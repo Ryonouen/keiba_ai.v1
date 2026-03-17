@@ -2148,13 +2148,9 @@ def fetch_newspaper_records(driver: webdriver.Chrome) -> Dict[str, Dict[str, Any
     records_map: Dict[str, Dict[str, Any]] = {}
 
     try:
-        # ページ上の全テーブルクラスを確認してセレクタ不一致を診断
-        all_tables = driver.find_elements(By.TAG_NAME, "table")
-        table_classes = [t.get_attribute("class") or "" for t in all_tables[:10]]
-        logger.info("[newspaper] ページ上のテーブルクラス: %s", table_classes)
-
-        rows = driver.find_elements(By.CSS_SELECTOR, "table.Newspaper_Table tbody tr")
-        logger.info("[newspaper] セレクタ行数: %d, タイトル: %s", len(rows), (driver.title or "不明")[:60])
+        # テーブルクラスに依存しない取得: .HorseName を持つ tr を XPath で直接取得
+        rows = driver.find_elements(By.XPATH, "//tr[.//td[contains(@class,'HorseName')]]")
+        logger.info("[newspaper] XPath行数: %d, タイトル: %s", len(rows), (driver.title or "不明")[:60])
     except Exception as _e:
         logger.warning("[newspaper] find_elements 失敗: %s", _e)
         return records_map
