@@ -1017,6 +1017,7 @@ def softmax(scores: List[float], temperature: float = 0.25) -> List[float]:
 
 
 def estimate_place_prob(win_prob: float) -> float:
+    # value_ai._safe_place_prob も同式を持つ。循環 import 回避のための意図的複製であり、変更時は両者を同期すること。
     place_prob = 0.12 + 1.75 * win_prob
     return round(min(0.85, max(0.05, place_prob)), 4)
 
@@ -2535,19 +2536,30 @@ def analyze_race(
 
         save_cookies(driver, COOKIE_FILE)
 
+        # 出馬表の全行が描画されるまで安定待機
+        # len > 3 で初期検出した後、行数が変化しなくなるまで待つ
         tables: List[Any] = []
-        for _ in range(20):
+        prev_count = 0
+        stable_count = 0
+        for _ in range(30):
             try:
                 tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
             except Exception:
                 tables = []
 
-            if tables and len(tables) > 3:
-                break
+            current_count = len(tables)
+            if current_count > 3:
+                if current_count == prev_count:
+                    stable_count += 1
+                    if stable_count >= 2:  # 2回連続で同じ行数なら描画完了と判定
+                        break
+                else:
+                    stable_count = 0
+                prev_count = current_count
 
             time.sleep(1)
 
-        time.sleep(1.5)
+        time.sleep(1.0)
 
         race_meta = extract_race_meta(driver)
         horses = fetch_horses(driver)
