@@ -279,14 +279,11 @@ def safe_get(driver: webdriver.Chrome, url: str, headless: bool = True, retries:
 
 
 def warmup_netkeiba_session(driver: webdriver.Chrome, headless: bool = True) -> webdriver.Chrome:
+    # メモリ節約のため1回のみロード（cookie は読み込むが再ナビゲートしない）
     driver = safe_get(driver, "https://race.netkeiba.com/", headless=headless, retries=1)
-    random_sleep(4.5, 7.0)
+    random_sleep(2.0, 3.0)
     emulate_human_behavior(driver)
-
-    if load_cookies(driver, COOKIE_FILE):
-        driver = safe_get(driver, "https://race.netkeiba.com/", headless=headless, retries=1)
-        random_sleep(4.5, 7.0)
-        emulate_human_behavior(driver)
+    load_cookies(driver, COOKIE_FILE)  # cookie をセットするだけ、再ロードしない
 
     return driver
 
@@ -2614,13 +2611,9 @@ def analyze_race(
             style_char = str(newspaper_entry.get("style_char", "")) if isinstance(newspaper_entry, dict) else ""
             newspaper_mark = str(newspaper_entry.get("newspaper_mark", "")) if isinstance(newspaper_entry, dict) else ""
 
-            if not records:
-                records, sire_name = fetch_horse_records(
-                    driver,
-                    horse_url,
-                    history_limit=history_limit,
-                    headless=headless,
-                )
+            # 個別馬ページへのフォールバックはメモリ節約のため省略
+            # 新聞ページで取得できなかった場合は records=[] のまま処理を継続
+            # （重賞レースは新聞ページに全馬データが揃っているため実害なし）
 
             if style_char:
                 proxy_pos = style_char_to_first_corner_pos(style_char)
