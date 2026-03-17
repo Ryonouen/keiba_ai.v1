@@ -162,6 +162,8 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--use-mock-keychain")
     options.add_argument("--lang=ja-JP")
     # --- メモリ削減フラグ（画像無効化は bot 判定リスクがあるため除外）---
+    options.add_argument("--single-process")        # レンダラーを独立プロセスにしない（Render無料枠OOM対策）
+    options.add_argument("--no-zygote")             # --single-process と併用推奨
     options.add_argument("--js-flags=--max-old-space-size=128")   # V8ヒープ上限128MB
     options.add_argument("--disk-cache-size=1")                   # ディスクキャッシュ最小化
     options.add_argument("--media-cache-size=1")
