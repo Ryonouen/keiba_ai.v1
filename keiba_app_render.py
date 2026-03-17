@@ -654,6 +654,24 @@ if st.session_state.result:
 
     features = result["features"]
 
+    # --- スクレイピング取得サマリー（デバッグ用）---
+    with st.expander("🔍 取得データ確認（デバッグ）", expanded=False):
+        st.write(f"**取得頭数**: {len(features)} 頭")
+        if features:
+            rows = []
+            for f in features:
+                rows.append({
+                    "馬名":     f.get("horse_name", "-"),
+                    "枠番":     f.get("gate", "-"),
+                    "脚質":     f.get("running_style", "-"),
+                    "近走記録数": len(f.get("records", [])),
+                    "父馬名":   f.get("sire_name", "-"),
+                    "新聞印":   f.get("newspaper_mark", "-"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.warning("馬データが取得できていません。")
+
     df = pd.DataFrame(features)
 
     # --- Recalculate AI metrics so ai_power_index / probabilities are populated ---

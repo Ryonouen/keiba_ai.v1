@@ -10,11 +10,18 @@ from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
 import json
 import hashlib
+import logging
 import math
 import os
 import random
 import re
 import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 from race_history_ai import (
     fetch_race_history as history_fetch_race_history,
@@ -2563,14 +2570,17 @@ def analyze_race(
 
         race_meta = extract_race_meta(driver)
         horses = fetch_horses(driver)
+        logger.info("[scrape] fetch_horses: %d頭取得", len(horses))
         newspaper_records: Dict[str, Dict[str, Any]] = {}
 
         try:
             driver = safe_get(driver, newspaper_url, headless=headless, retries=1)
             random_sleep(2.0, 3.0)
             newspaper_records = fetch_newspaper_records(driver)
+            logger.info("[scrape] fetch_newspaper_records: %d頭分取得", len(newspaper_records))
         except Exception:
             newspaper_records = {}
+            logger.warning("[scrape] fetch_newspaper_records 失敗")
 
         if not horses:
             return {
@@ -2589,6 +2599,7 @@ def analyze_race(
         for horse in horses:
             horse_url = str(horse.get("link") or "")
             if not horse_url:
+                logger.warning("[scrape] 馬URL取得失敗: %s", horse.get("name", "不明"))
                 continue
 
             # 新聞データがあればそれを優先使用（高速化 + 脚質取得の正確化）
@@ -2654,6 +2665,7 @@ def analyze_race(
         except Exception:
             course_bias = {}
 
+        logger.info("[scrape] horse_results: %d頭分のデータ構築完了", len(horse_results))
         features: List[Dict[str, Any]] = []
         for hr in horse_results:
             feature_dict = build_feature_dict(
