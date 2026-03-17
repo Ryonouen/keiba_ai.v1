@@ -650,9 +650,18 @@ if st.session_state.result:
 
     result = st.session_state.result
 
-    result = apply_bloodline_and_track_bias_to_result(result)
+    try:
+        result = apply_bloodline_and_track_bias_to_result(result)
+    except Exception as _e:
+        st.error(f"[DEBUG] apply_bloodline_and_track_bias_to_result 失敗: {_e}")
 
-    features = result["features"]
+    try:
+        result = refresh_result_payload(result)
+    except Exception as _e:
+        st.error(f"[DEBUG] refresh_result_payload 失敗: {_e}")
+
+    features = result.get("features", [])
+    st.write(f"[DEBUG] features 件数: {len(features)}, result keys: {list(result.keys())}")
 
     # --- スクレイピング取得サマリー（デバッグ用）---
     with st.expander("🔍 取得データ確認（デバッグ）", expanded=False):
