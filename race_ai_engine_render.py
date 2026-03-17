@@ -2591,7 +2591,23 @@ def analyze_race(
             driver = safe_get(driver, newspaper_url, headless=headless, retries=1)
             logger.info("[scrape] newspaper URL: %s", newspaper_url)
             logger.info("[scrape] newspaper page title: %s", (driver.title or "不明")[:80])
-            random_sleep(2.0, 3.0)
+            # JS レンダリング完了を待つ: tr の数が安定するまでポーリング
+            prev_tr = 0
+            stable_tr = 0
+            for _ in range(20):
+                time.sleep(1)
+                try:
+                    tr_count = len(driver.find_elements(By.TAG_NAME, "tr"))
+                except Exception:
+                    tr_count = 0
+                if tr_count > 5 and tr_count == prev_tr:
+                    stable_tr += 1
+                    if stable_tr >= 2:
+                        break
+                else:
+                    stable_tr = 0
+                prev_tr = tr_count
+            logger.info("[scrape] newspaper tr安定数: %d", prev_tr)
             newspaper_records = fetch_newspaper_records(driver)
             logger.info("[scrape] fetch_newspaper_records: %d頭分取得", len(newspaper_records))
         except Exception:
