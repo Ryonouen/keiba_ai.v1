@@ -2149,7 +2149,9 @@ def fetch_newspaper_records(driver: webdriver.Chrome) -> Dict[str, Dict[str, Any
 
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, "table.Newspaper_Table tbody tr")
-    except Exception:
+        logger.info("[newspaper] セレクタ行数: %d, タイトル: %s", len(rows), (driver.title or "不明")[:60])
+    except Exception as _e:
+        logger.warning("[newspaper] find_elements 失敗: %s", _e)
         return records_map
 
     for row in rows:
@@ -2577,6 +2579,8 @@ def analyze_race(
 
         try:
             driver = safe_get(driver, newspaper_url, headless=headless, retries=1)
+            logger.info("[scrape] newspaper URL: %s", newspaper_url)
+            logger.info("[scrape] newspaper page title: %s", (driver.title or "不明")[:80])
             random_sleep(2.0, 3.0)
             newspaper_records = fetch_newspaper_records(driver)
             logger.info("[scrape] fetch_newspaper_records: %d頭分取得", len(newspaper_records))
