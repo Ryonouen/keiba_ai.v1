@@ -138,7 +138,7 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options = Options()
     options.binary_location = chrome_bin
 
-    options.add_argument("--window-size=1400,900")
+    options.add_argument("--window-size=800,600")           # 小さいウィンドウでメモリ節約
     options.add_argument(f"--user-agent={user_agent}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
@@ -160,8 +160,13 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--no-first-run")
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
-    options.add_argument("--remote-debugging-port=9222")
     options.add_argument("--lang=ja-JP")
+    # --- メモリ削減フラグ ---
+    options.add_argument("--blink-settings=imagesEnabled=false")  # 画像非読み込み
+    options.add_argument("--disable-images")
+    options.add_argument("--js-flags=--max-old-space-size=128")   # V8ヒープ上限128MB
+    options.add_argument("--disk-cache-size=1")                   # ディスクキャッシュ最小化
+    options.add_argument("--media-cache-size=1")
     options.page_load_strategy = "eager"
 
     if headless:
@@ -2963,8 +2968,6 @@ def analyze_race(
             result["winner_pattern_confidence"] = 0.0
             result["winner_pattern_notes"] = str(e)
         # 最終AI指標・期待値・危険人気馬などを再計算
-        result = refresh_result_payload(result)
-
         result = refresh_result_payload(result)
         save_json_cache(race_cache_name, result)
         return result
