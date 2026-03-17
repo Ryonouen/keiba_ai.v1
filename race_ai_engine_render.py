@@ -138,7 +138,7 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options = Options()
     options.binary_location = chrome_bin
 
-    options.add_argument("--window-size=800,600")           # 小さいウィンドウでメモリ節約
+    options.add_argument("--window-size=1280,800")
     options.add_argument(f"--user-agent={user_agent}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
@@ -161,9 +161,7 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--lang=ja-JP")
-    # --- メモリ削減フラグ ---
-    options.add_argument("--blink-settings=imagesEnabled=false")  # 画像非読み込み
-    options.add_argument("--disable-images")
+    # --- メモリ削減フラグ（画像無効化は bot 判定リスクがあるため除外）---
     options.add_argument("--js-flags=--max-old-space-size=128")   # V8ヒープ上限128MB
     options.add_argument("--disk-cache-size=1")                   # ディスクキャッシュ最小化
     options.add_argument("--media-cache-size=1")
