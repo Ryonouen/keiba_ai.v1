@@ -2519,8 +2519,8 @@ def analyze_race(
 
     driver = build_webdriver(headless=headless)
     try:
-        driver = warmup_netkeiba_session(driver, headless=headless)
-
+        # warmup をスキップ: メモリ節約のため shutuba URL に直接アクセス
+        # （bot 判定リスクはあるが、無料枠での Chrome OOM 回避を優先）
         driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
         random_sleep(5.0, 7.5)
         emulate_human_behavior(driver)
