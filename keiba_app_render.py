@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 if "result" not in st.session_state:
     st.session_state.result = None
 
-from race_ai_engine import (
+from race_ai_engine_render import (
     analyze_race,
     apply_bloodline_and_track_bias_to_result,
     recommend_bets,
@@ -1228,7 +1228,7 @@ if st.session_state.result:
         rank["勝率"] = rank["勝率"].apply(lambda x: round(x * 100, 1))
         rank["複勝圏AI"] = rank["複勝圏AI"].apply(lambda x: round(x * 100, 1))
 
-        st.dataframe(rank.sort_values("勝率", ascending=False), use_container_width=True)
+        st.dataframe(rank.sort_values("勝率", ascending=False), width="stretch")
 
         st.subheader("📰 新聞AI評価")
 
@@ -1236,7 +1236,7 @@ if st.session_state.result:
             mark_df = df[["horse_name","newspaper_mark","win_prob","ai_power_index"]].copy()
             mark_df.columns = ["馬名","新聞印","勝率","AIパワー"]
             mark_df["勝率"] = mark_df["勝率"].apply(lambda x: round(x*100,1))
-            st.dataframe(mark_df, use_container_width=True)
+            st.dataframe(mark_df, width="stretch")
 
         st.subheader("期待値ランキング")
         ev = df[["horse_name", "win_ev", "place_ev", "value_index"]].copy()
@@ -1246,7 +1246,7 @@ if st.session_state.result:
             "place_ev": "複勝EV",
             "value_index": "妙味指数",
         })
-        st.dataframe(ev.sort_values("単勝EV", ascending=False), use_container_width=True)
+        st.dataframe(ev.sort_values("単勝EV", ascending=False), width="stretch")
 
         st.subheader("AI穴馬候補")
         dark_horses = result.get("dark_horses", [])
@@ -1254,7 +1254,7 @@ if st.session_state.result:
             dark_df = pd.DataFrame(dark_horses)[["horse_name", "win_prob", "win_odds", "value_index"]].copy()
             dark_df.columns = ["馬名", "勝率", "単勝オッズ", "妙味指数"]
             dark_df["勝率"] = dark_df["勝率"].apply(lambda x: round(x * 100, 1))
-            st.dataframe(dark_df, use_container_width=True)
+            st.dataframe(dark_df, width="stretch")
         else:
             st.write("AIが検出した穴馬はありません")
 
@@ -1264,7 +1264,7 @@ if st.session_state.result:
             danger_df = pd.DataFrame(danger_favorites)[["horse_name", "win_prob", "win_odds", "danger_gap"]].copy()
             danger_df.columns = ["馬名", "勝率", "単勝オッズ", "危険度ギャップ"]
             danger_df["勝率"] = danger_df["勝率"].apply(lambda x: round(x * 100, 1))
-            st.dataframe(danger_df, use_container_width=True)
+            st.dataframe(danger_df, width="stretch")
         else:
             st.write("危険人気馬は検出されませんでした")
 
@@ -1294,7 +1294,7 @@ if st.session_state.result:
 
             st.dataframe(
                 value_df.sort_values("歪み指数", ascending=False),
-                use_container_width=True
+                width="stretch"
             )
 
         else:
@@ -1374,7 +1374,7 @@ if st.session_state.result:
             font=dict(color="white"),
             margin=dict(l=20, r=20, t=50, b=20),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("AIレース難易度")
         probs = df["win_prob"].sort_values(ascending=False).values
@@ -1414,11 +1414,11 @@ if st.session_state.result:
                 font=dict(color="white"),
                 margin=dict(l=20, r=20, t=40, b=20),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             show_df = pos_df[["horse_name", "style", "win_prob", "pace_simulation_index"]].copy()
             show_df.columns = ["馬名", "脚質", "勝率", "展開指数"]
             show_df["勝率"] = show_df["勝率"].apply(lambda x: round(float(x) * 100, 1))
-            st.dataframe(show_df, use_container_width=True)
+            st.dataframe(show_df, width="stretch")
         else:
             st.write("ポジション分析データがありません")
 
@@ -1434,7 +1434,7 @@ if st.session_state.result:
             trio = df.sort_values("win_prob", ascending=False).head(5)[["horse_name", "win_prob", "win_odds"]].copy()
             trio.columns = ["馬名", "勝率", "単勝オッズ"]
             trio["勝率"] = trio["勝率"].apply(lambda x: round(x * 100, 1))
-            st.dataframe(trio, use_container_width=True)
+            st.dataframe(trio, width="stretch")
         else:
             st.write("データ不足")
 
@@ -1443,7 +1443,7 @@ if st.session_state.result:
             top = df.sort_values("win_prob", ascending=False).head(3)[["horse_name", "win_prob", "win_odds"]].copy()
             top.columns = ["馬名", "勝率", "単勝オッズ"]
             top["勝率"] = top["勝率"].apply(lambda x: round(x * 100, 1))
-            st.dataframe(top, use_container_width=True)
+            st.dataframe(top, width="stretch")
         else:
             st.write("データ不足")
 
@@ -1467,7 +1467,7 @@ if st.session_state.result:
                 "others": "相手"
             })
 
-            st.dataframe(ai_bets_df, use_container_width=True)
+            st.dataframe(ai_bets_df, width="stretch")
 
         else:
 
@@ -1517,7 +1517,7 @@ if st.session_state.result:
                 show_alloc["勝率"] = show_alloc["勝率"].apply(lambda x: round(x*100,1))
                 show_alloc["ケリー指数"] = show_alloc["ケリー指数"].apply(lambda x: round(x,2))
 
-                st.dataframe(show_alloc, use_container_width=True)
+                st.dataframe(show_alloc, width="stretch")
 
             else:
                 st.info("オッズが無いため資金配分を計算できません")
@@ -1556,4 +1556,3 @@ if st.session_state.result:
 
         with st.expander("オッズ補正メモ", expanded=False):
             st.caption("上部の『🎯 単勝オッズ入力・取得』内の『手動オッズ入力』から必要時のみ入力してください。")
-            

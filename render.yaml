@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: keiba-ai
+    runtime: docker
+    plan: free
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false      # Render ダッシュボードで手動設定
+      - key: RENDER
+        value: "true"

@@ -32,7 +32,8 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException, NoSuchWindowException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import NoSuchElementException, NoSuchWindowException, WebDriverException, TimeoutException
 
 try:
     import pandas as pd  # type: ignore
@@ -114,7 +115,7 @@ def emulate_human_behavior(driver: webdriver.Chrome) -> None:
         pass
 
 
-def build_webdriver(headless: bool = False) -> webdriver.Chrome:
+def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     user_agent = os.getenv(
         "NETKEIBA_USER_AGENT",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -122,6 +123,10 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
 
     chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
     chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
+    # Render / Docker 環境では GUI がないため headless を強制
+    if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or not os.getenv("DISPLAY"):
+        headless = True
 
     options = Options()
     options.binary_location = chrome_bin
@@ -131,6 +136,7 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-extensions")
@@ -149,14 +155,19 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--use-mock-keychain")
     options.add_argument("--remote-debugging-port=9222")
     options.add_argument("--lang=ja-JP")
+    options.page_load_strategy = "eager"
 
     if headless:
         options.add_argument("--headless=new")
 
-    service = Service(chromedriver_path)
+    service = Service(
+        executable_path=chromedriver_path,
+        log_output="/tmp/chromedriver.log",
+    )
+
     driver = webdriver.Chrome(service=service, options=options)
     driver.implicitly_wait(5)
-    driver.set_page_load_timeout(40)
+    driver.set_page_load_timeout(25)
 
     try:
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -173,7 +184,7 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
 
     return driver
 
-def restart_driver(old_driver: Optional[webdriver.Chrome], headless: bool = False) -> webdriver.Chrome:
+def restart_driver(old_driver: Optional[webdriver.Chrome], headless: bool = True) -> webdriver.Chrome:
     try:
         if old_driver is not None:
             old_driver.quit()
@@ -200,33 +211,62 @@ def safe_driver_title(driver: Optional[webdriver.Chrome]) -> str:
         return ""
 
 
-def safe_get(driver: webdriver.Chrome, url: str, headless: bool = False, retries: int = 1) -> webdriver.Chrome:
+def safe_get(driver: webdriver.Chrome, url: str, headless: bool = True, retries: int = 2) -> webdriver.Chrome:
     last_error: Optional[Exception] = None
 
     for attempt in range(retries + 1):
         try:
+            driver.set_page_load_timeout(25)
             driver.get(url)
+
+            try:
+                WebDriverWait(driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+                )
+            except Exception:
+                pass
+
             return driver
+
+        except TimeoutException as e:
+            last_error = e
+            print(f"ブラウザ遷移タイムアウト: {url}")
+
+            try:
+                driver.execute_script("window.stop();")
+                page_src = safe_page_source(driver)
+                if page_src and len(page_src) > 1000:
+                    return driver
+            except Exception:
+                pass
+
+            if attempt >= retries:
+                raise e
+
+            driver = restart_driver(driver, headless=headless)
+            random_sleep(2.0, 3.5)
+
         except (NoSuchWindowException, WebDriverException) as e:
             last_error = e
             print(f"ブラウザ遷移失敗: {type(e).__name__}")
             if attempt >= retries:
                 raise e
             driver = restart_driver(driver, headless=headless)
-            random_sleep(1.5, 2.5)
+            random_sleep(2.0, 3.5)
+
         except Exception as e:
             last_error = e
             print(f"ブラウザ遷移エラー: {type(e).__name__}")
             if attempt >= retries:
                 raise e
-            random_sleep(1.5, 2.5)
+            random_sleep(2.0, 3.5)
 
     if last_error is not None:
         raise last_error
     return driver
 
 
-def warmup_netkeiba_session(driver: webdriver.Chrome, headless: bool = False) -> webdriver.Chrome:
+def warmup_netkeiba_session(driver: webdriver.Chrome, headless: bool = True) -> webdriver.Chrome:
     driver = safe_get(driver, "https://race.netkeiba.com/", headless=headless, retries=1)
     random_sleep(4.5, 7.0)
     emulate_human_behavior(driver)
@@ -2449,7 +2489,7 @@ def build_winner_condition_ai(past_results: List[Dict[str, Any]]) -> str:
 def analyze_race(
     race_url: str,
     history_limit: int = HISTORY_LIMIT_DEFAULT,
-    headless: bool = False,
+    headless: bool = True,
 ) -> Dict[str, Any]:
     input_url = race_url.strip()
     if "newspaper.html" in input_url:

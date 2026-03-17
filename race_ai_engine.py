@@ -8,6 +8,16 @@ from pathlib import Path
 from openai import OpenAI
 from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
+from value_ai import (
+    build_ev_table,
+    detect_value_horses,
+    detect_danger_favorites_v2,
+    apply_trend_adjustments,
+    classify_race_structure,
+    recommend_bet_plan,
+    assign_marks,
+)
+from jockey_ai import apply_jockey_adjustments
 import json
 import hashlib
 import math
@@ -25,7 +35,9 @@ from race_history_ai import (
     fetch_past_10y_results,
     analyze_10y_race_trend,
     match_current_runners_with_10y_trend,
+    fetch_race_history_enriched,
 )
+from trend_stats import build_condition_stats
 
 from selenium import webdriver
 from selenium.webdriver import ActionChains
@@ -966,6 +978,7 @@ def softmax(scores: List[float], temperature: float = 0.25) -> List[float]:
 
 
 def estimate_place_prob(win_prob: float) -> float:
+    # value_ai._safe_place_prob も同式を持つ。循環 import 回避のための意図的複製であり、変更時は両者を同期すること。
     place_prob = 0.12 + 1.75 * win_prob
     return round(min(0.85, max(0.05, place_prob)), 4)
 
@@ -1524,6 +1537,34 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     result["condition_match_horses"] = result.get("condition_match_horses") or []
     result["winner_pattern_ai"] = result.get("winner_pattern_ai") or {}
     result["ai_comment"] = generate_ai_comment(result)
+
+    # =========================================================
+    # 馬券期待値AI (value_ai モジュール)
+    # =========================================================
+    try:
+        race_pace = result.get("race_meta", {}).get("predicted_pace", "medium") or "medium"
+        ev_table       = build_ev_table(features)
+        pace_balance   = result.get("pace_balance", {})
+        race_structure = classify_race_structure(features, pace_balance)
+        danger_v2      = detect_danger_favorites_v2(ev_table, features, race_pace)
+        value_v2       = detect_value_horses(ev_table, features, race_pace)
+        horse_marks    = assign_marks(features, ev_table, danger_v2)
+
+        result["ev_table"]            = ev_table
+        result["race_structure"]      = race_structure
+        result["value_horses_v2"]     = value_v2
+        result["danger_favorites_v2"] = danger_v2
+        result["horse_marks"]         = horse_marks
+        # bet_plan は bankroll が必要なのでここでは空。keiba_app.py 側で生成する。
+        result.setdefault("bet_plan", {})
+    except Exception as _val_err:
+        result.setdefault("ev_table", [])
+        result.setdefault("race_structure", {})
+        result.setdefault("value_horses_v2", [])
+        result.setdefault("danger_favorites_v2", [])
+        result.setdefault("horse_marks", [])
+        result.setdefault("bet_plan", {})
+
     return result
 
 # =========================================================
@@ -2635,10 +2676,18 @@ def analyze_race(
         winner_conditions: List[str] = []
         condition_match_horses: List[str] = []
         winner_pattern_ai: Dict[str, Any] = {}
+        condition_stats: Dict[str, Any] = {}
 
         try:
             if current_race_id:
                 past_10y_results = fetch_past_10y_results(driver, current_race_id)
+
+                # 証拠ベース補正用: 全走者データを取得して条件別統計を構築
+                try:
+                    _enriched = fetch_race_history_enriched(driver, current_race_id)
+                    condition_stats = build_condition_stats(_enriched) if _enriched else {}
+                except Exception:
+                    condition_stats = {}
                 trend_base = analyze_10y_race_trend(past_10y_results) or {}
                 trend_match_horses = match_current_runners_with_10y_trend(features, trend_base) or []
 
@@ -2740,6 +2789,15 @@ def analyze_race(
             winner_conditions = []
             condition_match_horses = []
             winner_pattern_ai = {}
+            condition_stats = {}
+
+        # 過去10年傾向をmodel_scoreに反映してから確率計算する
+        # condition_stats が取得できていれば証拠ベースの補正を優先する
+        if condition_stats or race_trend_10y:
+            features = apply_trend_adjustments(features, race_trend_10y, condition_stats)
+
+        # 騎手補正を model_score に反映（傾向補正の後に適用）
+        features = apply_jockey_adjustments(features)
 
         ml_probs = predict_win_probability_with_model(features, MODEL_FILE)
 

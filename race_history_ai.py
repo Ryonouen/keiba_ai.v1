@@ -9,6 +9,7 @@ import os
 import re
 import time
 import random
+from trend_stats import bucket_gate
 
 # -------------------------------------------------
 # Utilities
@@ -64,16 +65,6 @@ def bucket_popularity(popularity: Optional[int]) -> str:
     if 7 <= popularity <= 9:
         return "7〜9番人気"
     return "10番人気以下"
-
-
-def bucket_gate(gate: Optional[int]) -> str:
-    if gate is None:
-        return "不明"
-    if gate <= 3:
-        return "内枠(1〜3)"
-    if gate <= 6:
-        return "中枠(4〜6)"
-    return "外枠(7〜)"
 
 
 def summarize_counts(d: Dict[str, int], top_n: int = 2) -> str:
@@ -213,7 +204,7 @@ def analyze_race_trend(history: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     for h in history:
 
-        gate_key = bucket_gate(h.get("gate"))
+        gate_key = bucket_gate(h.get("gate")) or "不明"
         gate[gate_key] = gate.get(gate_key, 0) + 1
 
         a = h.get("age")
@@ -527,3 +518,103 @@ def match_current_runners_with_10y_trend(
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return [name for name, _ in scored[:5]]
+
+
+# -------------------------------------------------
+# Enriched single race (all runners)
+# -------------------------------------------------
+
+def fetch_single_race_enriched(driver: Any, race_id: str) -> Optional[Dict[str, Any]]:
+    """
+    指定レースの全走者を返す（勝ち馬のみではなく全馬）。
+
+    Returns
+    -------
+    {
+        "race_id":   str,
+        "n_runners": int,
+        "runners":   List[Dict]  # rank, gate, horse_name, age, popularity, odds, running_style
+    }
+    None なら取得失敗
+    """
+    url = f"https://db.netkeiba.com/race/{race_id}/"
+    try:
+        driver.get(url)
+        random_sleep()
+    except Exception:
+        return None
+
+    rows = driver.find_elements(By.CSS_SELECTOR, ".race_table_01 tbody tr")
+    if not rows:
+        return None
+
+    runners = []
+    for row in rows:
+        cols = row.find_elements(By.TAG_NAME, "td")
+        if len(cols) < 14:
+            continue
+
+        rank = parse_int(safe_text(cols[0]))
+        if rank is None:
+            continue
+
+        gate       = parse_int(safe_text(cols[1]))
+        horse      = safe_text(cols[3])
+        sex_age    = safe_text(cols[4])
+        passing    = safe_text(cols[10])
+        odds       = parse_float(safe_text(cols[12]))
+        popularity = parse_int(safe_text(cols[13]))
+
+        age_match = re.search(r"(\d+)", sex_age)
+        age = int(age_match.group(1)) if age_match else None
+        style = infer_style(passing)
+
+        runners.append({
+            "rank":          rank,
+            "gate":          gate,
+            "horse_name":    horse,
+            "age":           age,
+            "popularity":    popularity,
+            "odds":          odds,
+            "running_style": style,
+        })
+
+    if not runners:
+        return None
+
+    return {
+        "race_id":   race_id,
+        "n_runners": len(runners),
+        "runners":   runners,
+    }
+
+
+def fetch_race_history_enriched(
+    driver: Any,
+    race_id: str,
+    years: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    過去N年の同レースを全走者付きで返す。
+    """
+    try:
+        current_year = int(str(race_id)[:4])
+    except Exception:
+        return []
+
+    history: List[Dict[str, Any]] = []
+    for year in range(current_year, current_year - years, -1):
+        try:
+            new_race_id = f"{year}{str(race_id)[4:]}"
+        except Exception:
+            continue
+
+        data = fetch_single_race_enriched(driver, new_race_id)
+        if data:
+            history.append(data)
+        random_sleep(0.8, 1.6)
+
+    return history
+
+
+    return result
