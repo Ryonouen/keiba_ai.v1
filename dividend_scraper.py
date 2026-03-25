@@ -424,7 +424,7 @@ def fetch_race_ids_by_name(
 
         if progress_callback:
             progress_callback(i + 1, total, ds)
-        time.sleep(random.uniform(0.3, 0.6))
+        time.sleep(random.uniform(1.0, 2.0))
 
     return {
         "race_ids": all_ids,
