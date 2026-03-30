@@ -2554,7 +2554,11 @@ def _bm_sorted_candidates(
 
     if len(non_fade) < 2:
         fade_horses = [f for f in sorted_f if f not in non_fade]
-        non_fade = non_fade + fade_horses[:2 - len(non_fade)]
+        to_add = fade_horses[:2 - len(non_fade)]
+        for f in to_add:
+            name = str(f.get("horse_name") or "")
+            role_map[name] = "himo"
+        non_fade = non_fade + to_add
 
     return non_fade, role_map
 
@@ -2606,8 +2610,10 @@ def _bm_plan(
     no_pick_reason: str,
     confidence_score: float,
 ) -> Dict[str, Any]:
-    """AI馬券師プランの標準辞書を返す。"""
+    """AI馬券師プランの標準辞書を返す。tickets が空の場合は confidence_ok を False に矯正する。"""
     count = len(tickets)
+    _ok = confidence_ok and count > 0
+    _reason = no_pick_reason if _ok or not confidence_ok else "買い目が生成できませんでした"
     return {
         "bet_type":         bet_type,
         "formation_legs":   formation_legs,
@@ -2616,8 +2622,8 @@ def _bm_plan(
         "budget":           count * BETMASTER_TICKET_UNIT,
         "risk_level":       risk_level,
         "reason":           reason,
-        "confidence_ok":    confidence_ok,
-        "no_pick_reason":   no_pick_reason,
+        "confidence_ok":    _ok,
+        "no_pick_reason":   _reason,
         "confidence_score": confidence_score,
     }
 
