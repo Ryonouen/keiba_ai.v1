@@ -36,12 +36,27 @@ EV_SKIP_THRESHOLD: float = 1.02     # この期待値未満は見送り候補
 BANKROLL_RATIO_BASE: float = 0.05   # 軍資金基本配分率
 BANKROLL_UNIT: int = 100            # 掛け金単位（100円）
 
+# 妙味候補の最低条件（「妙味だけで飛びやすい馬」の過大評価抑制）
+VALUE_MIN_WIN_PROB: float = 0.05    # AI勝率がこれ未満の馬は value_gap があっても妙味候補に入れない
+VALUE_MIN_STABLE_SCORE: float = 0.35  # (consistency_index + trend_index)/2 がこれ未満の馬も除外
+
+# 主推奨昇格のための安定性下限（妙味候補に残りつつも主推奨に上がりにくくする 3 段階設計）
+# stable < 0.35 → 妙味候補に入れない（VALUE_MIN_STABLE_SCORE）
+# 0.35 ≤ stable < 0.38 → 候補入りするが単勝/複勝ともペナルティ
+# 0.38 ≤ stable < 0.45 → 複勝 OK、単勝はペナルティ
+# 0.45 ≤ stable → 制約なし
+TANSHO_STABLE_MIN: float = 0.45   # 単勝の主推奨昇格に必要な安定性（高め：1着が必要なため）
+FUKUSHO_STABLE_MIN: float = 0.38  # 複勝の主推奨昇格に必要な安定性（やや緩め：3着圏内でよいため）
+UMAREN_AXIS_STABLE_MIN: float = 0.43  # 馬連の軸馬安定性下限（軸が安定しないと組み合わせ全体が破綻しやすい）
+WIDE_AXIS_STABLE_MIN: float = 0.38   # ワイド/3連複の安定性下限（3着圏内なので複勝と同水準）
+
 # 過去傾向補正の重み（model_scoreへの加減算の最大値）
 TREND_WEIGHTS: Dict[str, float] = {
     "style":      0.025,   # 脚質傾向補正
     "popularity": 0.015,   # 人気帯傾向補正
     "gate":       0.010,   # 枠傾向補正
-    "age":        0.012,   # 年齢傾向補正
+    "age":        0.022,   # 年齢傾向補正
+    "prev_class": 0.025,   # 前走クラス補正（G1前走 + / 条件戦前走 −）
 }
 
 # 券種別期待値エンジン定数
@@ -71,14 +86,49 @@ PLACE_ODDS_FACTORS: Dict[str, float] = {
 
 # 推奨プラン安定化定数
 MIN_STAKE_PER_TICKET: int  = 100   # 1点最低掛け金（円）—— これを割る案は除外
-MAX_PRACTICAL_TICKETS: int = 5     # 点数上限（EVよりも少点数・安定性を優先）
+MAX_PRACTICAL_TICKETS: int = 10    # 点数上限（旧5点から緩和 — EVがあれば10点まで許容）
 EV_TIE_MARGIN: float       = 0.10  # EV差がこれ以下なら少点数・低リスク券種を優先
+
+# Kelly 賭け金計算パラメータ
+# half-Kelly を採用（フルKellyは分散が大きすぎるため）
+# f_kelly = KELLY_FRACTION × p × (EV-1) / (EV-p)
+KELLY_FRACTION: float   = 0.5    # half-Kelly
+KELLY_MAX_RATIO: float  = 0.10   # bankroll に対する上限（10%）
+KELLY_MIN_RATIO: float  = 0.01   # bankroll に対する下限（1%、最低掛け金保証用）
 
 # ── フェーズ3: 着順分布推定定数 ──────────────────────────────────
 # p_top2 = p1 + TOP2_FRAC × (p_top3 - p1)
 TOP2_FRAC_FRONT:   float = 0.68   # 逃げ・先行: ポジション保持しやすい → p_top2 寄り
 TOP2_FRAC_CLOSER:  float = 0.58   # 差し馬: 2着以内はブレやすい
 TOP2_FRAC_DEFAULT: float = 0.63   # 不明・その他
+
+# ── JRA経験的3着内率（人気順位別）──────────────────────────────
+# 出典: JRA公式統計 過去10年・中央競馬全レース集計の近似値
+# 3連複のp_top3推定にAI推定値とブレンドして使用する
+EMPIRICAL_TOP3_RATES: Dict[int, float] = {
+    1:  0.65,   # 1番人気: 約65%（圧倒的に高い）
+    2:  0.52,   # 2番人気: 約52%
+    3:  0.40,   # 3番人気: 約40%
+    4:  0.32,   # 4番人気: 約32%
+    5:  0.26,   # 5番人気: 約26%
+    6:  0.22,   # 6番人気: 約22%
+    7:  0.18,   # 7番人気: 約18%
+    8:  0.15,   # 8番人気: 約15%
+    9:  0.13,   # 9番人気: 約13%
+}
+EMPIRICAL_TOP3_DEFAULT: float = 0.10  # 10番人気以下
+
+# 人気順位別ブレンド係数（経験データの重み）
+# 人気馬ほど経験データが信頼できる → 重みを上げる
+# AI能力推定が高い場合は自然にAI側が勝つ（加重平均なので）
+EMPIRICAL_BLEND_WEIGHTS: Dict[int, float] = {
+    1:  0.40,   # 1番人気: 経験データ40% + AI推定60%
+    2:  0.35,   # 2番人気: 経験データ35%
+    3:  0.28,   # 3番人気: 経験データ28%
+    4:  0.20,   # 4番人気: 経験データ20%
+    5:  0.15,   # 5番人気: 経験データ15%
+    6:  0.12,   # 6番人気: 経験データ12%
+}
 
 # 人気帯別ワイドヒット補正係数（両人気は割り引く、中穴混じりは優遇）
 WIDE_CORR_BOTH_POP:  float = 0.58   # 両馬オッズ ≤7: 人気同士は売れすぎ
@@ -203,10 +253,35 @@ def detect_value_horses(
         vg = row.get("value_gap")
         if vg is None or vg < min_value_gap:
             continue
+
+        # AI勝率下限チェック: 勝率が極めて低い馬はオッズ妙味だけで上位に来るのを抑制
+        ai_win_prob = float(row.get("ai_win_prob") or 0.0)
+        if ai_win_prob < VALUE_MIN_WIN_PROB:
+            continue
+
         horse_name = row["horse_name"]
         f = features_by_name.get(horse_name, {})
+
+        # 安定性下限チェック: 成績が極端にバラバラな馬（飛びやすい）を妙味候補から除外
+        # consistency_index / trend_index が未取得の場合はデフォルト 0.5 扱いで通す
+        consistency = float(f.get("consistency_index") or 0.5)
+        trend = float(f.get("trend_index") or 0.5)
+        stable = (consistency + trend) / 2.0
+        if stable < VALUE_MIN_STABLE_SCORE:
+            continue
+
+        # 年齢シグナルが明確な懸念（medium/strong_negative）の場合、
+        # 妙味候補からは除外しないが「強妙味」への昇格を禁止する。
+        # 超長オッズ馬は value_gap が大きくなりやすいため、
+        # そのレースの年齢別3着内率が明確に低い馬は推しすぎを抑制する。
+        age_signal = f.get("age_signal", "neutral")
+        age_label_cap = "妙味" if age_signal in ("medium_negative", "strong_negative") else None
+
         reason = _value_reason(f, row, race_pace)
-        candidates.append({**row, "reason": reason})
+        entry = {**row, "reason": reason}
+        if age_label_cap:
+            entry["age_label_cap"] = age_label_cap
+        candidates.append(entry)
 
     candidates.sort(key=lambda x: float(x.get("value_gap") or 0), reverse=True)
     return candidates
@@ -236,9 +311,8 @@ def _danger_reason(feature: Dict[str, Any], ev_row: Dict[str, Any], race_pace: s
     if float(feature.get("distance_fit_index") or 0.5) <= 0.35:
         parts.append("距離適性に不安")
 
-    age = feature.get("age")
-    if isinstance(age, (int, float)) and age >= 7:
-        parts.append("年齢面がやや不利")
+    # 年齢の固定テキストは廃止。レース別傾向データを持つ場合は
+    # trend_signal_details 経由で表示されるため、ここでは一律表記しない。
 
     return "・".join(parts[:3]) if parts else "AI評価 < 市場評価"
 
@@ -282,6 +356,54 @@ def detect_danger_favorites_v2(
 # =========================================================
 # 過去10年傾向スコア補正
 # =========================================================
+
+def _calc_age_delta_from_trend(
+    feature: Dict[str, Any],
+    race_trend_10y: Dict[str, Any],
+) -> float:
+    """
+    race_trend_10y の年齢別勝者カウントから年齢補正値を計算する。
+    signal_judge が年齢 neutral のときに標準ルートの補完として使う。
+
+    【評価軸の統一】
+    旧実装は固定閾値（ratio <= 0.05 → -0.025 等）を使っていたが、
+    標準ルート（condition_stats）の diff_top3 と評価軸を統一するため、
+    「このレースの年齢別平均勝率との相対差分」で補正量を算出する。
+
+    具体的には:
+      age_ratio  = この年齢の勝者数 / 全勝者数
+      avg_ratio  = 1 / 出走年齢グループ数（均等配分の期待値）
+      diff_ratio = age_ratio - avg_ratio（相対偏差）
+      adj        = TREND_WEIGHTS["age"] * (diff_ratio / avg_ratio)
+
+    例:
+      全4年齢グループで5歳が5/10年優勝 → ratio=0.5, avg=0.25 → adj=+0.022
+      7歳以上が0/10年優勝             → ratio=0.0, avg=0.25 → adj=-0.022
+    """
+    age_counts: Dict[str, int] = race_trend_10y.get("age") or {}
+    age = feature.get("age")
+    if age is None:
+        return 0.0
+    age_i = int(age)
+    # bucket_age と同じ: 7歳以上はまとめる
+    age_key = "7歳以上" if age_i >= 7 else f"{age_i}歳"
+    if not age_counts:
+        return 0.0
+
+    total = sum(age_counts.values()) or 1
+    count = age_counts.get(age_key, 0)
+    age_ratio = count / total
+
+    # 平均比率: 観測された年齢グループ数で均等配分
+    n_groups = len([v for v in age_counts.values() if v > 0]) or 1
+    avg_ratio = 1.0 / n_groups
+
+    diff_ratio = age_ratio - avg_ratio
+    # 相対偏差をスコア補正に変換（標準ルートの diff_top3 と同じ方向性）
+    adj = TREND_WEIGHTS["age"] * (diff_ratio / avg_ratio)
+    # 過大補正を防止
+    return round(max(-0.025, min(TREND_WEIGHTS["age"], adj)), 5)
+
 
 def trend_score_adjustment(
     feature: Dict[str, Any],
@@ -373,19 +495,40 @@ def trend_score_adjustment(
             delta -= TREND_WEIGHTS["gate"] * 0.5
 
     # ----- 年齢傾向 -----
+    # このレース過去10年の勝者年齢分布と照合して補正。
+    # 評価軸: 年齢グループ別の勝者比率 vs 均等配分期待値の相対差分。
+    # _calc_age_delta_from_trend と同一ロジックで統一。
     age_counts: Dict[str, int] = race_trend_10y.get("age") or {}
     age = feature.get("age")
-    if age_counts and age is not None:
-        total = sum(age_counts.values()) or 1
-        age_i = int(age)
-        # キー書式は f"{a}歳"（例: "4歳"）。intキーは存在しない。
-        matching = sum(v for k, v in age_counts.items() if str(age_i) in str(k))
-        age_ratio = matching / total
-        if age_ratio >= 0.35:
-            delta += TREND_WEIGHTS["age"] * age_ratio
-        elif age_ratio <= 0.05 and age_i >= 7:
-            # 7歳以上かつ過去傾向と合わない場合のみ微減
-            delta -= TREND_WEIGHTS["age"] * 0.6
+    age_delta = 0.0
+    if age is not None and age_counts:
+        age_i   = int(age)
+        age_key = "7歳以上" if age_i >= 7 else f"{age_i}歳"
+        total   = sum(age_counts.values()) or 1
+        count   = age_counts.get(age_key, 0)
+        age_ratio = count / total
+        n_groups  = len([v for v in age_counts.values() if v > 0]) or 1
+        avg_ratio = 1.0 / n_groups
+        diff_ratio = age_ratio - avg_ratio
+        age_delta  = TREND_WEIGHTS["age"] * (diff_ratio / avg_ratio)
+        age_delta  = max(-0.025, min(TREND_WEIGHTS["age"], age_delta))
+    delta += age_delta
+
+    # ----- 前走クラス補正 -----
+    # G1前走: 大幅加点 / G2・G3重賞前走: 小加点 / 条件戦前走: 減点
+    prev_class = float(feature.get("prev_race_class_index") or 0.0)
+    prev_name  = str(feature.get("prev_race_name") or "")
+    if prev_class > 0:
+        prev_delta = 0.0
+        if prev_class >= 0.95:          # G1前走
+            prev_delta = TREND_WEIGHTS["prev_class"]
+            if "有馬記念" in prev_name or "天皇賞" in prev_name:
+                prev_delta += 0.010     # 長距離G1組は特別加点
+        elif prev_class >= 0.75:        # G2/G3重賞前走
+            prev_delta = TREND_WEIGHTS["prev_class"] * 0.40
+        elif prev_class < 0.60:         # OP未満（条件戦）前走
+            prev_delta = -TREND_WEIGHTS["prev_class"] * 0.60
+        delta += prev_delta
 
     return round(delta, 5)
 
@@ -394,6 +537,7 @@ def apply_trend_adjustments(
     features: List[Dict[str, Any]],
     race_trend_10y: Dict[str, Any],
     condition_stats: Optional[Dict[str, Any]] = None,
+    combo_condition_stats: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     全馬に傾向補正を適用して model_score を更新する。
@@ -402,6 +546,7 @@ def apply_trend_adjustments(
     1. 標準ルート（condition_stats が非空の場合）:
        signal_judge.build_horse_signal_details + aggregate_signal_result を使用。
        走者個別の統計に基づく証拠ベース補正。サンプルサイズ信頼度・エスカレーションあり。
+       combo_condition_stats が渡された場合はコンボシグナルも追加（60% 圧縮で二重計上を抑制）。
 
     2. フォールバックルート（condition_stats が空 or None の場合）:
        trend_score_adjustment() を使用。
@@ -419,14 +564,54 @@ def apply_trend_adjustments(
 
     # --- 標準ルート: condition_stats による証拠ベース補正 ---
     if condition_stats:
-        from signal_judge import build_horse_signal_details, aggregate_signal_result
+        from signal_judge import (
+            build_horse_signal_details,
+            build_horse_combo_signal_details,
+            aggregate_signal_result,
+        )
         for f in features:
-            details    = build_horse_signal_details(f, condition_stats)
-            sig_result = aggregate_signal_result(details)
-            delta      = sig_result["total_trend_adjust"]
+            score_before  = float(f.get("model_score") or 0.0)
+            details       = build_horse_signal_details(f, condition_stats)
+            combo_details = build_horse_combo_signal_details(f, combo_condition_stats or {})
+            all_details   = details + combo_details
+            sig_result    = aggregate_signal_result(all_details)
+            delta         = sig_result["total_trend_adjust"]
+
+            # 年齢シグナルが neutral（サンプル不足等）だった場合は
+            # race_trend_10y の年齢分布データをフォールバックとして補完する。
+            age_detail = next(
+                (d for d in details if d.get("factor") == "年齢"), None
+            )
+            age_signal_applied = age_detail is not None
+            if not age_signal_applied and race_trend_10y:
+                age_delta = _calc_age_delta_from_trend(f, race_trend_10y)
+                if age_delta != 0.0:
+                    delta += age_delta
+                    f["age_delta_fallback"] = age_delta
+
+            # --- デバッグフィールド ---
+            f["model_score_before_trend"] = score_before
+            f["combo_signal_count"] = len(combo_details)
+            if age_detail:
+                f["age_bucket"]        = age_detail.get("value")
+                f["age_sample_size"]   = age_detail.get("sample_size")
+                f["age_top3_rate"]     = age_detail.get("top3_rate")
+                f["overall_top3_rate"] = age_detail.get("overall_top3_rate")
+                f["age_diff_top3"]     = age_detail.get("diff_top3")
+                f["age_signal"]        = age_detail.get("signal")
+                f["age_adjustment"]    = age_detail.get("score_adjust")
+            else:
+                f["age_bucket"]        = f.get("age_bucket")  # 既存値保持
+                f["age_sample_size"]   = None
+                f["age_top3_rate"]     = None
+                f["overall_top3_rate"] = None
+                f["age_diff_top3"]     = None
+                f["age_signal"]        = "neutral"
+                f["age_adjustment"]    = f.get("age_delta_fallback", 0.0)
+
             f["trend_delta"]          = delta
             f["trend_signal_details"] = sig_result
-            f["model_score"]          = round(float(f.get("model_score") or 0.0) + delta, 6)
+            f["model_score"]          = round(score_before + delta, 6)
         return features
 
     # --- フォールバックルート: race_trend_10y のみ使用 ---
@@ -512,7 +697,18 @@ def estimate_placement_probs(
     - running_style と race_structure の組み合わせで分配比を微補正
     """
     p1     = float(f.get("win_prob") or 0.0)
-    p_top3 = _safe_place_prob(f)   # 0.12 + 1.75 * p1 をベース
+    p_top3_ai = _safe_place_prob(f)   # 0.12 + 1.75 * p1 をベース
+
+    # ── JRA経験的3着内率とのブレンド ──────────────────────────────
+    # 人気馬は経験的3着内率が高く信頼性があるため、AI推定と加重平均する。
+    # AIが能力を高く評価している馬は自然にAI側の値が効く（p_top3_aiが大きくなる）。
+    # AIが過小評価していても経験データが下支えするため、人気馬が過度に除外されなくなる。
+    _pop_rank = int(f.get("popularity") or 99)
+    _empirical = EMPIRICAL_TOP3_RATES.get(_pop_rank, EMPIRICAL_TOP3_DEFAULT)
+    _blend_w   = EMPIRICAL_BLEND_WEIGHTS.get(_pop_rank, 0.0)  # 7番人気以下は経験ブレンドなし
+    p_top3 = round(
+        (1.0 - _blend_w) * p_top3_ai + _blend_w * _empirical, 4
+    )
 
     running_style  = f.get("running_style") or ""
     structure_type = (race_structure or {}).get("structure_type", "標準型")
@@ -614,16 +810,17 @@ def _combo_value_corr(
 ) -> float:
     """
     組み合わせの価値補正。
-    - 妙味馬1頭 → +4%  / 危険馬1頭 → -12%
-    - 結果を [0.70, 1.15] にクリップ
+    - 妙味馬1頭 → +4%  / 危険馬1頭 → -7%
+    - 結果を [0.75, 1.15] にクリップ
+    （かつての -12% は人気馬を組み合わせから過剰に締め出す原因だったため緩和）
     """
     mult = 1.0
     for h in horse_names:
         if h in value_names:
             mult *= 1.04
         if h in danger_names:
-            mult *= 0.88
-    return round(min(1.15, max(0.70, mult)), 4)
+            mult *= 0.93
+    return round(min(1.15, max(0.75, mult)), 4)
 
 
 def _style_fit_corr(
@@ -795,9 +992,11 @@ def calc_sanrenpuku_ev_trio(
 
 def build_ticket_ev_table(
     features: List[Dict[str, Any]],
-    top_n: int = 6,
+    top_n: int = 8,
     race_structure: Optional[Dict[str, Any]] = None,
     ev_table: Optional[List[Dict[str, Any]]] = None,
+    forced_axis: Optional[str] = None,
+    horse_roles: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     上位馬の全券種×組み合わせの期待値テーブルを返す（EV降順ソート済み）。
@@ -819,20 +1018,134 @@ def build_ticket_ev_table(
     if not features:
         return []
 
-    sorted_f = sorted(
-        features,
-        key=lambda x: float(x.get("win_prob") or 0.0),
-        reverse=True,
-    )
-    # shallow copy でオリジナル features を汚染しない
-    top_f = [dict(f) for f in sorted_f[:top_n]]
+    # ── ロールベースのプール構築 ───────────────────────────────────────
+    # horse_roles が提供された場合: assign_roles の結果でプールを構成する
+    # → fade 馬を除外し、head/axis を軸候補、himo をヒモ候補として分離
+    # horse_roles が未提供の場合: 従来通り win_prob 上位 top_n を使用（後方互換）
+
+    _AXIS_ROLES = {"head", "axis"}
+
+    if horse_roles:
+        _role_map: Dict[str, str] = {
+            r["horse_name"]: r.get("role", "himo") for r in horse_roles
+        }
+        # fade 以外を全プールに入れる
+        _all_non_fade = [
+            dict(f) for f in features
+            if _role_map.get(str(f.get("horse_name") or ""), "himo") != "fade"
+        ]
+        if not _all_non_fade:
+            _all_non_fade = [dict(f) for f in features]  # fallback
+
+        # 各馬に _role を付与
+        for _f in _all_non_fade:
+            _f["_role"] = _role_map.get(str(_f.get("horse_name") or ""), "himo")
+
+        # 軸候補 / ヒモ候補 を分離
+        axis_pool = [f for f in _all_non_fade if f["_role"] in _AXIS_ROLES]
+        himo_pool = [f for f in _all_non_fade if f["_role"] == "himo"]
+
+        # 軸候補が2頭未満の場合: win_prob 上位の himo を軸に昇格（買い目が成立しなくなるのを防ぐ）
+        if len(axis_pool) < 2 and himo_pool:
+            _himo_sorted = sorted(himo_pool, key=lambda x: -float(x.get("win_prob") or 0))
+            _need = min(2 - len(axis_pool), len(_himo_sorted))
+            for _pf in _himo_sorted[:_need]:
+                _pf["_role"] = "axis"
+            axis_pool = axis_pool + _himo_sorted[:_need]
+            himo_pool = _himo_sorted[_need:]
+
+        # forced_axis: 指定馬を軸プールに強制追加
+        if forced_axis:
+            _in_axis = any(str(f.get("horse_name") or "") == forced_axis for f in axis_pool)
+            if not _in_axis:
+                _fa_f = next(
+                    (dict(f) for f in features if str(f.get("horse_name") or "") == forced_axis),
+                    None,
+                )
+                if _fa_f:
+                    _fa_f["_role"] = "axis"
+                    axis_pool = [_fa_f] + axis_pool
+
+        # 全プール（軸+ヒモ）を上限で絞る
+        axis_pool = axis_pool[:top_n]
+        himo_pool = himo_pool[:top_n]
+        top_f     = axis_pool + himo_pool   # 単勝・複勝・馬連・ワイド用（以後も参照）
+        trio_pool = top_f                   # 3連複も同じプール（role 制約で組み合わせを制限）
+
+        # フォールバック: プールが3頭未満で3連複が組めない場合
+        # fade 馬の中から p_top3（経験ブレンド済み）が高い馬を "himo_fallback" として追加
+        if len(trio_pool) < 3:
+            _all_names_in_pool = {str(f.get("horse_name") or "") for f in trio_pool}
+            _fade_candidates = [
+                {**dict(f), "_role": "himo"}
+                for f in sorted(
+                    features,
+                    key=lambda x: -float(x.get("_pp_p_top3") or _safe_place_prob(x)),
+                )
+                if str(f.get("horse_name") or "") not in _all_names_in_pool
+            ]
+            _need = 3 - len(trio_pool)
+            trio_pool = trio_pool + _fade_candidates[:_need]
+            top_f     = trio_pool  # 複勝・馬連も拡張
+
+    else:
+        # ── 従来モード（role 情報なし）──────────────────────────────
+        sorted_f = sorted(features, key=lambda x: float(x.get("win_prob") or 0.0), reverse=True)
+        top_f    = [dict(f) for f in sorted_f[:top_n]]
+
+        # 全馬に _role="axis" を付与（制約なし）
+        for _f in top_f:
+            _f["_role"] = "axis"
+
+        # 強制軸追加
+        if forced_axis:
+            if not any(str(f.get("horse_name") or "") == forced_axis for f in top_f):
+                _fa_f = next(
+                    (dict(f) for f in features if str(f.get("horse_name") or "") == forced_axis),
+                    None,
+                )
+                if _fa_f:
+                    _fa_f["_role"] = "axis"
+                    top_f = [_fa_f] + top_f[:top_n - 1]
+
+        axis_pool = top_f
+        himo_pool = []
+
+        # 3連複プール: 人気上位馬を強制追加（従来互換）
+        _top_f_names = {str(f.get("horse_name") or "") for f in top_f}
+        _pop_sorted  = sorted(features, key=lambda x: float(x.get("popularity") or 99))
+        _extra_trio: List[Dict[str, Any]] = []
+        for _pf in _pop_sorted:
+            if len(_extra_trio) >= 2:
+                break
+            if str(_pf.get("horse_name") or "") not in _top_f_names:
+                _extra_trio.append({**dict(_pf), "_role": "himo"})
+        trio_pool = top_f + _extra_trio
 
     # 着順分布推定値を付与（_pp_* キー）
     _enrich_placement_probs(top_f, race_structure)
+    # trio_pool に top_f 以外の馬がいれば追加エンリッチ
+    _top_f_set = {str(f.get("horse_name") or "") for f in top_f}
+    _trio_extras = [f for f in trio_pool if str(f.get("horse_name") or "") not in _top_f_set]
+    if _trio_extras:
+        _enrich_placement_probs(_trio_extras, race_structure)
+
+    # 人気上位2頭の馬名セット（EV閾値緩和用）
+    _pop_sorted_all = sorted(features, key=lambda x: float(x.get("popularity") or 99))
+    _top2_pop_names: Set[str] = {str(f.get("horse_name") or "") for f in _pop_sorted_all[:2]}
 
     rows: List[Dict[str, Any]] = []
 
+    def _stable(f: Dict[str, Any]) -> float:
+        return (float(f.get("consistency_index") or 0.5) + float(f.get("trend_index") or 0.5)) / 2.0
+
+    def _is_axis(f: Dict[str, Any]) -> bool:
+        return f.get("_role", "axis") in _AXIS_ROLES
+
+    # 単勝: 軸役（head/axis）のみ対象
     for f in top_f:
+        if not _is_axis(f):
+            continue
         ev = calc_tansho_ev(f)
         if ev is not None:
             rows.append({
@@ -840,8 +1153,10 @@ def build_ticket_ev_table(
                 "horses":      [str(f.get("horse_name") or "")],
                 "ev":          ev,
                 "ai_hit_prob": round(float(f.get("_pp_p1") or f.get("win_prob") or 0.0), 4),
+                "stable_score": round(_stable(f), 4),
             })
 
+    # 複勝: 全プール（ヒモも3着に来るので対象）
     for f in top_f:
         ev = calc_fukusho_ev(f)
         if ev is not None:
@@ -850,22 +1165,30 @@ def build_ticket_ev_table(
                 "horses":      [str(f.get("horse_name") or "")],
                 "ev":          ev,
                 "ai_hit_prob": round(float(f.get("_pp_p_top3") or _safe_place_prob(f)), 4),
+                "stable_score": round(_stable(f), 4),
             })
 
-    top_f_by_name = {str(f.get("horse_name") or ""): f for f in top_f}
+    # 馬連: 少なくとも一方が軸役
     for fa, fb in combinations(top_f, 2):
+        if not (_is_axis(fa) or _is_axis(fb)):
+            continue  # ヒモ同士の馬連は生成しない
         ev = calc_umaren_ev_pair(fa, fb)
         if ev is not None:
             pa = float(fa.get("_pp_p1") or fa.get("win_prob") or 0.0)
             pb = float(fb.get("_pp_p1") or fb.get("win_prob") or 0.0)
+            _axis_stable = round(_stable(fa) if pa >= pb else _stable(fb), 4)
             rows.append({
                 "bet_type":    "馬連",
                 "horses":      [str(fa.get("horse_name") or ""), str(fb.get("horse_name") or "")],
                 "ev":          ev,
                 "ai_hit_prob": round(_harville_umaren_hit(pa, pb), 4),
+                "stable_score": _axis_stable,
             })
 
+    # ワイド: 少なくとも一方が軸役
     for fa, fb in combinations(top_f, 2):
+        if not (_is_axis(fa) or _is_axis(fb)):
+            continue
         ev = calc_wide_ev_pair(fa, fb)
         if ev is not None:
             pa = float(fa.get("_pp_p_top3") or _safe_place_prob(fa))
@@ -876,29 +1199,36 @@ def build_ticket_ev_table(
                 "horses":      [str(fa.get("horse_name") or ""), str(fb.get("horse_name") or "")],
                 "ev":          ev,
                 "ai_hit_prob": round(pa * pb * corr, 4),
+                "stable_score": round(min(_stable(fa), _stable(fb)), 4),
             })
 
-    for fa, fb, fc in combinations(top_f, 3):
+    # 3連複: 少なくとも1頭が軸役
+    for fa, fb, fc in combinations(trio_pool, 3):
+        if not any(_is_axis(f) for f in (fa, fb, fc)):
+            continue  # ヒモ3頭の組み合わせは生成しない
         ev = calc_sanrenpuku_ev_trio(fa, fb, fc)
         if ev is not None:
             pa = float(fa.get("_pp_p_top3") or _safe_place_prob(fa))
             pb = float(fb.get("_pp_p_top3") or _safe_place_prob(fb))
             pc = float(fc.get("_pp_p_top3") or _safe_place_prob(fc))
+            _trio_names = [
+                str(fa.get("horse_name") or ""),
+                str(fb.get("horse_name") or ""),
+                str(fc.get("horse_name") or ""),
+            ]
             rows.append({
-                "bet_type":    "3連複",
-                "horses":      [
-                    str(fa.get("horse_name") or ""),
-                    str(fb.get("horse_name") or ""),
-                    str(fc.get("horse_name") or ""),
-                ],
-                "ev":          ev,
-                "ai_hit_prob": round(pa * pb * pc * TRIO_CORR, 4),
+                "bet_type":       "3連複",
+                "horses":         _trio_names,
+                "ev":             ev,
+                "ai_hit_prob":    round(pa * pb * pc * TRIO_CORR, 4),
+                "stable_score":   round(min(_stable(fa), _stable(fb), _stable(fc)), 4),
+                "has_top2_popular": any(h in _top2_pop_names for h in _trio_names),
             })
 
     # ── 補正フェーズ ──────────────────────────────────────────────
     structure_type   = (race_structure or {}).get("structure_type", "標準型")
     favorable_style  = (race_structure or {}).get("favorable_style", "unknown")
-    features_by_name = {str(f.get("horse_name") or ""): f for f in top_f}
+    features_by_name = {str(f.get("horse_name") or ""): f for f in trio_pool}
 
     if ev_table:
         value_names: Set[str] = {
@@ -937,6 +1267,14 @@ def build_ticket_ev_table(
         row["has_danger_horse"]= any(h in danger_names for h in hs)
 
     rows.sort(key=lambda x: x["ev"], reverse=True)
+
+    # 軸馬フィルタ: 指定された馬が含まれる組み合わせのみ残す
+    if forced_axis:
+        filtered = [r for r in rows if forced_axis in r.get("horses", [])]
+        # フィルタ後にEVが基準を超える行が最低1件あれば採用、なければ全件返す
+        if filtered:
+            return filtered
+
     return rows
 
 
@@ -1067,6 +1405,8 @@ def recommend_bet_plan(
     race_structure: Dict[str, Any],
     bankroll: int,
     race_pace: str = "medium",
+    forced_axis: Optional[str] = None,
+    horse_roles: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     券種別EVテーブルを優先し、オッズ未入力時はレース構造ベースにフォールバック。
@@ -1101,32 +1441,115 @@ def recommend_bet_plan(
         for f in features
     )
 
-    if has_odds:
-        ticket_evs = build_ticket_ev_table(
-            features, top_n=6, race_structure=race_structure, ev_table=ev_table
-        )
-        if ticket_evs:
-            plan = _build_ev_plan(ticket_evs, bankroll)
-            if plan:
-                return plan
-            # 全券種が閾値未満 → 見送り
-            return {
-                **EMPTY,
-                "skip":        True,
-                "skip_reason": f"全券種のEV不足（最高EV={ticket_evs[0]['ev']:.2f}）。見送り推奨。",
-            }
+    # ── 常に構造型推奨を使用 ──────────────────────────────────────
+    # LightGBMモデル未訓練の段階ではwin_probが不正確なため、
+    # EV計算（= win_prob × odds）は推奨の根拠として信頼できない。
+    # オッズ入力は危険馬・妙味馬の検出には活用するが、
+    # 推奨馬券はレース構造 + horse_roles（役割）ベースで決定する。
+    _ = has_odds  # オッズ有無は推奨経路に影響させない
 
-    # ── 構造ベース fallback ────────────────────────────────────────
-    plan = _recommend_by_structure(features, ev_table, race_structure, bankroll, race_pace)
+    plan = _recommend_by_structure(
+        features, ev_table, race_structure, bankroll, race_pace, horse_roles=horse_roles,
+    )
     if not plan.get("skip") and "selection_detail" not in plan:
         stype = race_structure.get("structure_type", "標準型")
+        has_odds_note = "（オッズ参照済み: 危険馬・妙味馬判定に使用）" if has_odds else ""
+        import os as _os
+        _model_trained = _os.path.exists("keiba_lgbm_model.txt")
+        _ev_note = "LightGBMモデルによるEV計算を適用中" if _model_trained else "LightGBMモデル未訓練のためEV計算は参考値として表示"
         plan["selection_detail"] = {
-            "why_bet_type":  f"オッズ未入力のためレース構造（{stype}）から選定",
-            "why_combo":     "AI上位馬・妙味馬を優先選択",
-            "why_not_other": "オッズ未入力のためEV比較不可",
+            "why_bet_type":  f"レース構造（{stype}）から選定{has_odds_note}",
+            "why_combo":     "AI上位馬・役割（head/axis/himo）・妙味馬を優先選択",
+            "why_not_other": _ev_note,
             "best_by_type":  {},
         }
     return plan
+
+
+def recommend_all_bet_types(
+    features: List[Dict[str, Any]],
+    ev_table: List[Dict[str, Any]],
+    race_structure: Dict[str, Any],
+    bankroll: int,
+    race_pace: str = "medium",
+    horse_roles: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    ワイド・馬連・三連複・三連単それぞれの推奨買い目を能力ベースで生成して返す。
+
+    馬の選定は全券種共通（horse_roles の role 順 + win_prob 順）。
+    オッズは使わない。bankroll は券種ごと独立。
+    """
+    from itertools import permutations as _perms
+
+    # ── 共通: 軸候補構築（_recommend_by_structure と同じロジック） ──
+    if horse_roles:
+        _role_map = {r["horse_name"]: r.get("role", "himo") for r in horse_roles}
+        _ROLE_ORDER = {"head": 0, "axis": 1, "himo": 2, "fade": 3}
+        _sorted = sorted(
+            features,
+            key=lambda x: (
+                _ROLE_ORDER.get(_role_map.get(str(x.get("horse_name") or ""), "himo"), 2),
+                -float(x.get("win_prob") or 0.0),
+            ),
+        )
+        _non_fade = [f for f in _sorted
+                     if _role_map.get(str(f.get("horse_name") or ""), "himo") != "fade"]
+        if len(_non_fade) < 2:
+            _non_fade += [f for f in _sorted if f not in _non_fade][:2 - len(_non_fade)]
+        candidates = _non_fade
+    else:
+        candidates = sorted(features, key=lambda x: float(x.get("win_prob") or 0.0), reverse=True)
+
+    names = [str(f.get("horse_name") or "") for f in candidates if f.get("horse_name")][:4]
+    if len(names) < 2:
+        return []
+
+    plans: List[Dict[str, Any]] = []
+    n1, n2 = names[0], names[1]
+    n3 = names[2] if len(names) >= 3 else None
+    n4 = names[3] if len(names) >= 4 else None
+    top3 = [n for n in [n1, n2, n3] if n]
+    top4 = [n for n in [n1, n2, n3, n4] if n]
+
+    # ── ワイドBOX（上位3頭, 3点） ──
+    if len(top3) >= 3:
+        combos = list(combinations(top3, 2))
+        s = _round_stake(bankroll / len(combos))
+        plans.append(_plan(
+            "ワイドBOX", top3,
+            [{"combination": list(c), "stake": s} for c in combos],
+            f"能力上位3頭ワイドBOX {len(combos)}点", "低", "構造型",
+        ))
+
+    # ── 馬連（上位2頭, 1点） ──
+    plans.append(_plan(
+        "馬連", [n1, n2],
+        [{"combination": [n1, n2], "stake": _round_stake(bankroll)}],
+        f"{n1}〜{n2} 馬連", "低", "構造型",
+    ))
+
+    # ── 三連複BOX（上位4頭, 最大4点） ──
+    if len(top4) >= 3:
+        combos3 = list(combinations(top4, 3))[:MAX_BET_TICKETS]
+        s = _round_stake(bankroll / len(combos3))
+        plans.append(_plan(
+            "三連複BOX", top4,
+            [{"combination": list(c), "stake": s} for c in combos3],
+            f"能力上位{len(top4)}頭 三連複BOX {len(combos3)}点", "中", "構造型",
+        ))
+
+    # ── 三連単（1着固定: names[0], 2・3着: names[1:3] の全順列） ──
+    if n3:
+        perms = list(_perms([n2, n3], 2))
+        s = _round_stake(bankroll / len(perms))
+        plans.append(_plan(
+            "三連単", top3,
+            [{"combination": [n1] + list(p), "stake": s} for p in perms],
+            f"{n1} 1着固定 三連単 {len(perms)}通り", "高", "構造型",
+        ))
+
+    return plans
 
 
 def _score_bet_plan(
@@ -1134,14 +1557,20 @@ def _score_bet_plan(
     ai_hit_prob: float,
     n_tickets: int,
     per_stake: int,
+    stable_score: float = 0.5,
+    bet_type: str = "",
 ) -> float:
     """
-    買い目プランの複合スコア（EV × ヒット率重み × 点数ペナルティ）。
+    買い目プランの複合スコア（EV × ヒット率重み × 点数ペナルティ × 安定性ペナルティ）。
     スコアが高いほど「再現性があり少額でも運用しやすい」プランと判断する。
 
     - per_stake が MIN_STAKE_PER_TICKET を下回るプランは即除外（-1.0）
     - ヒット率が高いほど微加点（arctan近似）
     - 点数が多いほどペナルティ
+    - 単勝: stable_score < TANSHO_STABLE_MIN → ×0.88 ペナルティ（1着が必要なため安定性を重視）
+    - 複勝: stable_score < FUKUSHO_STABLE_MIN → ×0.92 ペナルティ（3着圏内でよいため緩め）
+    - 馬連: stable_score（軸馬） < UMAREN_AXIS_STABLE_MIN → ×0.90（軸不安定＝組み合わせ全崩れリスク）
+    - ワイド/3連複: stable_score（min） < WIDE_AXIS_STABLE_MIN → ×0.93（複数馬依存のためやや緩め）
     """
     if per_stake < MIN_STAKE_PER_TICKET:
         return -1.0
@@ -1152,7 +1581,17 @@ def _score_bet_plan(
         ticket_factor = 0.97
     else:
         ticket_factor = 0.93
-    return ev * hit_weight * ticket_factor
+    if bet_type == "単勝" and stable_score < TANSHO_STABLE_MIN:
+        stable_factor = 0.88
+    elif bet_type == "複勝" and stable_score < FUKUSHO_STABLE_MIN:
+        stable_factor = 0.92
+    elif bet_type == "馬連" and stable_score < UMAREN_AXIS_STABLE_MIN:
+        stable_factor = 0.90
+    elif bet_type in ("ワイド", "3連複") and stable_score < WIDE_AXIS_STABLE_MIN:
+        stable_factor = 0.93
+    else:
+        stable_factor = 1.0
+    return ev * hit_weight * ticket_factor * stable_factor
 
 
 def _select_best_plan(
@@ -1164,15 +1603,26 @@ def _select_best_plan(
 
     選定ルール:
     1. 券種別EV閾値（単勝/複勝 >= EV_SKIP_THRESHOLD、その他 >= EV_COMPOUND_SKIP）を満たす
-    2. 同一券種内で MAX_PRACTICAL_TICKETS まで集約
+    2. 同一券種内で EV 降順に最大 MAX_PRACTICAL_TICKETS 点まで集約（現在10点上限）
     3. per_stake >= MIN_STAKE_PER_TICKET を保証
-    4. 複合スコアで券種を選択
+    4. 複合スコア（_score_bet_plan）で券種を選択
+       — 点数が多いほどペナルティ: ≤3点×1.00 / ≤5点×0.97 / >5点×0.93
     5. EV差が EV_TIE_MARGIN 以内の券種が複数あれば、少点数・低リスクを優先
     """
-    def ev_threshold(bet_type: str) -> float:
-        return EV_SKIP_THRESHOLD if bet_type in ("単勝", "複勝") else EV_COMPOUND_SKIP
+    def ev_threshold(r: Dict[str, Any]) -> float:
+        base = EV_SKIP_THRESHOLD if r["bet_type"] in ("単勝", "複勝") else EV_COMPOUND_SKIP
+        # 人気1〜2番を含む3連複は閾値を緩める（AIが過小評価しても市場人気馬を候補に残す）
+        if r["bet_type"] == "3連複" and r.get("has_top2_popular"):
+            base = min(base, 0.82)
+        return base
 
-    candidates = [r for r in ticket_evs if r["ev"] >= ev_threshold(r["bet_type"])]
+    # 複勝は主推奨から除外（回収率上限が低く、ユーザーの期待に応えられないため）
+    _EXCLUDE_AS_PRIMARY = {"複勝"}
+
+    candidates = [
+        r for r in ticket_evs
+        if r["ev"] >= ev_threshold(r) and r["bet_type"] not in _EXCLUDE_AS_PRIMARY
+    ]
     if not candidates:
         return None
 
@@ -1187,12 +1637,24 @@ def _select_best_plan(
         group_sorted = sorted(group, key=lambda x: x["ev"], reverse=True)
         selected     = group_sorted[:MAX_PRACTICAL_TICKETS]
         n            = len(selected)
-        raw_per      = bankroll / max(n, 1)
-        per_stake    = max(MIN_STAKE_PER_TICKET, (int(raw_per) // BANKROLL_UNIT) * BANKROLL_UNIT)
 
         top_ev       = selected[0]["ev"]
         top_hit_prob = selected[0]["ai_hit_prob"]
-        score = _score_bet_plan(top_ev, top_hit_prob, n, per_stake)
+        top_stable   = float(selected[0].get("stable_score") or 0.5)
+
+        # half-Kelly による賭け金計算
+        # f = KELLY_FRACTION × p × (EV-1) / (EV-p)
+        # EV = p × payout → payout = EV/p, net_odds = EV/p - 1
+        _p   = max(0.001, top_hit_prob)
+        _ev  = top_ev
+        _kelly_f = KELLY_FRACTION * _p * (_ev - 1.0) / max(0.001, _ev - _p)
+        _kelly_f = max(KELLY_MIN_RATIO, min(KELLY_MAX_RATIO, _kelly_f))
+        # 総配分を点数で均等割り、100円単位に丸め
+        _total_kelly = bankroll * _kelly_f
+        per_stake    = max(MIN_STAKE_PER_TICKET,
+                           (int(_total_kelly / max(n, 1)) // BANKROLL_UNIT) * BANKROLL_UNIT)
+
+        score = _score_bet_plan(top_ev, top_hit_prob, n, per_stake, top_stable, bet_type)
 
         if score > best_score:
             best_score  = score
@@ -1217,6 +1679,21 @@ def _build_ev_plan(
     group      = selection["group"]
     per_stake  = selection["per_stake"]
     bet_type   = best_entry["bet_type"]
+
+    # 3連複で人気1〜2番が1枚も含まれていない場合、末尾チケットと入れ替える
+    if bet_type == "3連複" and not any(r.get("has_top2_popular") for r in group):
+        _pop_candidates = [
+            r for r in ticket_evs
+            if r["bet_type"] == "3連複"
+            and r.get("has_top2_popular")
+            and r["ev"] >= 0.75
+        ]
+        if _pop_candidates:
+            _best_pop = max(_pop_candidates, key=lambda x: x["ev"])
+            # 末尾（最低EV）を置き換え、既存グループに重複がなければ差し込む
+            _group_combos = [frozenset(r["horses"]) for r in group]
+            if frozenset(_best_pop["horses"]) not in _group_combos:
+                group = group[:-1] + [_best_pop]
 
     tickets = [{"combination": r["horses"], "stake": per_stake} for r in group]
 
@@ -1297,8 +1774,9 @@ def _recommend_by_structure(
     race_structure: Dict[str, Any],
     bankroll: int,
     race_pace: str,
+    horse_roles: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """レース構造ベースの推奨買い目（オッズ未入力時 or EV全滅時のフォールバック）"""
+    """レース構造ベースの推奨買い目。horse_roles があれば消し馬を除外する。"""
     EMPTY: Dict[str, Any] = {
         "bet_type":     "-",
         "horses":       [],
@@ -1314,26 +1792,51 @@ def _recommend_by_structure(
 
     structure_type = race_structure.get("structure_type", "標準型")
 
-    sorted_features = sorted(
-        features,
-        key=lambda x: float(x.get("win_prob") or 0.0),
-        reverse=True,
-    )
+    # horse_roles が渡された場合: 消し馬を除外し、head/axis を優先順位上位に
+    if horse_roles:
+        _role_map = {r["horse_name"]: r.get("role", "himo") for r in horse_roles}
+        _ROLE_ORDER = {"head": 0, "axis": 1, "himo": 2, "fade": 3}
+        sorted_features = sorted(
+            features,
+            key=lambda x: (
+                _ROLE_ORDER.get(_role_map.get(str(x.get("horse_name") or ""), "himo"), 2),
+                -float(x.get("win_prob") or 0.0),
+            ),
+        )
+        # 消し馬は除外（ただし非消し馬が2頭未満なら最高win_prob消し馬を追加）
+        _non_fade = [f for f in sorted_features
+                     if _role_map.get(str(f.get("horse_name") or ""), "himo") != "fade"]
+        if len(_non_fade) < 2:
+            _fade_sorted = [f for f in sorted_features if f not in _non_fade]
+            _non_fade = _non_fade + _fade_sorted[:2 - len(_non_fade)]
+        sorted_features = _non_fade
+    else:
+        sorted_features = sorted(
+            features,
+            key=lambda x: float(x.get("win_prob") or 0.0),
+            reverse=True,
+        )
 
-    value_horses  = detect_value_horses(ev_table, features, race_pace)
-    danger_horses = detect_danger_favorites_v2(ev_table, features, race_pace)
-    danger_names  = {d["horse_name"] for d in danger_horses}
-
-    axis_candidates = [f for f in sorted_features if f.get("horse_name") not in danger_names]
-    if not axis_candidates:
+    # horse_roles がある場合: fade除外はすでに sorted_features に反映済み。
+    # オッズ由来の detect_danger_favorites_v2 を二重適用しない。
+    # horse_roles がない場合（フォールバック）のみ、オッズベースの danger 除外を行う。
+    if horse_roles:
         axis_candidates = sorted_features
+    else:
+        _danger_h = detect_danger_favorites_v2(ev_table, features, race_pace)
+        _danger_n = {d["horse_name"] for d in _danger_h if d.get("is_truly_dangerous", True)}
+        axis_candidates = [f for f in sorted_features if f.get("horse_name") not in _danger_n]
+        if not axis_candidates:
+            axis_candidates = sorted_features
+
+    # value_horses は参考計算のみ（馬選定には使わない）
+    value_horses = detect_value_horses(ev_table, features, race_pace)  # noqa: unused-in-selection
+
+    if not axis_candidates:
+        return {**EMPTY, "skip": True, "skip_reason": "推奨できる馬がいません。見送り推奨。"}
 
     axis      = axis_candidates[0]
     axis_name = str(axis.get("horse_name") or "")
-
-    has_value = len(value_horses) > 0
-    if not has_value and not axis_candidates:
-        return {**EMPTY, "skip": True, "skip_reason": "期待値条件を満たす買い目がありません。見送り推奨。"}
 
     # ----- ① 本命信頼型 -----
     if structure_type == "本命信頼型":
@@ -1358,7 +1861,7 @@ def _recommend_by_structure(
 
     # ----- ③ 波乱型 -----
     elif structure_type == "波乱型":
-        box_names = [v["horse_name"] for v in value_horses[:2]]
+        box_names = []
         for f in axis_candidates:
             fn = str(f.get("horse_name") or "")
             if fn not in box_names:
@@ -1381,9 +1884,6 @@ def _recommend_by_structure(
             for f in axis_candidates
             if f.get("running_style") == "closer"
         ]
-        for v in value_horses:
-            if v["horse_name"] not in closer_names:
-                closer_names.append(v["horse_name"])
         pool = closer_names + [str(f.get("horse_name") or "") for f in axis_candidates]
         pool = list(dict.fromkeys(pool))[:4]
         if len(pool) >= 3:
@@ -1412,11 +1912,8 @@ def _recommend_by_structure(
 
     # ----- ⑥ 混戦型 / 標準型 -----
     else:
-        pool = [str(axis_candidates[0].get("horse_name") or "")]
-        for v in value_horses:
-            if v["horse_name"] not in pool:
-                pool.append(v["horse_name"])
-        for f in axis_candidates[1:]:
+        pool = []
+        for f in axis_candidates:
             fn = str(f.get("horse_name") or "")
             if fn not in pool:
                 pool.append(fn)
@@ -1478,13 +1975,9 @@ def _plan(
 def _pick_second(
     axis_candidates: List[Dict[str, Any]],
     axis_name: str,
-    value_horses: List[Dict[str, Any]],
+    value_horses: List[Dict[str, Any]],  # 引数は互換性のため残す（未使用）
 ) -> Optional[str]:
-    """軸の次の候補を返す（妙味馬があれば優先）"""
-    for v in value_horses:
-        vn = v["horse_name"]
-        if vn != axis_name:
-            return vn
+    """軸の次の候補を返す。win_prob/role順のaxis_candidatesから選択（オッズ非依存）"""
     for f in axis_candidates[1:]:
         fn = str(f.get("horse_name") or "")
         if fn != axis_name:
@@ -1495,15 +1988,11 @@ def _pick_second(
 def _build_others(
     axis_candidates: List[Dict[str, Any]],
     axis_name: str,
-    value_horses: List[Dict[str, Any]],
+    value_horses: List[Dict[str, Any]],  # 引数は互換性のため残す（未使用）
     max_count: int = 4,
 ) -> List[str]:
-    """軸以外の相手馬リストを構築（妙味馬を優先）"""
+    """軸以外の相手馬リストを構築。win_prob/role順のaxis_candidatesから選択（オッズ非依存）"""
     result: List[str] = []
-    for v in value_horses:
-        vn = v["horse_name"]
-        if vn != axis_name and vn not in result:
-            result.append(vn)
     for f in axis_candidates[1:]:
         fn = str(f.get("horse_name") or "")
         if fn != axis_name and fn not in result:
@@ -1598,9 +2087,8 @@ def calc_horse_scores(
     recent_form  = float(f.get("recent_form_index") or 0.5)
     last3f       = float(f.get("last3f_index") or 0.5)
     form_base    = (recent_form + last3f) / 2.0
-    value_gap    = float((ev_row or {}).get("value_gap") or 0.0)
-    value_comp   = max(0.0, value_gap * 3.0)
-    upside_score = min(1.0, form_base * 0.6 + value_comp * 0.4)
+    # upside_score は能力ベースのみ（value_gap=オッズ由来を除外）
+    upside_score = min(1.0, form_base)
 
     # ペース適合: 有利脚質との一致度
     running_style   = f.get("running_style") or ""
@@ -1675,6 +2163,7 @@ def assign_roles(
     features: List[Dict[str, Any]],
     ev_table: List[Dict[str, Any]],
     race_structure: Optional[Dict[str, Any]] = None,
+    danger_horses: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     各馬に役割を割り当てる。
@@ -1703,6 +2192,15 @@ def assign_roles(
         if vg is not None and wo is not None:
             if float(wo) <= DANGER_ODDS_MAX and vg <= -DANGER_GAP_MIN:
                 danger_names.add(row["horse_name"])
+
+    # is_truly_dangerous マップ
+    # danger_horses 未提供時は False（能力チェックなしで fade にしない）。
+    # 通常フロー（recommend_bet_plan）は detect_danger_favorites_v3 の結果を必ず渡す。
+    _truly_map: Dict[str, bool] = {
+        d["horse_name"]: bool(d.get("is_truly_dangerous", True))
+        for d in (danger_horses or [])
+    }
+    _truly_default = False  # danger_horses 未提供時: 能力証拠なしで fade にしない
 
     sorted_by_win = sorted(
         features,
@@ -1735,13 +2233,33 @@ def assign_roles(
                                0.04 if "FAVORITE_LOW_TRUST" in jockey_codes else 0.0)
         himo_threshold_adj  = -0.02 if "LONGSHOT_UPSIDE"   in jockey_codes else 0.0
 
-        if name in danger_names and "FAVORITE_LOW_TRUST" not in jockey_codes:
-            # 危険人気馬だが騎手補正がニュートラルな場合はそのまま fade
+        _is_truly_danger = _truly_map.get(name, _truly_default) if name in danger_names else False
+        _pop = int(f.get("popularity") or 99)
+        _ev_vg = float((ev_by_name.get(name) or {}).get("value_gap") or 0.0)
+
+        # 1〜3番人気はvalue_gap が -0.08 以上深くないとfadeにしない
+        # （AIのwin_prob精度が不十分なため、市場評価上位馬を安易に消しにしない）
+        if name in danger_names and _is_truly_danger and _pop <= 3 and _ev_vg > -0.08:
+            # 危険判定を軟化: fadeではなくhimoに留める
+            _is_truly_danger = False
+
+        if name in danger_names and _is_truly_danger and "FAVORITE_LOW_TRUST" not in jockey_codes:
+            # 真に危険な人気馬（消し）
             role   = "fade"
             reason = "危険人気馬（AI<市場評価）"
-        elif name in danger_names and "FAVORITE_LOW_TRUST" in jockey_codes:
+        elif name in danger_names and _is_truly_danger and "FAVORITE_LOW_TRUST" in jockey_codes:
             role   = "fade"
             reason = "危険人気馬（AI<市場評価）・" + (jockey_summary or "人気馬信頼度低")
+        elif name in danger_names and not _is_truly_danger:
+            # 相手残り危険馬: 1着は怪しいが3着残りの可能性あり → himo 上限で判定
+            if top3_p >= (TOP3_HIMO_MIN + himo_threshold_adj):
+                role   = "himo"
+                reason = "相手残り（上位人気・3着内残り）"
+                if jockey_summary and "LONGSHOT_UPSIDE" in jockey_codes:
+                    reason = reason + "・" + jockey_summary
+            else:
+                role   = "fade"
+                reason = "相手残り候補だが3着内確率不足"
         elif (
             name in top2_names
             and win_p >= WIN_PROB_HEAD_MIN
@@ -1781,6 +2299,24 @@ def assign_roles(
             "axis_score":   axis_s,
             "jockey_delta": jockey_delta,
         })
+
+    # ── 大頭数フォールバック ─────────────────────────────────────────
+    # 全馬/ほぼ全馬がfadeになった場合（大頭数レースで絶対閾値を超えられないケース）、
+    # 勝率上位から相対評価で head/axis/himo を強制割り当てする。
+    n_non_fade = sum(1 for r in results if r["role"] != "fade")
+    if n_non_fade < 3:
+        _sorted = sorted(results, key=lambda r: -r["win_prob"])
+        _rank_role = {0: "head", 1: "axis", 2: "himo", 3: "himo"}
+        _assigned  = 0
+        for _r in _sorted:
+            if _r["role"] == "fade" and _assigned in _rank_role:
+                _r["role"]   = _rank_role[_assigned]
+                _r["reason"] = f"相対評価{_assigned+1}位（大頭数フィールド自動調整）"
+                _assigned   += 1
+            elif _r["role"] != "fade":
+                _assigned   += 1
+            if _assigned >= 4:
+                break
 
     return results
 
@@ -1947,7 +2483,8 @@ def detect_danger_favorites_v3(
         )
 
         is_truly_dangerous = (axis_s < DANGER_V3_AXIS_MAX and top3_p < DANGER_V3_TOP3_MAX)
-        if pace_conflict:
+        # 展開不利でも top3_prob が高い馬は「相手残り」扱い — 実力馬を過剰に消さない
+        if pace_conflict and top3_p < DANGER_V3_TOP3_MAX:
             is_truly_dangerous = True
 
         reason = _danger_reason_v3(f, row, race_pace, scores, pace_conflict)
@@ -1961,3 +2498,383 @@ def detect_danger_favorites_v3(
 
     candidates.sort(key=lambda x: float(x.get("value_gap") or 0))
     return candidates[:3]
+
+
+# =========================================================
+# AI馬券師推奨機能 — 全券種・1枚100円固定
+# =========================================================
+
+BETMASTER_TICKET_UNIT: int = 100  # 1枚100円固定
+
+# 自信度閾値
+CONFIDENCE_TANSHO: float = 0.60    # 単勝: head の stable_score
+CONFIDENCE_FUKUSHO: float = 0.50   # 複勝: head の top3_prob
+CONFIDENCE_BATAN: float = 0.65     # 馬単・三連単: head の stable_score（厳しめ）
+
+
+def _bm_stable(f: Dict[str, Any]) -> float:
+    """stable_score = (consistency_index + trend_index) / 2"""
+    return (float(f.get("consistency_index") or 0.5) + float(f.get("trend_index") or 0.5)) / 2.0
+
+
+def _bm_sorted_candidates(
+    features: List[Dict[str, Any]],
+    horse_roles: Optional[List[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """
+    horse_roles に従って馬をソートし、role_map も返す。
+    horse_roles が None の場合は win_prob 順で自動割当。
+    fade 馬は non_fade リストから除外する。
+    """
+    _ROLE_ORDER = {"head": 0, "axis": 1, "himo": 2, "fade": 3}
+
+    if horse_roles:
+        role_map: Dict[str, str] = {r["horse_name"]: r.get("role", "himo") for r in horse_roles}
+        sorted_f = sorted(
+            features,
+            key=lambda x: (
+                _ROLE_ORDER.get(role_map.get(str(x.get("horse_name") or ""), "himo"), 2),
+                -float(x.get("win_prob") or 0.0),
+            ),
+        )
+        non_fade = [f for f in sorted_f
+                    if role_map.get(str(f.get("horse_name") or ""), "himo") != "fade"]
+    else:
+        sorted_f = sorted(features, key=lambda x: -float(x.get("win_prob") or 0.0))
+        non_fade = sorted_f
+        role_map = {}
+        for i, f in enumerate(non_fade):
+            name = str(f.get("horse_name") or "")
+            if i == 0:
+                role_map[name] = "head"
+            elif i <= 2:
+                role_map[name] = "axis"
+            else:
+                role_map[name] = "himo"
+
+    if len(non_fade) < 2:
+        fade_horses = [f for f in sorted_f if f not in non_fade]
+        non_fade = non_fade + fade_horses[:2 - len(non_fade)]
+
+    return non_fade, role_map
+
+
+def _bm_formation_trio_tickets(
+    leg1: List[str], leg2: List[str], leg3: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    三連複フォーメーション: leg1/leg2/leg3 から3頭の組み合わせを生成。
+    各レグから少なくとも1頭を含み、重複しないユニークな3頭組み合わせを返す。
+    """
+    seen: Set[frozenset] = set()
+    tickets: List[Dict[str, Any]] = []
+    for a in leg1:
+        for b in leg2:
+            for c in leg3:
+                combo = frozenset([a, b, c])
+                if len(combo) == 3 and combo not in seen:
+                    seen.add(combo)
+                    tickets.append({"combination": sorted([a, b, c]), "stake": BETMASTER_TICKET_UNIT})
+    return tickets
+
+
+def _bm_formation_trifecta_tickets(
+    leg1: List[str], leg2: List[str], leg3: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    三連単フォーメーション: (1着, 2着, 3着) の順列を生成。
+    各馬は1回のみ使用。
+    """
+    seen: Set[Tuple[str, str, str]] = set()
+    tickets: List[Dict[str, Any]] = []
+    for a in leg1:
+        for b in leg2:
+            for c in leg3:
+                if len({a, b, c}) == 3 and (a, b, c) not in seen:
+                    seen.add((a, b, c))
+                    tickets.append({"combination": [a, b, c], "stake": BETMASTER_TICKET_UNIT})
+    return tickets
+
+
+def _bm_plan(
+    bet_type: str,
+    formation_legs: Optional[Dict[str, List[str]]],
+    tickets: List[Dict[str, Any]],
+    risk_level: str,
+    reason: str,
+    confidence_ok: bool,
+    no_pick_reason: str,
+    confidence_score: float,
+) -> Dict[str, Any]:
+    """AI馬券師プランの標準辞書を返す。"""
+    count = len(tickets)
+    return {
+        "bet_type":         bet_type,
+        "formation_legs":   formation_legs,
+        "tickets":          tickets,
+        "ticket_count":     count,
+        "budget":           count * BETMASTER_TICKET_UNIT,
+        "risk_level":       risk_level,
+        "reason":           reason,
+        "confidence_ok":    confidence_ok,
+        "no_pick_reason":   no_pick_reason,
+        "confidence_score": confidence_score,
+    }
+
+
+def recommend_betmaster_plans(
+    features: List[Dict[str, Any]],
+    race_structure: Dict[str, Any],
+    horse_roles: Optional[List[Dict[str, Any]]] = None,
+    race_pace: str = "medium",
+) -> List[Dict[str, Any]]:
+    """
+    全券種（単勝・複勝・ワイド・馬連・馬単・三連複×2・三連単×2）を評価し、
+    AI馬券師として1枚100円固定で推奨する買い目リストを返す。
+
+    各プランに confidence_ok フラグを付与し、
+    自信がない券種は tickets=[] / confidence_ok=False / no_pick_reason=理由 を返す。
+    """
+    non_fade, role_map = _bm_sorted_candidates(features, horse_roles)
+    if not non_fade:
+        return []
+
+    head_horses = [f for f in non_fade if role_map.get(str(f.get("horse_name") or ""), "himo") == "head"]
+    axis_horses = [f for f in non_fade if role_map.get(str(f.get("horse_name") or ""), "himo") == "axis"]
+    himo_horses = [f for f in non_fade if role_map.get(str(f.get("horse_name") or ""), "himo") == "himo"]
+
+    if not head_horses:
+        head_horses = non_fade[:1]
+    if not axis_horses:
+        axis_horses = non_fade[1:3]
+    if not himo_horses:
+        himo_horses = non_fade[3:]
+
+    head = head_horses[0]
+    head_name = str(head.get("horse_name") or "")
+    head_stable = _bm_stable(head)
+
+    pp = estimate_placement_probs(head, race_structure)
+    head_top3_prob = pp["p_top3"]
+
+    axis_names = [str(f.get("horse_name") or "") for f in axis_horses[:3]]
+    himo_names = [str(f.get("horse_name") or "") for f in himo_horses]
+    all_names = [str(f.get("horse_name") or "") for f in non_fade]
+
+    plans: List[Dict[str, Any]] = []
+
+    # ── 1. 単勝 ───────────────────────────────────────────────────────────
+    ok_tansho = head_stable >= CONFIDENCE_TANSHO
+    plans.append(_bm_plan(
+        bet_type="単勝",
+        formation_legs=None,
+        tickets=[{"combination": [head_name], "stake": BETMASTER_TICKET_UNIT}] if ok_tansho else [],
+        risk_level="低",
+        reason=f"{head_name} の安定指数 {head_stable:.2f}（閾値{CONFIDENCE_TANSHO}）",
+        confidence_ok=ok_tansho,
+        no_pick_reason="" if ok_tansho else f"軸馬の安定指数不足（{head_stable:.2f} < {CONFIDENCE_TANSHO}）",
+        confidence_score=head_stable,
+    ))
+
+    # ── 2. 複勝 ───────────────────────────────────────────────────────────
+    ok_fukusho = head_top3_prob >= CONFIDENCE_FUKUSHO
+    plans.append(_bm_plan(
+        bet_type="複勝",
+        formation_legs=None,
+        tickets=[{"combination": [head_name], "stake": BETMASTER_TICKET_UNIT}] if ok_fukusho else [],
+        risk_level="最低",
+        reason=f"{head_name} の3着圏内確率 {head_top3_prob:.2f}（閾値{CONFIDENCE_FUKUSHO}）",
+        confidence_ok=ok_fukusho,
+        no_pick_reason="" if ok_fukusho else f"3着圏内確率不足（{head_top3_prob:.2f} < {CONFIDENCE_FUKUSHO}）",
+        confidence_score=head_top3_prob,
+    ))
+
+    # ── 3. ワイド ────────────────────────────────────────────────────────
+    wide_legs = [head_name] + axis_names[:2]
+    wide_combos = list(combinations(wide_legs, 2))
+    wide_tickets = [{"combination": list(c), "stake": BETMASTER_TICKET_UNIT} for c in wide_combos]
+    plans.append(_bm_plan(
+        bet_type="ワイド",
+        formation_legs={"組み合わせ": wide_legs},
+        tickets=wide_tickets,
+        risk_level="低",
+        reason=f"能力上位{len(wide_legs)}頭のワイドBOX",
+        confidence_ok=True,
+        no_pick_reason="",
+        confidence_score=head_stable,
+    ))
+
+    # ── 4. 馬連（流し）────────────────────────────────────────────────────
+    umaren_partners = axis_names + [str(f.get("horse_name") or "") for f in himo_horses[:3]]
+    umaren_partners = [n for n in umaren_partners if n != head_name][:5]
+    umaren_tickets = [{"combination": sorted([head_name, p]), "stake": BETMASTER_TICKET_UNIT}
+                      for p in umaren_partners]
+    plans.append(_bm_plan(
+        bet_type="馬連（流し）",
+        formation_legs={"軸": [head_name], "相手": umaren_partners},
+        tickets=umaren_tickets,
+        risk_level="低",
+        reason=f"{head_name} 軸・馬連流し {len(umaren_tickets)}点",
+        confidence_ok=True,
+        no_pick_reason="",
+        confidence_score=head_stable,
+    ))
+
+    # ── 5. 馬単フォーメーション ──────────────────────────────────────────
+    ok_batan = head_stable >= CONFIDENCE_BATAN
+    batan_partners = axis_names[:3]
+    batan_tickets = [{"combination": [head_name, p], "stake": BETMASTER_TICKET_UNIT}
+                     for p in batan_partners] if ok_batan else []
+    plans.append(_bm_plan(
+        bet_type="馬単フォーメーション",
+        formation_legs={"1着": [head_name], "2着": batan_partners} if batan_partners else None,
+        tickets=batan_tickets,
+        risk_level="中",
+        reason=f"{head_name} 1着固定・馬単 {len(batan_tickets)}点",
+        confidence_ok=ok_batan,
+        no_pick_reason="" if ok_batan else f"1着固定の確度不足（安定指数 {head_stable:.2f} < {CONFIDENCE_BATAN}）",
+        confidence_score=head_stable,
+    ))
+
+    # ── 6. 三連複フォーメーション（AI絞り）────────────────────────────────
+    trio_leg1 = [head_name]
+    trio_leg2 = axis_names[:2]
+    trio_leg3_ai = [str(f.get("horse_name") or "") for f in
+                    sorted(himo_horses, key=lambda x: -float(x.get("win_prob") or 0.0))[:6]]
+    trio_ai_tickets = _bm_formation_trio_tickets(trio_leg1, trio_leg2, trio_leg3_ai)
+    plans.append(_bm_plan(
+        bet_type="三連複フォーメーション（AI絞り）",
+        formation_legs={"馬1": trio_leg1, "馬2": trio_leg2, "馬3": trio_leg3_ai},
+        tickets=trio_ai_tickets,
+        risk_level="中",
+        reason=f"馬1:{head_name} / 馬2:{len(trio_leg2)}頭 / 馬3:AI絞り{len(trio_leg3_ai)}頭",
+        confidence_ok=True,
+        no_pick_reason="",
+        confidence_score=head_stable,
+    ))
+
+    # ── 7. 三連複フォーメーション（全頭）─────────────────────────────────
+    trio_leg3_all = [n for n in all_names if n != head_name and n not in trio_leg2]
+    trio_all_tickets = _bm_formation_trio_tickets(trio_leg1, trio_leg2, trio_leg3_all)
+    plans.append(_bm_plan(
+        bet_type="三連複フォーメーション（全頭）",
+        formation_legs={"馬1": trio_leg1, "馬2": trio_leg2, "馬3": trio_leg3_all},
+        tickets=trio_all_tickets,
+        risk_level="中",
+        reason=f"馬1:{head_name} / 馬2:{len(trio_leg2)}頭 / 馬3:全{len(trio_leg3_all)}頭",
+        confidence_ok=True,
+        no_pick_reason="",
+        confidence_score=head_stable,
+    ))
+
+    # ── 8. 三連単フォーメーション（AI絞り）────────────────────────────────
+    trifecta_leg1 = [head_name]
+    trifecta_leg2 = axis_names[:3]
+    trifecta_leg3_ai = [str(f.get("horse_name") or "") for f in
+                        sorted(himo_horses, key=lambda x: -float(x.get("win_prob") or 0.0))[:6]]
+    trifecta_ai_tickets = _bm_formation_trifecta_tickets(
+        trifecta_leg1, trifecta_leg2, trifecta_leg3_ai
+    ) if ok_batan else []
+    plans.append(_bm_plan(
+        bet_type="三連単フォーメーション（AI絞り）",
+        formation_legs={"1着": trifecta_leg1, "2着": trifecta_leg2, "3着": trifecta_leg3_ai},
+        tickets=trifecta_ai_tickets,
+        risk_level="高",
+        reason=f"1着:{head_name} / 2着:{len(trifecta_leg2)}頭 / 3着:AI絞り{len(trifecta_leg3_ai)}頭",
+        confidence_ok=ok_batan,
+        no_pick_reason="" if ok_batan else f"1着固定の確度不足（安定指数 {head_stable:.2f} < {CONFIDENCE_BATAN}）",
+        confidence_score=head_stable,
+    ))
+
+    # ── 9. 三連単フォーメーション（全頭）─────────────────────────────────
+    trifecta_leg3_all = [n for n in all_names if n != head_name and n not in trifecta_leg2]
+    trifecta_all_tickets = _bm_formation_trifecta_tickets(
+        trifecta_leg1, trifecta_leg2, trifecta_leg3_all
+    ) if ok_batan else []
+    plans.append(_bm_plan(
+        bet_type="三連単フォーメーション（全頭）",
+        formation_legs={"1着": trifecta_leg1, "2着": trifecta_leg2, "3着": trifecta_leg3_all},
+        tickets=trifecta_all_tickets,
+        risk_level="高",
+        reason=f"1着:{head_name} / 2着:{len(trifecta_leg2)}頭 / 3着:全{len(trifecta_leg3_all)}頭",
+        confidence_ok=ok_batan,
+        no_pick_reason="" if ok_batan else f"1着固定の確度不足（安定指数 {head_stable:.2f} < {CONFIDENCE_BATAN}）",
+        confidence_score=head_stable,
+    ))
+
+    return plans
+
+
+def select_primary_betmaster(
+    plans: List[Dict[str, Any]],
+    race_structure: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    recommend_betmaster_plans() の結果から主推奨を1つ選定して返す。
+    confidence_ok=True の中からレース構造に基づいてスコアリングし最高値を返す。
+    全て confidence_ok=False の場合は None を返す。
+    """
+    structure_type = (race_structure or {}).get("structure_type", "標準型")
+
+    _BASE_PRIORITY: Dict[str, float] = {
+        "単勝":                         0.50,
+        "複勝":                         0.20,
+        "ワイド":                        0.40,
+        "馬連（流し）":                   0.55,
+        "馬単フォーメーション":            0.60,
+        "三連複フォーメーション（AI絞り）":  0.80,
+        "三連複フォーメーション（全頭）":    0.65,
+        "三連単フォーメーション（AI絞り）":  0.70,
+        "三連単フォーメーション（全頭）":    0.55,
+    }
+
+    _STRUCTURE_BONUS: Dict[str, Dict[str, float]] = {
+        "本命信頼型": {
+            "馬単フォーメーション":            0.20,
+            "三連単フォーメーション（AI絞り）":  0.15,
+            "馬連（流し）":                   0.10,
+        },
+        "標準型": {
+            "三連複フォーメーション（AI絞り）":  0.15,
+            "馬連（流し）":                   0.05,
+        },
+        "1強相手混戦型": {
+            "三連複フォーメーション（AI絞り）":  0.10,
+            "三連複フォーメーション（全頭）":    0.15,
+        },
+        "混戦型": {
+            "三連複フォーメーション（全頭）":    0.20,
+            "ワイド":                        0.10,
+        },
+        "波乱型": {
+            "ワイド":                        0.25,
+            "複勝":                         0.15,
+            "三連複フォーメーション（全頭）":    0.10,
+        },
+        "差し届く型": {
+            "三連複フォーメーション（AI絞り）":  0.10,
+            "三連単フォーメーション（AI絞り）":  0.10,
+        },
+    }
+
+    bonus_map = _STRUCTURE_BONUS.get(structure_type, {})
+
+    best_plan: Optional[Dict[str, Any]] = None
+    best_score: float = -1.0
+
+    for plan in plans:
+        if not plan.get("confidence_ok"):
+            continue
+        if not plan.get("tickets"):
+            continue
+
+        base = _BASE_PRIORITY.get(plan["bet_type"], 0.4)
+        bonus = bonus_map.get(plan["bet_type"], 0.0)
+        ticket_penalty = min(0.20, plan["ticket_count"] / 500.0)
+        score = base + bonus - ticket_penalty
+
+        if score > best_score:
+            best_score = score
+            best_plan = plan
+
+    return best_plan
