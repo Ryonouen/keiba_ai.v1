@@ -171,6 +171,10 @@ def build_race_record(
     ev_by_name     = {r["horse_name"]: r           for r in ev_table}
     rescue_names   = {r["horse_name"] for r in rescue_horses}
     danger_names   = {r["horse_name"] for r in danger_horses}
+    # is_truly_dangerous フラグを保持（detect_danger_favorites_v2 の分類を review_ai で使用）
+    truly_dangerous_by_name = {
+        r["horse_name"]: r.get("is_truly_dangerous", True) for r in danger_horses
+    }
     value_names    = {r["horse_name"] for r in value_horses}
 
     # 馬ごとのデータ
@@ -179,6 +183,21 @@ def build_race_record(
         name   = str(f.get("horse_name") or "")
         ev_row = ev_by_name.get(name, {})
         role_d = roles_by_name.get(name, {})
+        # シグナルサマリーの抽出（的中率トラッキング用）
+        _sig_result = f.get("trend_signal_details") or {}
+        _sig_strong_concerns  = [d.get("factor", "") for d in _sig_result.get("strong_concerns", [])]
+        _sig_strong_tailwinds = [d.get("factor", "") for d in _sig_result.get("strong_tailwinds", [])]
+        _sig_total_adjust     = _sig_result.get("total_trend_adjust", 0.0)
+        # positive/negative シグナルを持つ条件名リスト（追跡用）
+        _sig_pos_factors = [
+            d.get("factor", "") for d in _sig_result.get("details", [])
+            if "_positive" in d.get("signal", "")
+        ]
+        _sig_neg_factors = [
+            d.get("factor", "") for d in _sig_result.get("details", [])
+            if "_negative" in d.get("signal", "")
+        ]
+
         horse_records.append({
             "horse_name":         name,
             "mark":               marks_by_name.get(name, ""),
@@ -191,10 +210,18 @@ def build_race_record(
             "axis_score":         round(float(role_d.get("axis_score") or 0.0), 4),
             "value_gap":          ev_row.get("value_gap"),
             "win_odds":           ev_row.get("win_odds"),
-            "is_value_horse":     name in value_names,
-            "is_danger_favorite": name in danger_names,
+            "popularity_rank":    ev_row.get("popularity_rank"),   # 人気帯別分析用
+            "is_value_horse":      name in value_names,
+            "is_danger_favorite":  name in danger_names,
+            "is_truly_dangerous":  truly_dangerous_by_name.get(name, False),
             "is_rescue_candidate": name in rescue_names,
             "finish_position":    None,
+            # シグナルトラッキング（4-A: シグナル別的中率）
+            "signal_total_adjust":     round(float(_sig_total_adjust), 5),
+            "signal_positive_factors": _sig_pos_factors,
+            "signal_negative_factors": _sig_neg_factors,
+            "signal_strong_tailwinds": _sig_strong_tailwinds,
+            "signal_strong_concerns":  _sig_strong_concerns,
         })
 
     investment_amount = bet_plan.get("total_stake", 0) if not bet_plan.get("skip") else 0
@@ -215,6 +242,7 @@ def build_race_record(
         "race_date":             race_date,
         "race_course":           race_meta.get("target_course", ""),
         "race_grade":            _extract_grade(race_name),
+        "race_field_size":       len(features),   # 頭数（頭数別集計に使用）
         "race_info_text":        race_meta.get("race_info_text", ""),
         "predicted_pace":        race_meta.get("predicted_pace", "medium"),
         "race_structure": {
@@ -285,8 +313,8 @@ def check_bet_hit(
             return True
         if bet_type == "馬連" and combo <= top2:
             return True
-        if bet_type == "ワイド" and len(combo & top3) >= 2:
+        if bet_type in ("ワイド", "ワイドBOX") and len(combo & top3) >= 2:
             return True
-        if bet_type == "3連複" and combo <= top3:
+        if bet_type in ("3連複", "3連複BOX") and combo <= top3:
             return True
     return False

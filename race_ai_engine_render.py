@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from openai import OpenAI
+from openai_cost_guard import safe_chat_create
 from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
 import json
@@ -974,6 +975,26 @@ def classify_value_label(edge: Optional[float], ev: Optional[float]) -> str:
 # Model score / probability / EV
 # =========================================================
 
+def calc_age_index(age) -> float:
+    """馬齢補正スコア: 4-5歳ピーク、7歳以上は明確に減点。"""
+    if age is None:
+        return 0.50
+    a = int(age)
+    if a <= 2:
+        return 0.45
+    if a == 3:
+        return 0.48
+    if a == 4:
+        return 0.62
+    if a == 5:
+        return 0.60
+    if a == 6:
+        return 0.50
+    if a == 7:
+        return 0.36
+    return 0.26  # 8歳以上
+
+
 def calc_model_score(feature_dict: Dict[str, Any]) -> float:
     dc = feature_dict["distance_course_suitability_index"]
     style = feature_dict["style_suitability_index"]
@@ -981,6 +1002,7 @@ def calc_model_score(feature_dict: Dict[str, Any]) -> float:
     race_level = feature_dict.get("race_level_index", 0.5)
     race_level_boost = race_level * 0.05
     ground = feature_dict["ground_match_index"]
+    age_idx = calc_age_index(feature_dict.get("age"))
     pace_bias = feature_dict["pace_bias_index"]
     jockey = feature_dict["jockey_index"]
     gate = feature_dict["gate_index"]
@@ -994,13 +1016,14 @@ def calc_model_score(feature_dict: Dict[str, Any]) -> float:
     sample_adj = min(1.0, feature_dict.get("distance_course_sample_size",0) / 3.0)
 
     model_score = (
-        0.18 * dc
-        + 0.13 * style
-        + 0.15 * recent
-        + 0.05 * ground
+        0.17 * dc
+        + 0.12 * style
+        + 0.14 * recent
+        + 0.04 * ground
+        + 0.05 * age_idx      # 馬齢補正（4-5歳ピーク、7歳以上減点）
         + 0.07 * pace_bias
         + 0.07 * last3f
-        + 0.07 * lap
+        + 0.06 * lap
         + 0.06 * jockey
         + 0.04 * gate
         + 0.04 * pace_adv
@@ -1057,19 +1080,26 @@ def kelly_fraction(prob: float, odds: Optional[float]) -> float:
 # =========================================================
 
 ML_FEATURE_COLUMNS: List[str] = [
-    "distance_course_suitability_index",
-    "style_suitability_index",
-    "recent_form_index",
-    "ground_match_index",
-    "pace_bias_index",
-    "jockey_index",
-    "gate_index",
-    "last3f_index",
-    "pace_advantage",
-    "lap_suitability_index",
-    "trend_index",
-    "consistency_index",
-    "distance_fit_index",
+    # 基本特徴量（結果ページ + 分析時に取得可能）
+    "feat_gate",
+    "feat_age",
+    "feat_popularity",
+    "feat_win_odds_log",
+    "feat_last3f",
+    "feat_jockey_weight",
+    "feat_n_runners",
+    "feat_running_style_enc",
+    "feat_track_condition_enc",
+    # 条件統計シグナル特徴量
+    "feat_signal_total_adjust",
+    "feat_cond_diff_age",
+    "feat_cond_diff_gate",
+    "feat_cond_diff_style",
+    "feat_cond_diff_popularity",
+    "feat_cond_diff_last3f",
+    "feat_cond_diff_weight",
+    "feat_cond_diff_jockey",
+    "feat_cond_diff_track",
 ]
 
 
@@ -1837,8 +1867,9 @@ def analyze_winner_patterns_with_chatgpt(
 - JSONのみを返す
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = safe_chat_create(
+            client,
+            model="gpt-5.4",
             messages=[
                 {"role": "developer", "content": developer_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1927,6 +1958,7 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
             jockey_text = safe_find_text(row, By.CSS_SELECTOR, ".Jockey")
             win_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Odds")
             place_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Place_Odds")
+            barei_text = safe_find_text(row, By.CSS_SELECTOR, ".Barei")
 
             if not gate_text:
                 all_tds = row.find_elements(By.TAG_NAME, "td")
@@ -1934,12 +1966,15 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
                 digit_cells = [t for t in td_texts if t.isdigit()]
                 if len(digit_cells) >= 2:
                     gate_text = digit_cells[0]
-                    number_text = digit_cells[1]
+                    if not number_text:  # .Umaban で取得済みなら上書きしない
+                        number_text = digit_cells[1]
 
             gate = int(gate_text) if gate_text.isdigit() else None
             number = int(number_text) if number_text.isdigit() else None
             win_odds = parse_float(win_odds_text)
             place_odds = parse_odds_range_text(place_odds_text)
+            _age_m = re.search(r"(\d+)", barei_text)
+            horse_age = int(_age_m.group(1)) if _age_m else None
 
             horses.append({
                 "name": horse_name,
@@ -1949,6 +1984,7 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
                 "jockey": jockey_text,
                 "win_odds_scraped": win_odds,
                 "place_odds_scraped": place_odds,
+                "age": horse_age,
             })
         except Exception:
             continue
@@ -2665,6 +2701,7 @@ def analyze_race(
                 "records": records,
                 "entry_style":style,
                 "gate": horse.get("gate"),
+                "age": horse.get("age"),
                 "jockey": horse.get("jockey", ""),
                 "win_odds_scraped": horse.get("win_odds_scraped"),
                 "place_odds_scraped": horse.get("place_odds_scraped"),
@@ -2708,6 +2745,10 @@ def analyze_race(
             feature_dict["newspaper_mark"] = hr.get("newspaper_mark", "")
             feature_dict["newspaper_mark_index"] = newspaper_mark_to_index(hr.get("newspaper_mark", ""))
             feature_dict["newspaper_entry_style"] = hr.get("entry_style", "unknown")
+            # 馬番（出馬表順ソート用）
+            feature_dict["horse_number"] = hr.get("number")
+            # 馬齢（性齢欄から取得: 7歳以上フィルタ等に使用）
+            feature_dict["age"] = hr.get("age")
             features.append(feature_dict)
 
         for f in features:

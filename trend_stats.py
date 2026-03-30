@@ -6,6 +6,7 @@ trend_stats.py
 - 全走者付き過去レース履歴から条件別統計テーブルを構築
 - 全体基準値（overall_win_rate / overall_top3_rate）を計算
 - 各条件値に diff_win / diff_top3 を付与
+- 組み合わせ条件（コンボ）統計も構築
 """
 from __future__ import annotations
 
@@ -22,8 +23,19 @@ GATE_INNER_MAX:  int = 3          # 内枠: 1〜3
 GATE_MIDDLE_MAX: int = 6          # 中枠: 4〜6
                                    # 外枠: 7〜8 (それ以降)
 
-# 集計対象条件（辞書キー）
-CONDITION_KEYS = ("年齢", "枠", "脚質", "人気帯")
+# 集計対象条件（単体）
+CONDITION_KEYS = ("年齢", "枠", "脚質", "人気帯", "上がり3F帯", "斤量帯", "騎手", "馬場")
+
+# 集計対象条件の組み合わせ（コンボ）
+# 各タプルは (cond1, cond2) で "cond1×cond2" キーを作成する
+COMBO_CONDITION_PAIRS = [
+    ("脚質",  "人気帯"),       # 逃げ×1番人気 など
+    ("年齢",  "脚質"),         # 4歳×差し など
+    ("枠",    "脚質"),         # 内枠×逃げ など
+    ("脚質",  "上がり3F帯"),   # 差し×超速 など
+    ("人気帯", "上がり3F帯"),  # 1番人気×超速 など
+    ("脚質",  "馬場"),         # 差し×重馬場 など
+]
 
 
 # =========================================================
@@ -89,6 +101,73 @@ def bucket_popularity_odds(win_odds: Optional[float]) -> Optional[str]:
     return "10番人気以下"
 
 
+def bucket_last3f(last3f: Optional[float]) -> Optional[str]:
+    """上がり3F秒 → バケットキー。"""
+    if last3f is None:
+        return None
+    if last3f <= 33.0:
+        return "超速(〜33.0)"
+    if last3f <= 34.0:
+        return "速い(33〜34)"
+    if last3f <= 35.0:
+        return "標準(34〜35)"
+    if last3f <= 36.0:
+        return "遅め(35〜36)"
+    return "遅い(36〜)"
+
+
+def bucket_jockey_weight(w: Optional[float]) -> Optional[str]:
+    """斤量 (kg) → バケットキー。"""
+    if w is None:
+        return None
+    if w <= 54.0:
+        return "軽量(〜54)"
+    if w <= 56.0:
+        return "標準(54〜56)"
+    if w <= 57.0:
+        return "やや重(56〜57)"
+    return "重量(57〜)"
+
+
+def bucket_track_condition(condition: Optional[str]) -> Optional[str]:
+    """馬場状態 → バケットキー。"""
+    if not condition:
+        return None
+    condition = condition.strip()
+    # netkeibaの表記: 良 / 稍重 / 重 / 不良
+    if condition in ("良", "稍重", "重", "不良"):
+        return condition
+    return None
+
+
+def bucket_jockey(jockey_name: Optional[str]) -> Optional[str]:
+    """
+    騎手名 → バケットキー。
+
+    騎手名をそのままバケットキーとして使う（過去10年で同一レースに
+    複数回騎乗した騎手のみ信頼度ある統計が生まれる）。
+    空文字・None は除外する。
+    """
+    if not jockey_name:
+        return None
+    return jockey_name.strip() or None
+
+
+def bucket_prev_rank(rank: Optional[int]) -> Optional[str]:
+    """前走着順 → バケットキー。"""
+    if rank is None:
+        return None
+    if rank == 1:
+        return "前走1着"
+    if rank <= 3:
+        return "前走2〜3着"
+    if rank <= 5:
+        return "前走4〜5着"
+    if rank <= 9:
+        return "前走6〜9着"
+    return "前走10着以下"
+
+
 def bucket_distance(distance: Optional[int]) -> Optional[str]:
     """距離 → 距離帯バケットキー。"""
     if distance is None:
@@ -109,10 +188,14 @@ def get_condition_keys(runner: Dict[str, Any]) -> Dict[str, Optional[str]]:
         or bucket_popularity_odds(runner.get("odds"))
     )
     return {
-        "年齢":  bucket_age(runner.get("age")),
-        "枠":    bucket_gate(runner.get("gate")),
-        "脚質":  bucket_style(runner.get("running_style")),
-        "人気帯": pop_key,
+        "年齢":      bucket_age(runner.get("age")),
+        "枠":        bucket_gate(runner.get("gate")),
+        "脚質":      bucket_style(runner.get("running_style")),
+        "人気帯":    pop_key,
+        "上がり3F帯": bucket_last3f(runner.get("last_3f")),
+        "斤量帯":    bucket_jockey_weight(runner.get("jockey_weight")),
+        "騎手":      bucket_jockey(runner.get("jockey")),
+        "馬場":      bucket_track_condition(runner.get("track_condition")),
     }
 
 
@@ -215,6 +298,84 @@ def build_condition_stats(
             wr  = round(wins / sample, 4) if sample > 0 else 0.0
             t3r = round(top3 / sample, 4) if sample > 0 else 0.0
             result[cond][key] = {
+                "sample_size": sample,
+                "wins":        wins,
+                "top3":        top3,
+                "win_rate":    wr,
+                "top3_rate":   t3r,
+                "diff_win":    round(wr  - overall_win,  4),
+                "diff_top3":   round(t3r - overall_top3, 4),
+            }
+
+    return result
+
+
+def build_combo_condition_stats(
+    history_enriched: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    組み合わせ条件（コンボ）統計テーブルを構築する。
+
+    例: "脚質×人気帯" → {"差し×1番人気": {sample_size, top3_rate, diff_top3, ...}}
+
+    単体条件では見えない相乗効果（例: 差し馬かつ1番人気はこのレースで特に強い）を
+    数値化して signal_judge に渡すための補助データ。
+
+    コンボ統計のシグナル判定は単体条件より高いサンプル閾値を要求することで
+    データ不足によるノイズを抑制する。
+    """
+    if not history_enriched:
+        return {}
+
+    n_races       = len(history_enriched)
+    total_runners = sum(r.get("n_runners", 0) for r in history_enriched)
+    avg_field     = total_runners / n_races if n_races > 0 else 18.0
+    overall_win   = round(1.0 / avg_field, 4)
+    overall_top3  = round(min(1.0, 3.0 / avg_field), 4)
+
+    combo_counters: Dict[str, Any] = {
+        f"{c1}×{c2}": defaultdict(lambda: {"sample": 0, "wins": 0, "top3": 0})
+        for c1, c2 in COMBO_CONDITION_PAIRS
+    }
+
+    for race in history_enriched:
+        for runner in race.get("runners", []):
+            rank = runner.get("rank")
+            if rank is None:
+                continue
+            keys = get_condition_keys(runner)
+            for c1, c2 in COMBO_CONDITION_PAIRS:
+                k1 = keys.get(c1)
+                k2 = keys.get(c2)
+                if not k1 or not k2:
+                    continue
+                combo_key  = f"{c1}×{c2}"
+                bucket_key = f"{k1}×{k2}"
+                c = combo_counters[combo_key][bucket_key]
+                c["sample"] += 1
+                if rank <= 3:
+                    c["top3"] += 1
+                if rank == 1:
+                    c["wins"] += 1
+
+    result: Dict[str, Any] = {
+        "_overall": {
+            "n_races":           n_races,
+            "avg_field_size":    round(avg_field, 2),
+            "overall_win_rate":  overall_win,
+            "overall_top3_rate": overall_top3,
+        }
+    }
+
+    for combo_key, buckets in combo_counters.items():
+        result[combo_key] = {}
+        for key, c in sorted(buckets.items()):
+            sample = c["sample"]
+            wins   = c["wins"]
+            top3   = c["top3"]
+            wr  = round(wins / sample, 4) if sample > 0 else 0.0
+            t3r = round(top3 / sample, 4) if sample > 0 else 0.0
+            result[combo_key][key] = {
                 "sample_size": sample,
                 "wins":        wins,
                 "top3":        top3,

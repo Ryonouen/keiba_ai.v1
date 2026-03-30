@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from openai import OpenAI
+from openai_cost_guard import safe_chat_create
 from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
 from value_ai import (
@@ -17,7 +18,8 @@ from value_ai import (
     recommend_bet_plan,
     assign_marks,
 )
-from jockey_ai import apply_jockey_adjustments
+from jockey_ai import apply_jockey_adjustments, normalize_jockey_name
+import datetime
 import json
 import hashlib
 import math
@@ -25,6 +27,7 @@ import os
 import random
 import re
 import time
+from bs4 import BeautifulSoup
 
 from race_history_ai import (
     fetch_race_history as history_fetch_race_history,
@@ -37,7 +40,7 @@ from race_history_ai import (
     match_current_runners_with_10y_trend,
     fetch_race_history_enriched,
 )
-from trend_stats import build_condition_stats
+from trend_stats import build_condition_stats, build_combo_condition_stats
 
 from selenium import webdriver
 from selenium.webdriver import ActionChains
@@ -276,6 +279,51 @@ def save_json_cache(name: str, data: Dict[str, Any]) -> None:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+ODDS_SNAPSHOT_TTL: int = 60 * 60 * 24  # 24時間（レース当日のみ有効）
+
+
+def _save_odds_snapshot(race_id: str, odds_map: Dict[str, float]) -> None:
+    """馬名→単勝オッズのスナップショットをキャッシュに保存する。"""
+    save_json_cache(f"odds_snap_{race_id}", {"odds": odds_map, "ts": time.time()})
+
+
+def _load_odds_snapshot(race_id: str) -> Optional[Dict[str, float]]:
+    """保存済みスナップショットを返す。24時間超過 or 未保存なら None。"""
+    cached = load_json_cache(f"odds_snap_{race_id}", ttl_seconds=ODDS_SNAPSHOT_TTL)
+    if cached and isinstance(cached.get("odds"), dict):
+        return {str(k): float(v) for k, v in cached["odds"].items()}
+    return None
+
+
+def calc_odds_drift_index(curr_odds: Optional[float], prev_odds: Optional[float]) -> float:
+    """
+    オッズ変化指数 (odds_drift_index)
+
+    前回スナップショットとの単勝オッズ差分を評価する。
+    オッズが大きく下がった（大口資金流入）ほど高評価。
+    上がった（人気離れ）ほど低評価。
+
+    prev_odds が None（初回取得）の場合は 0.5（中立）。
+    """
+    if curr_odds is None or prev_odds is None or prev_odds <= 0:
+        return 0.5
+    drift = (prev_odds - curr_odds) / prev_odds  # 正値 = オッズ低下 = 資金流入
+    if drift > 0.30:
+        return 0.72
+    elif drift > 0.15:
+        return 0.63
+    elif drift > 0.05:
+        return 0.56
+    elif drift >= -0.05:
+        return 0.50
+    elif drift >= -0.15:
+        return 0.44
+    elif drift >= -0.30:
+        return 0.40
+    else:
+        return 0.35
 
 
 def is_blocked_page(page_src: str, title: str = "") -> bool:
@@ -753,21 +801,33 @@ def parse_race_class_index(race_name: str) -> float:
     return 0.30
 
 
+# 直近レースほど重くなる指数減衰ウェイト（インデックス 0 = 最新戦）
+# 合計 ≒ 1.0。6戦目以降は最後のウェイトを繰り返す
+_FORM_DECAY_WEIGHTS: List[float] = [0.40, 0.25, 0.15, 0.10, 0.07, 0.03]
+
+
 def calc_recent_form_index(records: List[Dict[str, Any]], top_n: int = 5) -> float:
+    """
+    直近 top_n 戦の成績を指数減衰ウェイトで加重平均して近走指数を算出する。
+
+    従来の等重み平均より直近戦の影響が大きくなるため、
+    「上昇中」「下降中」の馬をより正確に評価できる。
+    """
     recent = [r for r in records[:top_n] if r["rank"] is not None]
     if not recent:
         return 0.0
 
-    rank_component = normalize_rank_index(safe_int_mean([r["rank"] for r in recent]))
-    weighted_class_sum = 0.0
-    weight_sum = 0.0
+    weights = [_FORM_DECAY_WEIGHTS[min(i, len(_FORM_DECAY_WEIGHTS) - 1)]
+               for i in range(len(recent))]
+    weight_sum = sum(weights)
 
-    for i, r in enumerate(recent):
-        w = top_n - i
-        weighted_class_sum += r["class_index"] * w
-        weight_sum += w
+    # 着順の加重平均（直近ほど重い）
+    weighted_rank = sum(r["rank"] * w for r, w in zip(recent, weights)) / weight_sum
+    rank_component = normalize_rank_index(weighted_rank)
 
-    class_component = weighted_class_sum / weight_sum if weight_sum else 0.0
+    # クラスの加重平均（同じ減衰ウェイトを使用）
+    class_component = sum(r["class_index"] * w for r, w in zip(recent, weights)) / weight_sum
+
     return round(0.65 * rank_component + 0.35 * class_component, 4)
 
 
@@ -779,6 +839,448 @@ def calc_ground_match_index(records: List[Dict[str, Any]], target_ground: str) -
         return 0.0
     avg_rank = safe_int_mean([r["rank"] for r in filtered])
     return round(normalize_rank_index(avg_rank), 4)
+
+
+# 馬場状態グループ: 良(dry) / 稍重(mid) / 重・不良(wet)
+_GOING_GROUP: Dict[str, str] = {
+    "良": "dry",
+    "稍重": "mid",
+    "重": "wet",
+    "不良": "wet",
+}
+
+
+def calc_ground_fit_index(records: List[Dict[str, Any]], target_ground: str) -> float:
+    """
+    馬場状態適性スコア
+
+    - 同一馬場グループ（良/稍重/重・不良）でのレース成績から算出
+    - 勝率 0.4 + 3着内率 0.6 の加重スコアをサンプル数で信頼度補正
+    - データ不足時は 0.5（中立）
+    """
+    if not target_ground or not records:
+        return 0.5
+
+    tg = _GOING_GROUP.get(target_ground)
+    if tg is None:
+        return 0.5  # 未知の馬場状態は中立（"dry" フォールバック誤適用を防ぐ）
+
+    # グループ内レコード（同一馬場グループ）
+    grp = [r for r in records if _GOING_GROUP.get(r.get("ground", ""), "") == tg and r.get("rank") is not None]
+    if not grp:
+        return 0.5
+
+    ranks = [r["rank"] for r in grp]
+    win_rate = calc_win_rate(ranks)
+    show_rate = calc_show_rate(ranks)
+
+    # スコア基準: 平均的な馬の想定値 win≈0.10, show≈0.30 → raw≈0.22
+    # raw=0.22 → 0.5（中立）、raw=0   → 0.15（最悪）、raw≥0.6 → 0.90（最良）
+    raw = win_rate * 0.4 + show_rate * 0.6
+    _AVG_RAW = 0.22  # 平均馬の期待値
+    scaled = 0.5 + (raw - _AVG_RAW) * (0.35 / _AVG_RAW)
+    scaled = max(0.1, min(0.9, scaled))
+
+    # サンプル数による信頼度補正（5件未満は0.5に引き寄せ）
+    conf = min(1.0, len(grp) / 5.0)
+    score = conf * scaled + (1.0 - conf) * 0.5
+    return round(score, 4)
+
+
+def calc_age_index(age: Optional[int]) -> float:
+    """
+    馬齢補正スコア (age_index)
+
+    競走馬の一般的な年齢別能力傾向を反映:
+      - 3歳: 0.48（成長途上・実績少）
+      - 4歳: 0.62（充実期・ピーク開始）
+      - 5歳: 0.60（ピーク）
+      - 6歳: 0.50（中立・やや下降）
+      - 7歳: 0.36（明確な下降傾向）
+      - 8歳以上: 0.26（大きく下降）
+      - データなし: 0.50（中立）
+
+    NOTE: condition_stats（過去傾向）がある重賞では trend_score_adjustment で
+          レース固有の年齢補正が上乗せされるため二重補正にならないよう
+          この指数はベースライン（小さめのウェイト）として機能する。
+    """
+    if age is None:
+        return 0.50
+    a = int(age)
+    if a <= 2:
+        return 0.45
+    if a == 3:
+        return 0.48
+    if a == 4:
+        return 0.62
+    if a == 5:
+        return 0.60
+    if a == 6:
+        return 0.50
+    if a == 7:
+        return 0.36
+    return 0.26  # 8歳以上
+
+
+def calc_weight_index(
+    jockey_weight: Optional[float],
+    field_weights: List[Optional[float]],
+) -> float:
+    """
+    斤量補正スコア (weight_index)
+
+    フィールド内の平均斤量との差から補正値を計算。
+    軽い斤量は有利（スコア > 0.5）、重い斤量は不利（スコア < 0.5）。
+    全馬同一斤量や取得不能の場合は 0.5 (中立)。
+
+    Parameters
+    ----------
+    jockey_weight  : この馬の斤量 (kg)
+    field_weights  : 全出走馬の斤量リスト
+    """
+    if jockey_weight is None:
+        return 0.5
+    valid = [w for w in field_weights if w is not None]
+    if len(valid) < 2:
+        return 0.5
+    avg_w = sum(valid) / len(valid)
+    std_w = (sum((w - avg_w) ** 2 for w in valid) / len(valid)) ** 0.5
+    if std_w < 0.5:
+        # 定量戦/別定戦: 斤量差がほぼない → 中立
+        return 0.5
+    # 斤量差: 平均より軽いほど有利
+    delta = avg_w - jockey_weight  # 正値 = 軽い = 有利
+    score = 0.5 + delta * 0.04     # 1kg差で ±0.04
+    return round(max(0.1, min(0.9, score)), 4)
+
+
+# =========================================================
+# 調教師×騎手シナジー指数
+# =========================================================
+
+# JRA主要コンビのシナジー補正値（0.5基準、正値=加点）
+# シードデータのみ。実CSV（trainer_jockey_stats.csv）があれば自動上書き予定。
+_TRAINER_JOCKEY_SYNERGY: Dict[Tuple[str, str], float] = {
+    ("藤原英昭", "川田将雅"):   +0.04,
+    ("池江泰寿", "ルメール"):   +0.04,
+    ("中内田充正", "川田将雅"): +0.04,
+    ("矢作芳人", "ルメール"):   +0.03,
+    ("国枝栄", "ルメール"):     +0.03,
+    ("堀宣行", "ルメール"):     +0.03,
+    ("高野友和", "ルメール"):   +0.03,
+    ("木村哲也", "ルメール"):   +0.03,
+    ("友道康夫", "武豊"):       +0.03,
+    ("安田隆行", "川田将雅"):   +0.02,
+    ("藤岡一雄", "藤岡佑介"):   +0.02,
+    ("須貝尚介", "浜中俊"):     +0.02,
+    ("西村真幸", "西村淳也"):   +0.02,
+}
+
+
+def calc_trainer_jockey_synergy_index(trainer: str, jockey: str) -> float:
+    """
+    調教師×騎手シナジー指数 (trainer_jockey_synergy_index)
+
+    既知の高相性コンビに加点。データが少ないため上限は小さく設計。
+    未知のコンビは 0.5（中立）。
+
+    trainer / jockey どちらかが空文字の場合も 0.5 を返す。
+    """
+    if not trainer or not jockey:
+        return 0.5
+    t = trainer.strip()
+    j = jockey.strip()
+    # 完全一致
+    delta = _TRAINER_JOCKEY_SYNERGY.get((t, j))
+    if delta is not None:
+        return round(0.5 + delta, 4)
+    # 前方3文字一致（「ルメール」「C.ルメール」等の表記ゆれ対応）
+    j3 = j[:3]
+    for (st, sj), d in _TRAINER_JOCKEY_SYNERGY.items():
+        if st == t and sj.startswith(j3):
+            return round(0.5 + d, 4)
+    return 0.5
+
+
+def _parse_margin_seconds(text: str) -> Optional[float]:
+    """
+    着差テキストを秒数相当の浮動小数に変換する。
+
+    勝ち馬のセルは通常空か "0" → None を返す。
+    ハナ・アタマ・クビ等の日本語表現にも対応。
+    cols[19] が着差列でない場合は None が返り、rank ベーススコアのみが使われる。
+    """
+    if not text:
+        return None
+    t = text.strip()
+    if t in ("", "0", "同着", "同タイム"):
+        return None
+    _JP: Dict[str, float] = {
+        "ハナ": 0.0, "アタマ": 0.1, "クビ": 0.2,
+        "1/2": 0.25, "3/4": 0.35,
+    }
+    if t in _JP:
+        return _JP[t]
+    try:
+        val = float(re.sub(r"[^\d.]", "", t))
+        if 0.0 <= val <= 99.0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def calc_last_margin_index(records: List[Dict[str, Any]]) -> float:
+    """
+    前走の結果品質指数 (last_margin_index)
+
+    直近1戦のみを評価。着順 + 着差の組み合わせで「勝ち方・負け方の質」を数値化する。
+    recent_form_index（直近5戦平均）と責務は別: こちらは最新戦の質のみ。
+
+    margin_text が取得できない場合（cols[19] が着差列でない等）は
+    rank ベーススコアのみ返す（サイレント失敗なし）。
+    """
+    if not records:
+        return 0.5
+    r = records[0]
+    rank = r.get("rank")
+    if rank is None:
+        return 0.5
+
+    if rank == 1:
+        base = 0.82
+    elif rank == 2:
+        base = 0.70
+    elif rank == 3:
+        base = 0.62
+    elif rank <= 5:
+        base = 0.52
+    elif rank <= 8:
+        base = 0.42
+    else:
+        base = 0.32
+
+    margin_sec = _parse_margin_seconds(r.get("margin_text", ""))
+    if margin_sec is not None:
+        if margin_sec <= 0.2:
+            adj = +0.04
+        elif margin_sec <= 0.5:
+            adj = +0.02
+        elif margin_sec <= 1.0:
+            adj = 0.00
+        elif margin_sec <= 2.0:
+            adj = -0.04
+        else:
+            adj = -0.08
+        base += adj
+
+    return round(max(0.1, min(0.9, base)), 4)
+
+
+def calc_distance_change_index(
+    records: List[Dict[str, Any]],
+    target_distance: Optional[int],
+) -> float:
+    """
+    距離延長・短縮適性指数 (distance_change_index)
+
+    今走距離と前走距離の変化方向（延長 / 短縮）に対して、
+    過去に同じ変化方向を経験したときの成績を集計する。
+
+    distance_fit_index（今走距離への適合度）とは責務が別:
+    こちらは「距離変化への対応力」を評価する。
+    """
+    if target_distance is None or not records:
+        return 0.5
+
+    # 最新戦の距離を「前走距離」とする
+    prev_dist = records[0].get("distance")
+    if prev_dist is None:
+        return 0.5
+
+    change = target_distance - prev_dist
+    if abs(change) < 200:
+        return 0.5  # 200m未満の変動は「同距離」扱い
+
+    direction = "ext" if change > 0 else "sht"  # 延長 or 短縮
+
+    # 過去レース間の距離変化が同方向だったときの着順を収集
+    same_dir_ranks: List[int] = []
+    for i in range(len(records) - 1):
+        curr = records[i]
+        prev = records[i + 1]
+        if curr.get("distance") is None or prev.get("distance") is None:
+            continue
+        race_change = curr["distance"] - prev["distance"]
+        if abs(race_change) < 200:
+            continue
+        race_dir = "ext" if race_change > 0 else "sht"
+        if race_dir == direction and curr.get("rank") is not None:
+            same_dir_ranks.append(curr["rank"])
+
+    if len(same_dir_ranks) < 2:
+        return 0.5  # サンプル不足 → 中立
+
+    _AVG_RAW = 0.22
+    win_r  = sum(1 for r2 in same_dir_ranks if r2 == 1) / len(same_dir_ranks)
+    show_r = sum(1 for r2 in same_dir_ranks if r2 <= 3) / len(same_dir_ranks)
+    raw = win_r * 0.4 + show_r * 0.6
+    scaled = 0.5 + (raw - _AVG_RAW) * (0.35 / _AVG_RAW)
+    scaled = max(0.1, min(0.9, scaled))
+    conf = min(1.0, len(same_dir_ranks) / 3.0)
+    return round(conf * scaled + (1.0 - conf) * 0.5, 4)
+
+
+def calc_class_change_index(
+    records: List[Dict[str, Any]],
+    target_class_index: float,
+) -> float:
+    """
+    クラス変動補正指数 (class_change_index)
+
+    前走クラスと今走クラスの差を評価する。
+    race_level_index（過去レースの平均クラス水準）とは責務が別:
+    こちらは「前走比での変化の方向と大きさ」のみを担当する。
+
+    格上挑戦 → 減点、格下げ → 加点、同クラス → 中立。
+    """
+    if not records:
+        return 0.5
+    prev_class = records[0].get("class_index")
+    if prev_class is None:
+        return 0.5
+
+    delta = target_class_index - prev_class  # 正 = 格上挑戦、負 = 格下げ
+    if abs(delta) < 0.05:
+        return 0.5  # 誤差範囲内 → 中立
+
+    # 1ランク差（例: 2勝→3勝 = 0.10）で ±0.10 の補正
+    score = 0.5 - delta * 1.0
+    return round(max(0.1, min(0.9, score)), 4)
+
+
+def _parse_race_date(date_text: str) -> Optional[Any]:
+    """過去レースの日付文字列を datetime に変換する。"""
+    from datetime import datetime as _dt
+    if not date_text:
+        return None
+    for fmt in ("%Y/%m/%d", "%Y年%m月%d日", "%Y-%m-%d"):
+        try:
+            return _dt.strptime(date_text.strip(), fmt)
+        except ValueError:
+            continue
+    # 数字6桁 or 8桁 (20241201)
+    m = re.search(r"(\d{4})[^\d]?(\d{1,2})[^\d]?(\d{1,2})", date_text)
+    if m:
+        try:
+            return _dt(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def calc_rotation_index(records: List[Dict[str, Any]]) -> float:
+    """
+    前走間隔補正スコア (rotation_index)
+
+    前走からの経過日数に応じてスコアを付与:
+      - 連闘（< 14日）: 0.40（疲労残リスク）
+      - 短期（14〜27日）: 0.65
+      - 適正間隔（28〜60日）: 0.80（最も安定）
+      - やや長め（61〜90日）: 0.70
+      - 休み明け（91〜180日）: 0.55
+      - 長期休養（> 180日）: 0.45（初戦割引）
+      - データなし: 0.60（中立寄り）
+
+    NOTE: 競馬新聞経由の records は date="" のため dates が空になり常に 0.60 を返す。
+          これは既知の制約。新聞データのみの馬では rotation_index は無効。
+    """
+    from datetime import datetime as _dt
+    if not records:
+        return 0.60
+
+    # 最新レース日付
+    dates = []
+    for r in records:
+        d = _parse_race_date(r.get("date", ""))
+        if d is not None:
+            dates.append(d)
+    if not dates:
+        return 0.60
+
+    latest = max(dates)
+    today = _dt.now()
+    days = (today - latest).days
+
+    if days < 0:
+        return 0.60
+    elif days < 14:
+        return 0.40
+    elif days < 28:
+        return 0.65
+    elif days <= 60:
+        return 0.80
+    elif days <= 90:
+        return 0.70
+    elif days <= 180:
+        return 0.55
+    else:
+        return 0.45
+
+
+def calc_weight_change_index(
+    current_weight: Optional[float],
+    records: List[Dict[str, Any]],
+) -> float:
+    """
+    斤量変化補正指数 (weight_change_index)
+
+    今走斤量と前走斤量を比較し、変化方向・大きさで補正値を返す。
+      - 減量（前走比 -1kg以上）: 0.60〜0.75 （軽くなるほど有利）
+      - 変化なし / 小変化 (±0.5kg以内): 0.55 （中立）
+      - 増量（前走比 +1kg以上）: 0.40〜0.45 （重くなるほど不利）
+      - データなし: 0.50
+
+    NOTE: 0.5kg は半馬身程度の影響とされる実績値を参考に設定。
+    """
+    if current_weight is None:
+        return 0.50
+    prev_weights = [r["weight"] for r in records[:3] if r.get("weight") is not None]
+    if not prev_weights:
+        return 0.50
+    prev_w = prev_weights[0]  # 直近前走斤量
+    delta = prev_w - current_weight  # 正値 = 今走が軽い = 有利
+    if abs(delta) <= 0.5:
+        return 0.55
+    score = 0.55 + delta * 0.06   # 1kg 差で ±0.06
+    return round(max(0.30, min(0.80, score)), 4)
+
+
+def calc_expectation_deviation_index(records: List[Dict[str, Any]]) -> float:
+    """
+    期待着順乖離指数 (expectation_deviation_index)
+
+    過去レースで「人気順位 - 実際着順」の平均を計算する。
+    プラス（人気より上位着順）= 期待以上の実績馬 → スコア高
+    マイナス（人気より下位着順）= 期待以下の実績馬 → スコア低
+
+    値域 [0.2, 0.8]。計算可能レースが3戦未満の場合は 0.50（中立）。
+
+    例: 3番人気で1着 → deviation = +2  (良い)
+        1番人気で5着 → deviation = -4  (悪い)
+    """
+    deviations = []
+    for r in records[:5]:
+        pop = r.get("popularity")
+        rank = r.get("rank")
+        if pop is not None and rank is not None and isinstance(pop, int) and isinstance(rank, int):
+            deviations.append(pop - rank)
+    if len(deviations) < 3:
+        return 0.50
+    avg_dev = mean(deviations)
+    # avg_dev が +4 で score ≈ 0.80, -4 で score ≈ 0.20
+    score = 0.50 + avg_dev * 0.075
+    return round(max(0.20, min(0.80, score)), 4)
 
 
 # =========================================================
@@ -933,6 +1435,18 @@ def calc_model_score(feature_dict: Dict[str, Any]) -> float:
     race_level = feature_dict.get("race_level_index", 0.5)
     race_level_boost = race_level * 0.05
     ground = feature_dict["ground_match_index"]
+    ground_fit = feature_dict.get("ground_fit_index", 0.5)
+    rotation = feature_dict.get("rotation_index", 0.60)
+    weight = feature_dict.get("weight_index", 0.5)
+    training = feature_dict.get("training_index", 0.50)  # default=0.50: データなし中立（データあり中立≈0.495と整合）
+    last_margin  = feature_dict.get("last_margin_index", 0.5)              # 前走着差品質
+    dist_change  = feature_dict.get("distance_change_index", 0.5)        # 距離延長/短縮適性
+    class_change = feature_dict.get("class_change_index", 0.5)           # クラス変動補正
+    odds_drift   = feature_dict.get("odds_drift_index", 0.5)             # オッズ変化
+    tj_synergy   = feature_dict.get("trainer_jockey_synergy_index", 0.5) # 調教師×騎手
+    wt_change    = feature_dict.get("weight_change_index", 0.50)         # 斤量変化
+    exp_dev      = feature_dict.get("expectation_deviation_index", 0.50) # 期待着順乖離
+    age_idx  = calc_age_index(feature_dict.get("age"))                   # 馬齢補正
     pace_bias = feature_dict["pace_bias_index"]
     jockey = feature_dict["jockey_index"]
     gate = feature_dict["gate_index"]
@@ -943,22 +1457,34 @@ def calc_model_score(feature_dict: Dict[str, Any]) -> float:
     consistency = feature_dict["consistency_index"]
     distance_fit = feature_dict["distance_fit_index"]
 
-    sample_adj = min(1.0, feature_dict.get("distance_course_sample_size",0) / 3.0)
+    sample_adj = min(1.0, feature_dict.get("distance_course_sample_size",0) / 10.0)
 
     model_score = (
-        0.18 * dc
-        + 0.13 * style
-        + 0.15 * recent
-        + 0.05 * ground
+        0.16 * dc
+        + 0.12 * style
+        + 0.13 * recent
+        + 0.03 * ground
+        + 0.03 * ground_fit   # 馬場状態適性
+        + 0.02 * rotation     # 前走間隔補正
+        + 0.01 * weight       # 斤量補正
+        + 0.02 * training     # 調教指数
+        + 0.02 * last_margin  # 前走着差品質
+        + 0.02 * dist_change  # 距離延長/短縮適性
+        + 0.02 * class_change # クラス変動補正
+        + 0.01 * odds_drift   # オッズ変化（資金流入シグナル）
+        + 0.02 * tj_synergy   # 調教師×騎手シナジー
+        + 0.01 * wt_change    # 斤量変化補正
+        + 0.01 * exp_dev      # 期待着順乖離（アンダー/オーバーパフォーマー）
+        + 0.05 * age_idx      # 馬齢補正（4-5歳ピーク、7歳以上減点）
         + 0.07 * pace_bias
         + 0.07 * last3f
-        + 0.07 * lap
+        + 0.06 * lap
         + 0.06 * jockey
-        + 0.04 * gate
+        + 0.03 * gate
         + 0.04 * pace_adv
         + 0.06 * trend
-        + 0.04 * consistency
-        + 0.04 * distance_fit
+        + 0.03 * consistency
+        + 0.03 * distance_fit
         + race_level_boost
     ) * (0.75 + 0.25 * sample_adj)
 
@@ -975,6 +1501,42 @@ def softmax(scores: List[float], temperature: float = 0.25) -> List[float]:
     if total == 0:
         return [1.0 / len(scores)] * len(scores)
     return [e / total for e in exps]
+
+
+def calc_softmax_temperature(scores: List[float]) -> float:
+    """
+    model_score の分布に応じた動的 softmax temperature を返す。
+
+    設計思想:
+      - スコア分散が大きい（実力差あり）→ temperature 低め → 強い馬をより強調
+      - スコア分散が小さい（大混戦）    → temperature 高め → 確率を平坦化
+      - 頭数が多いほど不確実性が増す   → temperature をやや増大
+
+    計算手順:
+      1. scores の標準偏差 (std) を算出
+      2. std が大きいほど temperature を下げる（base 0.25 から調整）
+      3. 頭数補正: 9頭以下で -0.02、16頭以上で +0.03
+
+    返り値範囲: [0.12, 0.45]
+    """
+    n = len(scores)
+    if n < 2:
+        return 0.25
+
+    std = pstdev(scores)  # 全数標準偏差
+
+    # std が 0.10 のとき temperature = 0.25（デフォルト維持）
+    # std が 0.20 のとき temperature ≈ 0.20（実力差を強調）
+    # std が 0.04 のとき temperature ≈ 0.30（混戦を平坦化）
+    base = 0.25 - (std - 0.10) * 0.50
+
+    # 頭数補正
+    if n <= 9:
+        base -= 0.02   # 少頭数: やや絞る
+    elif n >= 16:
+        base += 0.03   # 多頭数: やや平坦化
+
+    return round(max(0.12, min(0.45, base)), 4)
 
 
 def estimate_place_prob(win_prob: float) -> float:
@@ -1009,20 +1571,92 @@ def kelly_fraction(prob: float, odds: Optional[float]) -> float:
 # =========================================================
 
 ML_FEATURE_COLUMNS: List[str] = [
-    "distance_course_suitability_index",
-    "style_suitability_index",
-    "recent_form_index",
-    "ground_match_index",
-    "pace_bias_index",
-    "jockey_index",
-    "gate_index",
-    "last3f_index",
-    "pace_advantage",
-    "lap_suitability_index",
-    "trend_index",
-    "consistency_index",
-    "distance_fit_index",
+    # 基本特徴量（結果ページ + 分析時に取得可能）
+    "feat_gate",
+    "feat_age",
+    "feat_popularity",
+    "feat_win_odds_log",
+    "feat_last3f",
+    "feat_jockey_weight",
+    "feat_n_runners",
+    "feat_running_style_enc",
+    "feat_track_condition_enc",
+    # 条件統計シグナル特徴量
+    "feat_signal_total_adjust",
+    "feat_cond_diff_age",
+    "feat_cond_diff_gate",
+    "feat_cond_diff_style",
+    "feat_cond_diff_popularity",
+    "feat_cond_diff_last3f",
+    "feat_cond_diff_weight",
+    "feat_cond_diff_jockey",
+    "feat_cond_diff_track",
 ]
+
+
+_RUNNING_STYLE_ENC: Dict[str, int] = {"front": 0, "stalker": 1, "closer": 2, "unknown": 3}
+_TRACK_COND_ENC:    Dict[str, int] = {"良": 0, "稍重": 1, "重": 2, "不良": 3}
+_COND_KEY_TO_FEAT:  Dict[str, str] = {
+    "年齢":       "feat_cond_diff_age",
+    "枠":         "feat_cond_diff_gate",
+    "脚質":       "feat_cond_diff_style",
+    "人気帯":     "feat_cond_diff_popularity",
+    "上がり3F帯": "feat_cond_diff_last3f",
+    "斤量帯":     "feat_cond_diff_weight",
+    "騎手":       "feat_cond_diff_jockey",
+    "馬場":       "feat_cond_diff_track",
+}
+
+
+def _inject_ml_features(
+    features: List[Dict[str, Any]],
+    condition_stats: Optional[Dict[str, Any]],
+    n_runners: int,
+) -> None:
+    """
+    feature dict に ML_FEATURE_COLUMNS に対応する feat_* フィールドを追加する。
+    LightGBM 予測の前に呼ぶ。in-place で更新する。
+    """
+    import math as _math
+    from trend_stats import get_condition_keys
+
+    for f in features:
+        win_odds = float(f.get("win_odds") or 1.0)
+        sig      = f.get("trend_signal_details") or {}
+
+        # per-condition diff_top3 の取得
+        cond_diffs: Dict[str, float] = {}
+        if condition_stats:
+            cond_keys = get_condition_keys(f)
+            for cond_name, bucket_key in cond_keys.items():
+                feat_col = _COND_KEY_TO_FEAT.get(cond_name)
+                if not feat_col or not bucket_key:
+                    continue
+                bucket = condition_stats.get(cond_name, {}).get(bucket_key, {})
+                cond_diffs[feat_col] = float(bucket.get("diff_top3", 0.0))
+
+        f.update({
+            "feat_gate":                f.get("gate") or 0,
+            "feat_age":                 f.get("age") or 0,
+            "feat_popularity":          f.get("popularity") or 0,
+            "feat_win_odds_log":        round(_math.log(max(win_odds, 1.0)), 4),
+            "feat_last3f":              f.get("recent_last3f") or 0.0,
+            "feat_jockey_weight":       f.get("jockey_weight") or 0.0,
+            "feat_n_runners":           n_runners,
+            "feat_running_style_enc":   _RUNNING_STYLE_ENC.get(
+                                            f.get("running_style", ""), 3),
+            "feat_track_condition_enc": _TRACK_COND_ENC.get(
+                                            f.get("track_condition", "") or "", 0),
+            "feat_signal_total_adjust": round(float(sig.get("total_trend_adjust", 0.0)), 5),
+            "feat_cond_diff_age":        cond_diffs.get("feat_cond_diff_age", 0.0),
+            "feat_cond_diff_gate":       cond_diffs.get("feat_cond_diff_gate", 0.0),
+            "feat_cond_diff_style":      cond_diffs.get("feat_cond_diff_style", 0.0),
+            "feat_cond_diff_popularity": cond_diffs.get("feat_cond_diff_popularity", 0.0),
+            "feat_cond_diff_last3f":     cond_diffs.get("feat_cond_diff_last3f", 0.0),
+            "feat_cond_diff_weight":     cond_diffs.get("feat_cond_diff_weight", 0.0),
+            "feat_cond_diff_jockey":     cond_diffs.get("feat_cond_diff_jockey", 0.0),
+            "feat_cond_diff_track":      cond_diffs.get("feat_cond_diff_track", 0.0),
+        })
 
 
 def train_lightgbm_model(csv_path: str = TRAINING_CSV, model_file: str = MODEL_FILE) -> bool:
@@ -1090,46 +1724,78 @@ def predict_win_probability_with_model(
 # Race Pace Simulation AI
 # =========================================================
 
-def simulate_race_position(style: str) -> float:
+def simulate_race_position(style: str, n_horses: int = 16, predicted_pace: str = "medium") -> float:
     """
-    脚質ごとの位置取りランダム化
+    脚質ごとの位置取りランダム化。
+    - 頭数スケール: 位置の中央値を n_horses に比例させる
+    - predicted_pace: slow → 先行有利（位置ペナルティ緩和）、fast → 先行不利（位置ペナルティ増加）
     """
+    scale = n_horses / 16.0  # 16頭基準で正規化
+
+    # ペース係数: slow=先行が前に出やすい(pos小)、fast=先行が消耗しやすい(pos大)
+    pace_offset: Dict[str, Dict[str, float]] = {
+        "very_fast": {"front": +1.5, "stalker": +0.5, "closer": -1.0, "other": -0.5},
+        "fast":      {"front": +0.8, "stalker": +0.3, "closer": -0.5, "other": -0.2},
+        "medium":    {"front":  0.0, "stalker":  0.0, "closer":  0.0, "other":  0.0},
+        "slow":      {"front": -0.8, "stalker": -0.3, "closer": +0.5, "other": +0.2},
+        "very_slow": {"front": -1.5, "stalker": -0.5, "closer": +1.0, "other": +0.5},
+    }
+    p_key = predicted_pace if predicted_pace in pace_offset else "medium"
+    offset = pace_offset[p_key].get(style, pace_offset[p_key]["other"])
+
     if style == "front":
-        return random.gauss(2.5, 1.2)
+        return random.gauss(2.5 * scale + offset, 1.2 * scale)
     elif style == "stalker":
-        return random.gauss(5.5, 1.8)
+        return random.gauss(5.5 * scale + offset, 1.8 * scale)
     elif style == "closer":
-        return random.gauss(9.0, 2.5)
-    return random.gauss(7.0, 2.0)
+        return random.gauss(9.0 * scale + offset, 2.5 * scale)
+    return random.gauss(7.0 * scale + offset, 2.0 * scale)
 
 
-def race_pace_simulation(features: List[Dict[str, Any]], simulations: int = 2000) -> Dict[str, float]:
-
+def race_pace_simulation(
+    features: List[Dict[str, Any]],
+    simulations: int = 2000,
+    predicted_pace: str = "medium",
+) -> Dict[str, float]:
+    """
+    ペースシミュレーション。predicted_pace を反映した位置取りで各馬のスコアを集計する。
+    """
     score_counter = {f["horse_name"]: 0.0 for f in features}
+    n_horses = len(features)
+
+    # ループ外で一度だけ計算
+    front_count = sum(1 for x in features if x.get("running_style") == "front")
+
+    # ペース別のスコアへの位置ペナルティ係数
+    # fast ペース → 位置がスコアに与える影響大（先行は後方より不利が大きい）
+    # slow ペース → 影響小
+    pos_penalty_map: Dict[str, float] = {
+        "very_fast": 0.018,
+        "fast":      0.014,
+        "medium":    0.010,
+        "slow":      0.007,
+        "very_slow": 0.005,
+    }
+    pos_penalty = pos_penalty_map.get(predicted_pace, 0.010)
 
     for _ in range(simulations):
-
         positions = []
 
         for f in features:
+            pos = simulate_race_position(f["running_style"], n_horses, predicted_pace)
 
-            pos = simulate_race_position(f["running_style"])
-
-            # 逃げ干渉AI
-            front_count = sum(1 for x in features if x.get("running_style") == "front")
-
+            # 逃げ馬多頭数による干渉ペナルティ
             if f.get("running_style") == "front" and front_count >= 2:
                 pos += random.uniform(0.7, 1.6) * (front_count - 1)
 
             pace_adv = f.get("pace_advantage", 1.0)
-            score = f["model_score"] * pace_adv - pos * 0.01
+            score = f["model_score"] * pace_adv - pos * pos_penalty
 
             positions.append((f["horse_name"], score))
 
         positions.sort(key=lambda x: x[1], reverse=True)
 
-        for rank, (horse, score) in enumerate(positions):
-
+        for rank, (horse, _) in enumerate(positions):
             if rank == 0:
                 score_counter[horse] += 1.0
             elif rank == 1:
@@ -1137,12 +1803,8 @@ def race_pace_simulation(features: List[Dict[str, Any]], simulations: int = 2000
             elif rank == 2:
                 score_counter[horse] += 0.3
 
-    results = {}
+    return {horse: s / simulations for horse, s in score_counter.items()}
 
-    for horse, s in score_counter.items():
-        results[horse] = s / simulations
-
-    return results
 
 def calc_pace_collapse_risk(features: List[Dict[str, Any]]) -> float:
 
@@ -1165,9 +1827,30 @@ def calc_pace_collapse_risk(features: List[Dict[str, Any]]) -> float:
 # =========================================================
 
 def monte_carlo_simulation(features: List[Dict[str, Any]], simulations: int = 5000) -> Dict[str, float]:
+    """
+    モンテカルロシミュレーションで各馬の勝率を推定する。
 
+    【ノイズ設計】
+    全馬一律のノイズ（旧: gauss(0, 0.12)）は、精緻な条件統計シグナルの
+    結果をランダム性で薄めてしまう問題があった。
+
+    改善: consistency_index（着順の安定性）に基づいて馬ごとにノイズ幅を変える。
+      - consistency 1.0（安定馬）→ noise_std 0.06: 予測通りに走りやすい
+      - consistency 0.5（平均）  → noise_std 0.10: 標準的なばらつき
+      - consistency 0.1（気分屋）→ noise_std 0.138: 何が起きるか読めない
+
+    formula: noise_std = 0.14 - consistency * 0.08
+      consistency=1.0 → 0.06, consistency=0.5 → 0.10, consistency=0.0 → 0.14
+    """
     if not features:
         return {}
+
+    # 馬ごとのノイズ標準偏差を事前計算（シミュレーション外で1回だけ）
+    noise_stds = {}
+    for f in features:
+        consistency = float(f.get("consistency_index") or 0.5)
+        consistency = max(0.0, min(1.0, consistency))
+        noise_stds[f["horse_name"]] = 0.14 - consistency * 0.08
 
     win_counter = {f["horse_name"]: 0 for f in features}
 
@@ -1175,7 +1858,7 @@ def monte_carlo_simulation(features: List[Dict[str, Any]], simulations: int = 50
         sampled = []
 
         for f in features:
-            noise = random.gauss(0, 0.12)
+            noise = random.gauss(0, noise_stds[f["horse_name"]])
             score = f["model_score"] + noise
             sampled.append((f["horse_name"], score))
 
@@ -1557,7 +2240,7 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         result["horse_marks"]         = horse_marks
         # bet_plan は bankroll が必要なのでここでは空。keiba_app.py 側で生成する。
         result.setdefault("bet_plan", {})
-    except Exception as _val_err:
+    except Exception:
         result.setdefault("ev_table", [])
         result.setdefault("race_structure", {})
         result.setdefault("value_horses_v2", [])
@@ -1699,9 +2382,6 @@ def generate_ai_comment(result: Dict[str, Any]) -> str:
             cond_line += "該当馬なし\n"
 
     return (
-        "■レース傾向\n"
-        f"{trend_line_1}\n"
-        f"{trend_line_2}\n\n"
         "■展開予測\n"
         f"{pace_line_1}\n"
         f"{pace_line_2}\n\n"
@@ -1817,8 +2497,9 @@ def analyze_winner_patterns_with_chatgpt(
 - JSONのみを返す
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = safe_chat_create(
+            client,
+            model="gpt-5.4",
             messages=[
                 {"role": "developer", "content": developer_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -1905,8 +2586,11 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
             gate_text = safe_find_text(row, By.CSS_SELECTOR, ".Waku")
             number_text = safe_find_text(row, By.CSS_SELECTOR, ".Umaban")
             jockey_text = safe_find_text(row, By.CSS_SELECTOR, ".Jockey")
+            trainer_text = safe_find_text(row, By.CSS_SELECTOR, ".Trainer")
+            weight_text = safe_find_text(row, By.CSS_SELECTOR, ".Kinryo")
             win_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Odds")
             place_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Place_Odds")
+            barei_text = safe_find_text(row, By.CSS_SELECTOR, ".Barei")
 
             if not gate_text:
                 all_tds = row.find_elements(By.TAG_NAME, "td")
@@ -1914,12 +2598,16 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
                 digit_cells = [t for t in td_texts if t.isdigit()]
                 if len(digit_cells) >= 2:
                     gate_text = digit_cells[0]
-                    number_text = digit_cells[1]
+                    if not number_text:  # .Umaban で取得済みなら上書きしない
+                        number_text = digit_cells[1]
 
             gate = int(gate_text) if gate_text.isdigit() else None
             number = int(number_text) if number_text.isdigit() else None
             win_odds = parse_float(win_odds_text)
             place_odds = parse_odds_range_text(place_odds_text)
+            jockey_weight = parse_float(weight_text)
+            _age_m = re.search(r"(\d+)", barei_text)
+            horse_age = int(_age_m.group(1)) if _age_m else None
 
             horses.append({
                 "name": horse_name,
@@ -1927,8 +2615,11 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
                 "gate": gate,
                 "number": number,
                 "jockey": jockey_text,
+                "trainer": trainer_text,
+                "jockey_weight": jockey_weight,
                 "win_odds_scraped": win_odds,
                 "place_odds_scraped": place_odds,
+                "age": horse_age,
             })
         except Exception:
             continue
@@ -2182,19 +2873,25 @@ def fetch_horse_records(
     horse_url: str,
     history_limit: int = HISTORY_LIMIT_DEFAULT,
     headless: bool = False,
-) -> Tuple[List[Dict[str, Any]], str]:
+    cutoff_date: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
+    """
+    cutoff_date: "YYYY/MM/DD" 形式。指定した日付以降（同日含む）のレコードを除外する。
+    過去レース分析時のデータリーク防止用。未来レース分析時は None のまま。
+    """
     records: List[Dict[str, Any]] = []
 
     if driver is None:
         return records, ""
 
-    cache_name = cache_key("horse_records", horse_url, history_limit)
+    cache_name = cache_key("horse_records", horse_url, history_limit, cutoff_date or "")
     cached = load_json_cache(cache_name)
     if cached:
         cached_records = cached.get("records", [])
         cached_sire = str(cached.get("sire_name", ""))
+        cached_birthday = cached.get("birthday")  # 旧キャッシュは None になる
         if isinstance(cached_records, list):
-            return cached_records, cached_sire
+            return cached_records, cached_sire, cached_birthday
 
     try:
         random_sleep(2.4, 4.2)
@@ -2205,16 +2902,20 @@ def fetch_horse_records(
         page_title = safe_driver_title(driver)
         if is_blocked_page(page_src, page_title):
             print("馬ページ取得ブロック")
-            return records, ""
+            return records, "", None
 
         sire_name = parse_sire_name(driver)
+        birthday  = parse_birthday(driver)
 
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, ".db_h_race_results tbody tr")
         except Exception:
-            return records, sire_name
+            return records, sire_name, birthday
 
-        for r in rows[:history_limit]:
+        collected = 0
+        for r in rows:
+            if collected >= history_limit:
+                break
             try:
                 cols = r.find_elements(By.TAG_NAME, "td")
             except Exception:
@@ -2224,15 +2925,23 @@ def fetch_horse_records(
                 continue
 
             date = safe_text(cols[0])
+
+            # データリーク防止: cutoff_date 以降（同日含む）のレコードは特徴量計算に使わない
+            # 過去レース分析時に対象レース自身の結果が recent_form 等に混入するのを防ぐ
+            if cutoff_date and date and date >= cutoff_date:
+                continue
             course_text = safe_text(cols[1])
             weather = safe_text(cols[2]) if len(cols) > 2 else ""
             ground = safe_text(cols[3]) if len(cols) > 3 else ""
             race_name = safe_text(cols[4]) if len(cols) > 4 else ""
+            popularity_text = safe_text(cols[10]) if len(cols) > 10 else ""
             rank_text = safe_text(cols[11])
             jockey = safe_text(cols[12]) if len(cols) > 12 else ""
+            weight_text_rec = safe_text(cols[13]) if len(cols) > 13 else ""
             distance_text = safe_text(cols[14]) if len(cols) > 14 else ""
             time_text = safe_text(cols[17]) if len(cols) > 17 else ""
             last3f_text = safe_text(cols[18]) if len(cols) > 18 else ""
+            margin_text = safe_text(cols[19]) if len(cols) > 19 else ""
             passing_text = safe_text(cols[20]) if len(cols) > 20 else ""
 
             surface, distance = parse_distance(distance_text)
@@ -2242,6 +2951,8 @@ def fetch_horse_records(
             course_name = parse_course_name(course_text)
             class_index = parse_race_class_index(race_name)
             last3f = parse_last3f(last3f_text)
+            popularity_rec = int(popularity_text) if popularity_text.isdigit() else None
+            weight_rec = parse_float(weight_text_rec)
 
             records.append({
                 "date": date,
@@ -2253,25 +2964,30 @@ def fetch_horse_records(
                 "class_index": class_index,
                 "rank_text": rank_text,
                 "rank": rank,
+                "popularity": popularity_rec,
                 "jockey": jockey,
+                "weight": weight_rec,
                 "time_text": time_text,
                 "time_sec": time_sec,
                 "last3f": last3f,
+                "margin_text": margin_text,
                 "passing_text": passing_text,
                 "first_corner_pos": first_corner_pos,
                 "distance_text": distance_text,
                 "surface": surface,
                 "distance": distance,
             })
+            collected += 1
 
         save_json_cache(cache_name, {
             "records": records,
             "sire_name": sire_name,
+            "birthday": birthday,
         })
-        return records, sire_name
+        return records, sire_name, birthday
     except Exception as e:
         print(f"馬ページ取得中エラー: {type(e).__name__}")
-        return records, ""
+        return records, "", None
 
 
 # =========================================================
@@ -2287,6 +3003,7 @@ def build_feature_dict(
     jockey_from_entry: str = "",
     scraped_win_odds: Optional[float] = None,
     scraped_place_odds: Optional[float] = None,
+    current_jockey_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     dc_index = calc_distance_course_index(
         records=records,
@@ -2303,6 +3020,14 @@ def build_feature_dict(
 
     recent_form_index = calc_recent_form_index(records, top_n=5)
     ground_match_index = calc_ground_match_index(records, race_meta.target_ground)
+    ground_fit_index = calc_ground_fit_index(records, race_meta.target_ground)
+    rotation_index = calc_rotation_index(records)
+    last_margin_index = calc_last_margin_index(records)
+    weight_change_index = calc_weight_change_index(current_jockey_weight, records)
+    expectation_deviation_index = calc_expectation_deviation_index(records)
+    _target_class_index = parse_race_class_index(race_meta.race_title)
+    distance_change_index = calc_distance_change_index(records, race_meta.target_distance)
+    class_change_index = calc_class_change_index(records, _target_class_index)
 
     latest_jockey = jockey_from_entry or (records[0]["jockey"] if records else "")
     jockey_index = calc_jockey_index(latest_jockey)
@@ -2314,6 +3039,18 @@ def build_feature_dict(
     consistency_index = calc_consistency_index(records)
     distance_fit_index = calc_distance_fit_index(records, race_meta.target_distance)
     race_level_index = calc_race_level_index(records)
+
+    # 前走クラス・レース名（records[0] = 直近1走）
+    _prev_rec = records[0] if records else {}
+    prev_race_class_index = float(_prev_rec.get("class_index") or 0.0)
+    prev_race_name = str(_prev_rec.get("race_name") or "")
+
+    # 前走着順（傾向シグナル用）
+    prev_rank = _prev_rec.get("rank")  # int | None
+
+    # 最近5走の上がり3F平均（上がり3F帯シグナル用）
+    _last3f_values = [r["last3f"] for r in records[:5] if r.get("last3f") is not None]
+    recent_last3f: Optional[float] = round(mean(_last3f_values), 2) if _last3f_values else None
 
     return {
         "horse_name": horse_name,
@@ -2343,6 +3080,13 @@ def build_feature_dict(
 
         "recent_form_index": recent_form_index,
         "ground_match_index": ground_match_index,
+        "ground_fit_index": ground_fit_index,
+        "rotation_index": rotation_index,
+        "last_margin_index": last_margin_index,
+        "weight_change_index": weight_change_index,
+        "expectation_deviation_index": expectation_deviation_index,
+        "distance_change_index": distance_change_index,
+        "class_change_index": class_change_index,
 
         "jockey_index": jockey_index,
         "gate_index": gate_index,
@@ -2354,6 +3098,10 @@ def build_feature_dict(
         "consistency_index": consistency_index,
         "distance_fit_index": distance_fit_index,
         "race_level_index": race_level_index,
+        "prev_race_class_index": prev_race_class_index,
+        "prev_race_name": prev_race_name,
+        "prev_rank":      prev_rank,
+        "recent_last3f":  recent_last3f,
 
         "distance_band_stats": distance_band_stats,
         "course_stats": course_stats,
@@ -2362,6 +3110,158 @@ def build_feature_dict(
         "win_odds_scraped": scraped_win_odds,
         "place_odds_scraped": scraped_place_odds,
     }
+
+# =========================================================
+# 調教情報スクレイプ
+# =========================================================
+
+# 良コース判定: 坂路・ウッド・ポリトラックは調教効果が高いとされる
+_TRAINING_COURSE_SCORE: Dict[str, float] = {
+    "坂路":         0.75,
+    "ウッド":       0.70,
+    "ポリトラック": 0.70,
+    "芝":           0.65,
+    "ダート":       0.55,
+    "Ｗ":           0.70,  # ウッドの略称表記
+    "坂":           0.75,  # 坂路の略称表記
+}
+
+
+def _parse_training_time(text: str) -> Optional[float]:
+    """
+    調教タイム文字列から最終ハロンタイム（秒）を返す。
+
+    例: "12.5-11.8-11.3-11.0" → 11.0
+        "49.5"（総タイム）は除外 → None
+
+    実際のハロンタイムは 10.0〜15.9 秒の範囲。
+    それ以外（総タイム等）は無視する。
+    """
+    floats = re.findall(r"\d+\.\d+", text)
+    # 現実的なハロンタイム（10.0〜15.9秒）のみを候補とする
+    candidates = [float(v) for v in floats if 10.0 <= float(v) <= 15.9]
+    if not candidates:
+        return None
+    return candidates[-1]  # 末尾 = 最終ハロン
+
+
+def fetch_training_info(
+    driver: webdriver.Chrome,
+    race_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    レース調教ページから全出走馬の調教データを取得し training_index を算出する。
+
+    URL: https://race.netkeiba.com/race/training.html?race_id={race_id}
+
+    Returns
+    -------
+    {horse_name: {"course": str, "last1f": float|None, "jockey_rides": bool,
+                  "training_index": float}} の辞書
+    空辞書 = 取得失敗
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    try:
+        training_url = f"https://race.netkeiba.com/race/training.html?race_id={race_id}"
+        driver = safe_get(driver, training_url, headless=False, retries=1)
+        random_sleep(1.5, 2.5)
+
+        # 調教テーブルを試みる (複数セレクタに対応)
+        rows = []
+        for sel in [
+            "table.Training_Table tbody tr",
+            ".p-training__table tbody tr",
+            ".TrainingTable tbody tr",
+        ]:
+            try:
+                rows = driver.find_elements(By.CSS_SELECTOR, sel)
+                if rows:
+                    break
+            except Exception:
+                continue
+
+        if not rows:
+            return {}
+
+        for row in rows:
+            try:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if len(cells) < 4:
+                    continue
+
+                # 馬名は .HorseName または最初のリンクセル
+                try:
+                    horse_name = row.find_element(By.CSS_SELECTOR, ".HorseName, .Horse a").text.strip()
+                except Exception:
+                    horse_name = cells[0].text.strip()
+                if not horse_name:
+                    continue
+
+                # セル全体のテキストを結合して解析
+                row_text = " ".join(c.text.strip() for c in cells)
+
+                # コース
+                course = ""
+                for cname in _TRAINING_COURSE_SCORE:
+                    if cname in row_text:
+                        course = cname
+                        break
+
+                # タイム
+                last1f = _parse_training_time(row_text)
+
+                # 騎手騎乗: 専用セルを個別取得して判定する
+                # 全セル結合テキストでの判定は "取得不能なのに True" になるため使わない
+                # セレクタが見つからない / セルが空 → False（ボーナスなし・保守的中立）
+                _rider_text = ""
+                for _rsel in [".TrainingRider", ".jockey"]:
+                    try:
+                        _rider_elem = row.find_element(By.CSS_SELECTOR, _rsel)
+                        _rider_text = _rider_elem.text.strip()
+                        if _rider_text:
+                            break
+                    except Exception:
+                        continue
+                # 騎手セルが取得でき、かつ「助手」でない場合のみ True
+                jockey_rides = bool(_rider_text) and "助手" not in _rider_text
+
+                # training_index 算出
+                course_score = _TRAINING_COURSE_SCORE.get(course, 0.55)
+                # タイムは短い方が良い（11.0秒台 = 好調）
+                if last1f is not None:
+                    if last1f <= 11.5:
+                        time_score = 0.80
+                    elif last1f <= 12.0:
+                        time_score = 0.65
+                    elif last1f <= 13.0:
+                        time_score = 0.50
+                    else:
+                        time_score = 0.40
+                else:
+                    time_score = 0.55  # データなし = 中立
+
+                jockey_bonus = 0.05 if jockey_rides else 0.0
+
+                # course 0.50 + time 0.40 + jockey 0.05 = 0.95〜1.00 (合計 ≈ 1)
+                training_index = round(
+                    course_score * 0.50 + time_score * 0.40 + jockey_bonus,
+                    4,
+                )
+                training_index = max(0.1, min(0.9, training_index))
+
+                result[horse_name] = {
+                    "course":          course,
+                    "last1f":          last1f,
+                    "jockey_rides":    jockey_rides,
+                    "training_index":  training_index,
+                }
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"調教ページ取得エラー: {type(e).__name__}")
+
+    return result
+
 
 # =========================================================
 # Past Race History AI (過去レース傾向AI)
@@ -2492,10 +3392,39 @@ def analyze_race(
         shutuba_url = input_url
         newspaper_url = input_url
 
-    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit)
+    # race_id から実際の開催日を取得してカットオフ日を生成
+    # race_id形式: YYYY + 会場(2) + 回(2) + 日(2) + R(2) → 先頭8桁は日付ではないため
+    # netkeibaの結果ページから実日付を取得する。取得失敗時は年のみのフォールバック。
+    _rid_m = re.search(r"race_id=(\d{8,})", shutuba_url)
+    _cutoff_date: Optional[str] = None
+    if _rid_m:
+        _rid = _rid_m.group(1)
+        try:
+            from dividend_scraper import scrape_race_result as _srl
+            _race_info = _srl(_rid)
+            _race_date_str = _race_info.get("race_date", "") if _race_info else ""
+            if _race_date_str and re.match(r"\d{4}-\d{2}-\d{2}", _race_date_str):
+                # "YYYY-MM-DD" → "YYYY/MM/DD"
+                _cutoff_date = _race_date_str.replace("-", "/")
+            else:
+                # 結果ページ未公開（未来レース）: 年のみフォールバック
+                _cutoff_date = f"{_rid[:4]}/12/31"
+        except Exception:
+            _cutoff_date = f"{_rid[:4]}/12/31"
+
+    # "cutoff_v2": race_idから正しい実日付を取得するよう修正したバージョン。
+    # 旧キャッシュ（cutoff 修正前のリーク済み分析結果）を自動無効化するための固定バージョン文字列。
+    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2")
     cached_result = load_json_cache(race_cache_name)
     if cached_result and cached_result.get("race_meta") and cached_result.get("features"):
-        return refresh_result_payload(cached_result)
+        # キャッシュが同一 race_id を指しているか確認（URL 変更漏れや手動上書きによる混入を防ぐ）
+        _cached_rid = cached_result.get("input_race_id", "")
+        _input_rid_m = re.search(r"race_id=(\d+)", shutuba_url)
+        _input_rid = _input_rid_m.group(1) if _input_rid_m else ""
+        if _cached_rid and _input_rid and _cached_rid != _input_rid:
+            cached_result = None  # race_id 不一致 → このキャッシュは別レースのもの、破棄
+        else:
+            return refresh_result_payload(cached_result)
 
     driver = build_webdriver(headless=headless)
     try:
@@ -2576,13 +3505,24 @@ def analyze_race(
             style_char = str(newspaper_entry.get("style_char", "")) if isinstance(newspaper_entry, dict) else ""
             newspaper_mark = str(newspaper_entry.get("newspaper_mark", "")) if isinstance(newspaper_entry, dict) else ""
 
+            # 新聞に近走データがあったか記録（診断用）
+            _had_newspaper_records = bool(isinstance(newspaper_entry, dict) and newspaper_entry.get("records"))
+
             if not records:
-                records, sire_name = fetch_horse_records(
+                records, sire_name, _birthday = fetch_horse_records(
                     driver,
                     horse_url,
                     history_limit=history_limit,
                     headless=headless,
+                    cutoff_date=_cutoff_date,
                 )
+            else:
+                # 新聞データ利用時も birthday だけは個別ページキャッシュから取る
+                _bday_cache = load_json_cache(cache_key("horse_records", horse_url, history_limit, _cutoff_date or ""))
+                _birthday = _bday_cache.get("birthday") if _bday_cache else None
+
+            # 近走データの取得元を記録（診断用: "newspaper" / "fallback" / "none"）
+            records_source = "newspaper" if _had_newspaper_records else ("fallback" if records else "none")
 
             if style_char:
                 proxy_pos = style_char_to_first_corner_pos(style_char)
@@ -2609,12 +3549,17 @@ def analyze_race(
                 "records": records,
                 "entry_style":style,
                 "gate": horse.get("gate"),
+                # birthday由来の年齢を優先、取れなければ性齢欄（.Barei）の値を使用
+                "age": calc_age_from_birthday(_birthday) or horse.get("age"),
+                "birthday": _birthday,
                 "jockey": horse.get("jockey", ""),
+                "jockey_weight": horse.get("jockey_weight"),
                 "win_odds_scraped": horse.get("win_odds_scraped"),
                 "place_odds_scraped": horse.get("place_odds_scraped"),
                 "sire_name": sire_name,
                 "style_char_scraped": horse.get("style_char_scraped", ""),
                 "newspaper_mark": newspaper_mark,
+                "records_source": records_source,
             })
 
         predicted_pace = calc_pace_pressure(entry_styles)
@@ -2632,7 +3577,24 @@ def analyze_race(
         except Exception:
             course_bias = {}
 
+        # =========================================================
+        # オッズスナップショット（変化検出用）
+        # =========================================================
+        current_race_id_for_odds = extract_race_id_from_url(shutuba_url)
+        _prev_odds_snap: Optional[Dict[str, float]] = None
+        _curr_odds_map: Dict[str, float] = {}
+        if current_race_id_for_odds:
+            _prev_odds_snap = _load_odds_snapshot(current_race_id_for_odds)
+            for _hr in horse_results:
+                _wo = _hr.get("win_odds_scraped")
+                if _wo is not None:
+                    _curr_odds_map[str(_hr["name"])] = float(_wo)
+            if _curr_odds_map:
+                _save_odds_snapshot(current_race_id_for_odds, _curr_odds_map)
+
         features: List[Dict[str, Any]] = []
+        # 斤量補正用: 全出走馬の斤量リストを先に収集
+        _field_weights: List[Optional[float]] = [hr.get("jockey_weight") for hr in horse_results]
         for hr in horse_results:
             feature_dict = build_feature_dict(
                horse_name=str(hr["name"]),
@@ -2643,6 +3605,7 @@ def analyze_race(
                jockey_from_entry=hr.get("jockey", ""),
                scraped_win_odds=hr.get("win_odds_scraped"),
                scraped_place_odds=hr.get("place_odds_scraped"),
+               current_jockey_weight=hr.get("jockey_weight"),
             )
             # 新聞脚質があれば上書き
             if hr.get("entry_style"):
@@ -2651,7 +3614,58 @@ def analyze_race(
             feature_dict["newspaper_mark"] = hr.get("newspaper_mark", "")
             feature_dict["newspaper_mark_index"] = newspaper_mark_to_index(hr.get("newspaper_mark", ""))
             feature_dict["newspaper_entry_style"] = hr.get("entry_style", "unknown")
+            # 可観測性フィールド（診断用 — ロジックには使用しない）
+            feature_dict["sire_name"] = hr.get("sire_name", "")
+            feature_dict["records_source"] = hr.get("records_source", "none")
+            # 馬番（出馬表順ソート用）
+            feature_dict["horse_number"] = hr.get("number")
+            # 馬齢（性齢欄から取得: 7歳以上フィルタ等に使用）
+            feature_dict["age"] = hr.get("age")
+            feature_dict["age_index"] = calc_age_index(hr.get("age"))
+            # 斤量補正
+            _jw = hr.get("jockey_weight")
+            feature_dict["jockey_weight"] = _jw
+            feature_dict["weight_index"] = calc_weight_index(_jw, _field_weights)
+            # H2: スクレイプ失敗診断フィールド（ロジック未使用・デバッグ用）
+            feature_dict["weight_index_source"] = "scraped" if _jw is not None else "default_no_data"
+            # オッズ変化指数
+            _h_name = str(hr["name"])
+            _prev_o = _prev_odds_snap.get(_h_name) if _prev_odds_snap else None
+            _curr_o = _curr_odds_map.get(_h_name)
+            feature_dict["odds_drift_index"] = calc_odds_drift_index(_curr_o, _prev_o)
+            # 調教師×騎手シナジー指数
+            feature_dict["trainer"] = hr.get("trainer", "")
+            feature_dict["trainer_jockey_synergy_index"] = calc_trainer_jockey_synergy_index(
+                hr.get("trainer", ""), hr.get("jockey", "")
+            )
+            # 騎手×馬コンビ実績（過去レース履歴から自動導出・追加スクレイピング不要）
+            _combo_jockey = normalize_jockey_name(str(hr.get("jockey", "") or ""))
+            _combo_recs = [
+                r for r in hr["records"]
+                if normalize_jockey_name(str(r.get("jockey", "") or "")) == _combo_jockey
+                and r.get("rank") is not None
+            ] if _combo_jockey else []
+            feature_dict["jockey_combo_rides"] = len(_combo_recs)
+            feature_dict["jockey_combo_wins"]  = sum(1 for r in _combo_recs if r["rank"] == 1)
+            feature_dict["jockey_combo_top2"]  = sum(1 for r in _combo_recs if r["rank"] <= 2)
+            feature_dict["jockey_combo_top3"]  = sum(1 for r in _combo_recs if r["rank"] <= 3)
             features.append(feature_dict)
+
+        # =========================================================
+        # 調教情報取得・注入
+        # =========================================================
+        current_race_id = extract_race_id_from_url(shutuba_url)
+        _training_map: Dict[str, Dict[str, Any]] = {}
+        if current_race_id:
+            try:
+                _training_map = fetch_training_info(driver, current_race_id)
+            except Exception:
+                _training_map = {}
+        for f in features:
+            _ti = _training_map.get(str(f.get("horse_name", "")), {})
+            f["training_index"] = _ti.get("training_index", 0.50)  # default=0.50: データなし中立
+            f["training_course"] = _ti.get("course", "")
+            f["training_jockey_rides"] = _ti.get("jockey_rides", False)
 
         for f in features:
             base_score = calc_model_score(f)
@@ -2668,7 +3682,6 @@ def analyze_race(
         # =========================================================
         # 過去10年レース傾向AI（完全版）
         # =========================================================
-        current_race_id = extract_race_id_from_url(shutuba_url)
         past_10y_results: List[Dict[str, Any]] = []
         race_trend_10y: Dict[str, Any] = {}
         trend_match_horses: List[str] = []
@@ -2677,17 +3690,31 @@ def analyze_race(
         condition_match_horses: List[str] = []
         winner_pattern_ai: Dict[str, Any] = {}
         condition_stats: Dict[str, Any] = {}
+        combo_condition_stats: Dict[str, Any] = {}
 
         try:
             if current_race_id:
-                past_10y_results = fetch_past_10y_results(driver, current_race_id)
+                # expected_race_name を渡すことで、別レースが同スロットに入っているページを自動除外する
+                _expected_name = race_meta.race_title if race_meta else ""
+                past_10y_results = fetch_past_10y_results(driver, current_race_id, _expected_name)
 
                 # 証拠ベース補正用: 全走者データを取得して条件別統計を構築
+                _condition_stats_error: str = ""
                 try:
-                    _enriched = fetch_race_history_enriched(driver, current_race_id)
-                    condition_stats = build_condition_stats(_enriched) if _enriched else {}
-                except Exception:
-                    condition_stats = {}
+                    _enriched = fetch_race_history_enriched(
+                        None, current_race_id, expected_race_name=_expected_name
+                    )
+                    if _enriched:
+                        condition_stats       = build_condition_stats(_enriched)
+                        combo_condition_stats = build_combo_condition_stats(_enriched)
+                    else:
+                        condition_stats       = {}
+                        combo_condition_stats = {}
+                        _condition_stats_error = "過去走者データが0件でした（該当コース・距離の履歴なし、またはページ構造変更の可能性）"
+                except Exception as _cse:
+                    condition_stats       = {}
+                    combo_condition_stats = {}
+                    _condition_stats_error = str(_cse)
                 trend_base = analyze_10y_race_trend(past_10y_results) or {}
                 trend_match_horses = match_current_runners_with_10y_trend(features, trend_base) or []
 
@@ -2789,15 +3816,21 @@ def analyze_race(
             winner_conditions = []
             condition_match_horses = []
             winner_pattern_ai = {}
-            condition_stats = {}
+            condition_stats       = {}
+            combo_condition_stats = {}
 
         # 過去10年傾向をmodel_scoreに反映してから確率計算する
         # condition_stats が取得できていれば証拠ベースの補正を優先する
         if condition_stats or race_trend_10y:
-            features = apply_trend_adjustments(features, race_trend_10y, condition_stats)
+            features = apply_trend_adjustments(
+                features, race_trend_10y, condition_stats, combo_condition_stats
+            )
 
         # 騎手補正を model_score に反映（傾向補正の後に適用）
         features = apply_jockey_adjustments(features)
+
+        # ML特徴量を feature dict に注入（LightGBM予測で使用）
+        _inject_ml_features(features, condition_stats, len(features))
 
         ml_probs = predict_win_probability_with_model(features, MODEL_FILE)
 
@@ -2806,22 +3839,33 @@ def analyze_race(
             for f in features:
                 f["model_type"] = "lightgbm"
         else:
-            probs = softmax([f["model_score"] for f in features], temperature=0.25)
+            _scores = [f["model_score"] for f in features]
+            _temp = calc_softmax_temperature(_scores)
+            probs = softmax(_scores, temperature=_temp)
             for f in features:
                 f["model_type"] = "rule_based"
+                f["softmax_temperature"] = _temp
 
         for f, p in zip(features, probs):
             f["win_prob"] = round(p, 4)
 
-        pace_probs = race_pace_simulation(features)
+        _sim_pace = (race_meta.predicted_pace if race_meta else "") or "medium"
+        pace_probs = race_pace_simulation(features, predicted_pace=_sim_pace)
         collapse_factor = calc_pace_collapse_risk(features)
+
+        # ハイペース時は先行馬も消耗（collapse_factor の逆数でペナルティ）
+        _is_fast_pace = _sim_pace in ("fast", "very_fast")
+        _front_penalty = 1.0 / collapse_factor if _is_fast_pace and collapse_factor > 1.0 else 1.0
 
         for f in features:
             pace_val = pace_probs.get(f["horse_name"], 0)
+            style = f.get("running_style", "")
 
-            # 展開崩壊AI
-            if f.get("running_style") == "closer":
+            # 展開崩壊AI: ハイペース→後方馬恩恵、先行馬不利
+            if style == "closer":
                 pace_val *= collapse_factor
+            elif style == "front" and _is_fast_pace:
+                pace_val *= _front_penalty
 
             f["pace_simulation_index"] = round(pace_val, 4)
             f["place_prob"] = estimate_place_prob(f["win_prob"])
@@ -2861,11 +3905,11 @@ def analyze_race(
 
         try:
             if current_race_id:
-                past_10y_results = fetch_past_10y_results(driver, current_race_id)
+                # 第1ブロックと同じ race_meta.race_title を渡して別レース混入を防ぐ
+                past_10y_results = fetch_past_10y_results(
+                    driver, current_race_id, race_meta.race_title
+                )
                 race_trend_10y = analyze_10y_race_trend(past_10y_results)
-                trend_match_horses = match_current_runners_with_10y_trend(features, race_trend_10y)
-                past_10y_results = fetch_past_10y_results(race_id)
-                race_trend_10y = analyze_10y_race_trend(past_10y_results)       
                 trend_match_horses = match_current_runners_with_10y_trend(features, race_trend_10y)
 
 # ==============================
@@ -2897,9 +3941,18 @@ def analyze_race(
             "past_10y_results": past_10y_results,
             "trend_match_horses": trend_match_horses,
             "race_history_summary": race_history_summary,
+            "condition_stats_error": locals().get("_condition_stats_error", ""),
             "winner_conditions": winner_conditions,
             "condition_match_horses": condition_match_horses,
             "winner_pattern_ai": winner_pattern_ai,
+            # 分析対象レースの一意識別情報（混同防止・UI表示・キャッシュ検証用）
+            "input_race_id": current_race_id,
+            "race_signature": (
+                f"{current_race_id}"
+                f"|{race_meta.race_title}"
+                f"|{race_meta.target_course}"
+                f"|{race_meta.target_distance}m"
+            ) if current_race_id else "",
         }
                 # =========================================================
         # 過去10年レース傾向AI
@@ -2909,7 +3962,9 @@ def analyze_race(
             if race_id_match:
                 race_id = race_id_match.group(1)
 
-                past_results = history_fetch_race_history(driver, race_id)
+                past_results = history_fetch_race_history(
+                    driver, race_id, expected_race_name=race_meta.race_title
+                )
                 race_trend = history_analyze_race_trend(past_results)
                 race_summary = history_build_race_trend_summary(past_results)
                 winner_conditions = history_build_winner_condition_ai(past_results)
@@ -3325,6 +4380,53 @@ def parse_sire_name(driver: webdriver.Chrome) -> str:
     return ""
 
 
+def parse_birthday(driver: webdriver.Chrome) -> Optional[str]:
+    """
+    netkeiba馬ページから生年月日を取得して "YYYY-MM-DD" 形式で返す。
+    取得できない場合は None。
+    """
+    try:
+        soup = BeautifulSoup(safe_page_source(driver), "html.parser")
+        # プロフィールテーブルの th/td ペアを走査
+        for th in soup.find_all("th"):
+            if "生年月日" in (th.get_text() or ""):
+                td = th.find_next_sibling("td")
+                if td:
+                    text = td.get_text(strip=True)
+                    # "2018年3月1日" → "2018-03-01"
+                    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+                    if m:
+                        y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+                        return f"{y}-{mo}-{d}"
+        # 別パターン: ページソースに直接埋め込まれている場合
+        text = safe_page_source(driver)
+        m = re.search(r"生年月日[^0-9]*(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+        if m:
+            y, mo, d = m.group(1), m.group(2).zfill(2), m.group(3).zfill(2)
+            return f"{y}-{mo}-{d}"
+    except Exception:
+        pass
+    return None
+
+
+def calc_age_from_birthday(birthday: Optional[str], reference_date: Optional[datetime.date] = None) -> Optional[int]:
+    """
+    "YYYY-MM-DD" の生年月日から JRA競馬の年齢を計算する。
+    日本の競馬では 1月1日が一斉誕生日のため、
+    分析日の年 - 生まれた年 = 競馬年齢（実際の誕生日は関係なし）。
+    例: 2019年4月28日生まれ → 2026年3月19日時点で 7歳
+    """
+    if not birthday:
+        return None
+    try:
+        born = datetime.date.fromisoformat(birthday)
+        ref  = reference_date or datetime.date.today()
+        age  = ref.year - born.year  # 1月1日基準で一律加算
+        return age if age >= 2 else None  # 2歳未満は異常値として除外
+    except Exception:
+        return None
+
+
 def calc_bloodline_index(
     sire_name: str,
     target_surface: Optional[str],
@@ -3386,6 +4488,15 @@ def calc_model_score_v2(feature_dict: Dict[str, Any]) -> float:
     style = feature_dict["style_suitability_index"]
     recent = feature_dict["recent_form_index"]
     ground = feature_dict["ground_match_index"]
+    ground_fit = feature_dict.get("ground_fit_index", 0.5)
+    rotation = feature_dict.get("rotation_index", 0.60)
+    weight = feature_dict.get("weight_index", 0.5)
+    training = feature_dict.get("training_index", 0.50)  # default=0.50: データなし中立（データあり中立≈0.495と整合）
+    last_margin = feature_dict.get("last_margin_index", 0.5)    # 前走着差品質
+    dist_change = feature_dict.get("distance_change_index", 0.5) # 距離延長/短縮適性
+    class_change = feature_dict.get("class_change_index", 0.5)   # クラス変動補正
+    odds_drift = feature_dict.get("odds_drift_index", 0.5)        # オッズ変化（資金流入シグナル）
+    tj_synergy = feature_dict.get("trainer_jockey_synergy_index", 0.5)  # 調教師×騎手シナジー
     pace_bias = feature_dict["pace_bias_index"]
     pace_sim = feature_dict.get("pace_simulation_index", 0.5)
     jockey = feature_dict["jockey_index"]
@@ -3401,22 +4512,31 @@ def calc_model_score_v2(feature_dict: Dict[str, Any]) -> float:
     race_level = feature_dict.get("race_level_index", 0.5)
     newspaper = feature_dict.get("newspaper_mark_index", 1.0)
 
-    sample_adj = min(1.0, feature_dict.get("distance_course_sample_size", 0) / 3.0)
+    sample_adj = min(1.0, feature_dict.get("distance_course_sample_size", 0) / 10.0)
 
     model_score = (
-        0.16 * dc
-        + 0.12 * style
-        + 0.15 * recent
-        + 0.05 * ground
+        0.15 * dc
+        + 0.11 * style
+        + 0.13 * recent
+        + 0.02 * ground
+        + 0.03 * ground_fit   # 馬場状態適性
+        + 0.02 * rotation     # 前走間隔補正
+        + 0.01 * weight       # 斤量補正
+        + 0.02 * training     # 調教指数
+        + 0.02 * last_margin  # 前走着差品質
+        + 0.02 * dist_change  # 距離延長/短縮適性
+        + 0.02 * class_change # クラス変動補正
+        + 0.01 * odds_drift   # オッズ変化（資金流入シグナル）
+        + 0.02 * tj_synergy   # 調教師×騎手シナジー
         + 0.06 * pace_bias
         + 0.06 * last3f
-        + 0.06 * lap
+        + 0.05 * lap
         + 0.06 * jockey
-        + 0.04 * gate
+        + 0.03 * gate
         + 0.04 * pace_adv
         + 0.06 * trend
-        + 0.04 * consistency
-        + 0.04 * distance_fit
+        + 0.03 * consistency
+        + 0.03 * distance_fit
         + 0.03 * bloodline
         + 0.03 * track_bias
         + 0.05 * pace_sim
@@ -3437,6 +4557,7 @@ def build_feature_dict_v2(
     scraped_place_odds: Optional[float] = None,
     sire_name: str = "",
     manual_styles: Optional[Dict[str, str]] = None,
+    current_jockey_weight: Optional[float] = None,
 ) -> Dict[str, Any]:
     # UIなどから手動入力された脚質があれば優先する
     if manual_styles and horse_name in manual_styles:
@@ -3450,6 +4571,7 @@ def build_feature_dict_v2(
         jockey_from_entry=jockey_from_entry,
         scraped_win_odds=scraped_win_odds,
         scraped_place_odds=scraped_place_odds,
+        current_jockey_weight=current_jockey_weight,
     )
 
     # 新聞脚質を優先
@@ -3524,7 +4646,9 @@ def apply_bloodline_and_track_bias_to_result(result: Dict[str, Any]) -> Dict[str
 
         feature["model_score"] = calc_model_score_v2(feature)
 
-    probs = softmax([f["model_score"] for f in result.get("features", [])], temperature=0.25)
+    _rf_scores = [f["model_score"] for f in result.get("features", [])]
+    _rf_temp   = calc_softmax_temperature(_rf_scores)
+    probs = softmax(_rf_scores, temperature=_rf_temp)
     for f, p in zip(result.get("features", []), probs):
         f["win_prob"] = round(p, 4)
         f["place_prob"] = estimate_place_prob(f["win_prob"])

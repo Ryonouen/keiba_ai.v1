@@ -23,6 +23,49 @@ SIGNAL_THRESHOLDS: Dict[str, Tuple[int, float]] = {
     "weak":   ( 5, 0.05),
 }
 
+# 年齢条件専用の低サンプル特例閾値（sample < 5 のみ使用）。
+# 年齢は同一レースへの出走機会自体が少ないため通常閾値だと
+# 「0/2出走」のような明確な不振でも neutral になる。
+# 2頭以上 + diff が大きければ強い懸念/追い風まで昇格させる。
+AGE_SIGNAL_THRESHOLDS: Dict[str, Tuple[int, float]] = {
+    "strong": ( 2, 0.20),  # 2頭以上 + |diff| ≥ 0.20 → 強い懸念/追い風
+    "medium": ( 2, 0.12),  # 2頭以上 + |diff| ≥ 0.12 → 懸念/追い風
+    "weak":   ( 2, 0.06),  # 2頭以上 + |diff| ≥ 0.06 → 弱い懸念/追い風
+}
+
+# 年齢条件のサンプル十分時専用閾値（sample >= 5 に使用）。
+#
+# 【設計根拠】
+# 通常 SIGNAL_THRESHOLDS (strong: diff >= 0.15, medium: diff >= 0.10) は
+# 年齢の diff_top3 の実質的な最大幅（約 ±0.19）に対して要件が高すぎる。
+# 例: 金鯱賞で7歳馬 1/10 → diff = -0.0875 → 通常閾値では weak_negative のみ。
+#
+# このレースにおける年齢別3着内率の相対差分を正しく捉えるため、
+# sample >= 5 の年齢条件には diff 要件を引き下げた専用閾値を使う。
+# （固定ペナルティではなく、レース固有データの相対比較で判定するという原則に従う）
+#
+# 検証:
+#   「0/5」 diff=-0.19 → strong(5, 0.12): 0.19 ≥ 0.12 ✓ → strong_negative
+#   「1/8」 diff=-0.06 → medium(5, 0.06): 0.06 ≥ 0.06 ✓ → medium_negative
+#   「1/10」diff=-0.09 → medium(5, 0.06): 0.09 ≥ 0.06 ✓ → medium_negative
+#   「5歳普通 diff=+0.01」→ weak(5, 0.03): 0.01 < 0.03 → neutral（過剰プラスなし）
+AGE_SAMPLE_ADEQUATE_THRESHOLDS: Dict[str, Tuple[int, float]] = {
+    "strong": (5, 0.12),   # sample ≥ 5 + |diff| ≥ 0.12 → 強い懸念/追い風
+    "medium": (5, 0.06),   # sample ≥ 5 + |diff| ≥ 0.06 → 懸念/追い風
+    "weak":   (5, 0.03),   # sample ≥ 5 + |diff| ≥ 0.03 → 弱い懸念/追い風
+}
+
+# 年齢条件の信頼度圧縮の基準サンプル数（sample < 5 の特例パス用）。
+# 通常の CONFIDENCE_FULL_SAMPLE=20 だと sample=2 → confidence=0.10 で
+# 補正値が 10% に圧縮されてしまう。年齢は少サンプルでも有意な傾向を
+# 持つため、基準を 5 に下げて圧縮を緩和する（0/2 でも -0.04 程度を確保）。
+AGE_CONFIDENCE_FULL_SAMPLE: int = 5
+
+# sample >= 5 の年齢条件パス用の信頼度基準サンプル数。
+# 通常より低め（10）に設定し、典型的な年齢サンプルサイズ（5〜15頭）で
+# 信頼度補正が過剰に圧縮されないようにする。
+AGE_CONFIDENCE_FULL_SAMPLE_ADEQUATE: int = 10
+
 # =========================================================
 # 補正値レンジ
 # =========================================================
@@ -71,18 +114,64 @@ SIGNAL_JP: Dict[str, str] = {
     "strong_negative": "強い懸念",
 }
 
-# 条件名 → 日本語表示
+# 条件名 → 日本語表示（単体条件 + コンボ条件）
 COND_JP: Dict[str, str] = {
-    "年齢":  "年齢",
-    "枠":    "枠順",
-    "脚質":  "脚質",
-    "人気帯": "人気帯",
+    # 単体条件
+    "年齢":       "年齢",
+    "枠":         "枠順",
+    "脚質":       "脚質",
+    "人気帯":     "人気帯",
+    "上がり3F帯": "上がり3F",
+    "斤量帯":     "斤量",
+    "騎手":       "騎手",
+    "馬場":       "馬場状態",
+    # コンボ条件
+    "脚質×人気帯":     "脚質×人気",
+    "年齢×脚質":       "年齢×脚質",
+    "枠×脚質":         "枠×脚質",
+    "脚質×上がり3F帯": "脚質×上がり3F",
+    "人気帯×上がり3F帯": "人気×上がり3F",
+    "脚質×馬場":       "脚質×馬場",
+}
+
+# コンボ条件のシグナル閾値（単体より高いサンプルを要求して誤検知を減らす）
+COMBO_SIGNAL_THRESHOLDS: Dict[str, Tuple[int, float]] = {
+    "strong": (12, 0.18),
+    "medium": ( 8, 0.12),
+    "weak":   ( 5, 0.07),
+}
+
+# コンボ条件ごとの補正圧縮係数（デフォルト 0.60）。
+# threshold_optimizer.optimize_combo_weights() で更新可能。
+# 単体条件との二重計上を抑えつつ、実績の高いコンボに高い重みを与える。
+COMBO_CONDITION_WEIGHTS: Dict[str, float] = {
+    "脚質×人気帯":       0.60,
+    "年齢×脚質":         0.60,
+    "枠×脚質":           0.60,
+    "脚質×上がり3F帯":   0.60,
+    "人気帯×上がり3F帯": 0.60,
+    "脚質×馬場":         0.60,
 }
 
 
 # =========================================================
 # シグナル判定
 # =========================================================
+
+def _judge_signal_with_thresholds(
+    sample_size: int,
+    diff_top3: float,
+    thresholds: Dict[str, Tuple[int, float]],
+) -> str:
+    """任意の閾値テーブルを使ってシグナルを判定する内部関数。"""
+    abs_diff = abs(diff_top3)
+    sign     = "positive" if diff_top3 >= 0 else "negative"
+    for level in ("strong", "medium", "weak"):
+        min_n, min_d = thresholds[level]
+        if sample_size >= min_n and abs_diff >= min_d:
+            return f"{level}_{sign}"
+    return "neutral"
+
 
 def judge_signal(sample_size: int, diff_top3: float) -> str:
     """
@@ -93,15 +182,7 @@ def judge_signal(sample_size: int, diff_top3: float) -> str:
       neutral,
       weak_positive, medium_positive, strong_positive
     """
-    abs_diff = abs(diff_top3)
-    sign     = "positive" if diff_top3 >= 0 else "negative"
-
-    for level in ("strong", "medium", "weak"):
-        min_n, min_d = SIGNAL_THRESHOLDS[level]
-        if sample_size >= min_n and abs_diff >= min_d:
-            return f"{level}_{sign}"
-
-    return "neutral"
+    return _judge_signal_with_thresholds(sample_size, diff_top3, SIGNAL_THRESHOLDS)
 
 
 # =========================================================
@@ -112,13 +193,17 @@ def calc_correction(
     signal: str,
     diff_top3: float,
     sample_size: int,
+    confidence_full_sample: int = CONFIDENCE_FULL_SAMPLE,
 ) -> float:
     """
     シグナル強度・diff_top3 の大きさ・サンプルサイズから補正値を計算する。
 
+    confidence_full_sample: この値以上で信頼度 1.0。
+        年齢条件など少サンプルで意味のある条件は AGE_CONFIDENCE_FULL_SAMPLE を渡す。
+
     設計:
     - diff_top3 の大きさに応じてレンジ内を補間（大きいほど極端な側へ）
-    - sample_size < CONFIDENCE_FULL_SAMPLE なら補正を圧縮
+    - sample_size < confidence_full_sample なら補正を圧縮
     - 不利補正はやや強め（負の方向はそのまま）
     - 有利補正はやや控えめ（正の方向は 0.95 倍）
     """
@@ -143,7 +228,7 @@ def calc_correction(
         raw = high + (low - high) * t
 
     # サンプルサイズ信頼度によって圧縮
-    confidence = min(1.0, sample_size / CONFIDENCE_FULL_SAMPLE)
+    confidence = min(1.0, sample_size / confidence_full_sample)
     return round(raw * confidence, 5)
 
 
@@ -156,16 +241,25 @@ def _get_horse_cond_keys(feature: Dict[str, Any]) -> Dict[str, Optional[str]]:
     from trend_stats import (
         bucket_age, bucket_gate, bucket_style,
         bucket_popularity_rank, bucket_popularity_odds,
+        bucket_last3f, bucket_jockey_weight, bucket_jockey,
+        bucket_track_condition,
     )
+    from jockey_ai import normalize_jockey_name
     pop_key = (
         bucket_popularity_rank(feature.get("popularity"))
         or bucket_popularity_odds(feature.get("win_odds"))
     )
+    jockey_raw = feature.get("jockey") or ""
+    jockey_key = bucket_jockey(normalize_jockey_name(jockey_raw))
     return {
-        "年齢":  bucket_age(feature.get("age")),
-        "枠":    bucket_gate(feature.get("gate")),
-        "脚質":  bucket_style(feature.get("running_style")),
-        "人気帯": pop_key,
+        "年齢":       bucket_age(feature.get("age")),
+        "枠":         bucket_gate(feature.get("gate")),
+        "脚質":       bucket_style(feature.get("running_style")),
+        "人気帯":     pop_key,
+        "上がり3F帯": bucket_last3f(feature.get("recent_last3f")),
+        "斤量帯":     bucket_jockey_weight(feature.get("jockey_weight")),
+        "騎手":       jockey_key,
+        "馬場":       bucket_track_condition(feature.get("track_condition")),
     }
 
 
@@ -217,11 +311,26 @@ def build_horse_signal_details(
         sample = bucket_data["sample_size"]
         t3r    = bucket_data["top3_rate"]
         diff   = bucket_data["diff_top3"]
-        signal = judge_signal(sample, diff)
+        # 年齢条件の閾値選択（3段階）:
+        #   sample < 5  → AGE_SIGNAL_THRESHOLDS（低サンプル特例）
+        #   sample >= 5 → AGE_SAMPLE_ADEQUATE_THRESHOLDS（年齢サンプル十分時専用）
+        #   その他条件  → SIGNAL_THRESHOLDS（通常）
+        # 年齢の diff_top3 実質範囲（±0.19 程度）に合わせた専用閾値を使うことで、
+        # 「このレースで7歳以上が1/10しか3着内に入っていない」等の
+        # 明確な不振を medium/strong_negative として正しく検知する。
+        if cond_name == "年齢" and sample < 5:
+            signal = _judge_signal_with_thresholds(sample, diff, AGE_SIGNAL_THRESHOLDS)
+            adj    = calc_correction(signal, diff, sample,
+                                     confidence_full_sample=AGE_CONFIDENCE_FULL_SAMPLE)
+        elif cond_name == "年齢":
+            signal = _judge_signal_with_thresholds(sample, diff, AGE_SAMPLE_ADEQUATE_THRESHOLDS)
+            adj    = calc_correction(signal, diff, sample,
+                                     confidence_full_sample=AGE_CONFIDENCE_FULL_SAMPLE_ADEQUATE)
+        else:
+            signal = judge_signal(sample, diff)
+            adj    = calc_correction(signal, diff, sample)
         if signal == "neutral":
             continue
-
-        adj    = calc_correction(signal, diff, sample)
         reason = _build_reason(cond_name, bucket_key, t3r, overall_top3, signal)
 
         details.append({
@@ -377,3 +486,81 @@ def _build_summary(
     sign = "+" if total >= 0 else ""
     parts.append(f"補正合計: {sign}{total:.3f}")
     return " | ".join(parts) if parts else "傾向シグナルなし"
+
+
+# =========================================================
+# コンボ条件シグナル生成
+# =========================================================
+
+def build_horse_combo_signal_details(
+    feature: Dict[str, Any],
+    combo_condition_stats: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    1頭分のコンボ条件（2条件の掛け合わせ）シグナル詳細リストを生成する。
+
+    例: "脚質×人気帯" で "差し×1番人気" の3着内率が全体より有意に高ければ
+        medium_positive シグナルを返す。
+
+    単体条件との二重計上を避けるため、補正値は 60% に圧縮する。
+    （コンボは相乗効果の「追加証拠」として機能する）
+
+    Parameters
+    ----------
+    feature              : race_ai_engine の features 要素
+    combo_condition_stats: build_combo_condition_stats() の戻り値
+
+    Returns
+    -------
+    build_horse_signal_details と同一構造の List[Dict]
+    """
+    if not combo_condition_stats:
+        return []
+
+    from trend_stats import COMBO_CONDITION_PAIRS
+
+    overall      = combo_condition_stats.get("_overall", {})
+    overall_top3 = overall.get("overall_top3_rate", 0.0)
+    horse_keys   = _get_horse_cond_keys(feature)
+    details: List[Dict[str, Any]] = []
+
+    for c1, c2 in COMBO_CONDITION_PAIRS:
+        k1 = horse_keys.get(c1)
+        k2 = horse_keys.get(c2)
+        if not k1 or not k2:
+            continue
+
+        combo_key   = f"{c1}×{c2}"
+        bucket_key  = f"{k1}×{k2}"
+        bucket_data = combo_condition_stats.get(combo_key, {}).get(bucket_key)
+        if not bucket_data:
+            continue
+
+        sample = bucket_data["sample_size"]
+        t3r    = bucket_data["top3_rate"]
+        diff   = bucket_data["diff_top3"]
+
+        signal = _judge_signal_with_thresholds(sample, diff, COMBO_SIGNAL_THRESHOLDS)
+        if signal == "neutral":
+            continue
+
+        # 単体との二重計上を抑えるためデータドリブン重みで圧縮（デフォルト 60%）
+        _combo_w = COMBO_CONDITION_WEIGHTS.get(combo_key, 0.60)
+        adj    = round(calc_correction(signal, diff, sample) * _combo_w, 5)
+        reason = _build_reason(combo_key, bucket_key, t3r, overall_top3, signal)
+
+        details.append({
+            "factor":            COND_JP.get(combo_key, combo_key),
+            "value":             bucket_key,
+            "sample_size":       sample,
+            "top3_rate":         t3r,
+            "overall_top3_rate": overall_top3,
+            "diff_top3":         diff,
+            "signal":            signal,
+            "signal_jp":         SIGNAL_JP.get(signal, ""),
+            "score_adjust":      adj,
+            "reason":            reason,
+            "is_combo":          True,
+        })
+
+    return details

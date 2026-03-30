@@ -239,11 +239,23 @@ _JOCKEY_ALIAS: Dict[str, str] = {
     "幸英明": "幸",
     "武豊": "武豊",
     "ルメール": "ルメール",
+    "C.ルメール": "ルメール",
     "C.デムーロ": "Cデムーロ",
     "M.デムーロ": "Mデムーロ",
     "石川裕紀人": "石川裕",
     "柴田大知": "柴田大",
     "丹内祐次": "丹内",
+    "戸崎圭太": "戸崎",
+    "浜中俊": "浜中",
+    "藤岡佑介": "藤岡佑",
+    "和田竜二": "和田竜",
+    "池添謙一": "池添",
+    "北村友一": "北村友",
+    "吉田隼人": "吉田隼",
+    "酒井学": "酒井",
+    "大野拓弥": "大野",
+    "藤岡康太": "藤岡康",
+    "松若風馬": "松若",
 }
 
 # プロファイルキャッシュ（プロセス内で1回だけビルドされる）
@@ -677,8 +689,26 @@ def calc_jockey_delta(
     dist_key = bucket_distance(int(target_dist) if target_dist else None)
     _add("距離", dist_key, profile["by_distance"], SENSITIVITY_DISTANCE, DELTA_DISTANCE_MAX)
 
-    # ── 馬コンビ ──────────────────────────────────────────────────────────
-    _add("馬コンビ", horse_name, profile["by_horse"], SENSITIVITY_DISTANCE, DELTA_COMBO_MAX)
+    # ── 馬コンビ（feature 由来の実績を優先、なければ CSV キャッシュにフォールバック） ──
+    _combo_rides = int(feature.get("jockey_combo_rides") or 0)
+    if _combo_rides > 0:
+        _combo_slot = {
+            horse_name: {
+                "smoothed_win_rate":  smooth_rate(
+                    int(feature.get("jockey_combo_wins") or 0),
+                    _combo_rides, PRIOR_STRENGTH_COMBO, GLOBAL_WIN_RATE,
+                ),
+                "smoothed_top3_rate": smooth_rate(
+                    int(feature.get("jockey_combo_top3") or 0),
+                    _combo_rides, PRIOR_STRENGTH_COMBO, GLOBAL_TOP3_RATE,
+                ),
+                "confidence": calc_confidence(_combo_rides, PRIOR_STRENGTH_COMBO),
+                "rides": _combo_rides,
+            }
+        }
+        _add("馬コンビ", horse_name, _combo_slot, SENSITIVITY_DISTANCE, DELTA_COMBO_MAX)
+    else:
+        _add("馬コンビ", horse_name, profile["by_horse"], SENSITIVITY_DISTANCE, DELTA_COMBO_MAX)
 
     # ── 合計 ──────────────────────────────────────────────────────────────
     jockey_delta = max(JOCKEY_DELTA_MIN, min(JOCKEY_DELTA_MAX, total_delta))

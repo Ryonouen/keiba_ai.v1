@@ -4,12 +4,112 @@ from selenium.webdriver.common.by import By
 from typing import List, Dict, Any, Optional, Tuple
 from statistics import mean
 from openai import OpenAI
+from openai_cost_guard import safe_chat_create
+import hashlib
 import json
 import os
 import re
 import time
 import random
+from pathlib import Path
 from trend_stats import bucket_gate
+
+# -------------------------------------------------
+# 簡易キャッシュ（race_history_ai 専用）
+# fetch_single_race_enriched の結果をキャッシュして
+# 毎回10ページ再取得しなくて済むようにする
+# -------------------------------------------------
+_ENRICHED_CACHE_DIR = Path(".keiba_cache")
+_ENRICHED_CACHE_TTL = 60 * 60 * 24 * 7  # 7日（レース結果は変わらないので長め）
+_ENRICHED_CACHE_VERSION = "v4"           # track_condition（馬場状態）を追加した際に更新
+
+
+def _enriched_cache_path(race_id: str) -> Path:
+    key = hashlib.md5(f"enriched_{_ENRICHED_CACHE_VERSION}_{race_id}".encode()).hexdigest()
+    return _ENRICHED_CACHE_DIR / f"enriched_{key}.json"
+
+
+def _load_enriched_cache(race_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        path = _enriched_cache_path(race_id)
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > _ENRICHED_CACHE_TTL:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_enriched_cache(race_id: str, data: Dict[str, Any]) -> None:
+    try:
+        _ENRICHED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_enriched_cache_path(race_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+# -------------------------------------------------
+# Race name matching — 別レース混入防止
+# -------------------------------------------------
+
+def _extract_core_race_name(title: str) -> str:
+    """
+    ページタイトル文字列からレース名のコア部分を抽出する。
+
+    目的: 年号・回次・グレード括弧・区切り文字以降のノイズを除去し、
+          「スプリングステークス」のようなレース名だけを残す。
+
+    例:
+        "スプリングステークス｜2024年中山11Rの競馬予想..." → "スプリングステークス"
+        "スプリングステークス(G2) | netkeiba.com"         → "スプリングステークス"
+        "2024年 第68回スプリングステークス"               → "スプリングステークス"
+    """
+    if not title:
+        return ""
+    # 区切り文字で最初のトークンだけを取る（レース名が先頭にある前提）
+    for sep in ("｜", " | ", " - ", "　"):
+        if sep in title:
+            title = title.split(sep)[0].strip()
+            break
+    title = re.sub(r'\d{4}年?', '', title)              # 年号除去
+    title = re.sub(r'第\d+回', '', title)                # 第XX回除去
+    title = re.sub(r'[\(（][^)\)）]*[\)）]', '', title)  # グレード括弧除去
+    title = title.replace('　', '').strip()
+    return title
+
+
+def race_names_match(scraped_title: str, target_name: str) -> bool:
+    """
+    スクレイプ済みページタイトルが対象レース名と同一レースを指すか判定する。
+
+    目的: スプリングSのURLで過去年を辿った際、アネモネSなど別レースが
+          同じ race_id スロットに割り当てられているケースを検出・除外する。
+
+    判定基準:
+        1. 正規化後にどちらかがもう一方を含む → 同一（略称 vs フル表記に対応）
+        2. 先頭5文字が一致 → 同一（表記揺れに対応）
+        3. 判定不能（空文字・取得失敗）→ True を返す（安全側で通す）
+
+    例:
+        "スプリングステークス" vs "アネモネステークス" → False  (先頭5文字: スプリン vs アネモネ)
+        "スプリングS"          vs "スプリングステークス" → True  (前者が後者の prefix 含む)
+    """
+    if not scraped_title or not target_name:
+        return True  # 判定不能 → 通す
+    n1 = _extract_core_race_name(scraped_title)
+    n2 = _extract_core_race_name(target_name)
+    if not n1 or not n2:
+        return True  # 正規化後も空 → 通す
+    if n1 in n2 or n2 in n1:
+        return True
+    # 先頭5文字が一致（表記揺れ許容）
+    if len(n1) >= 5 and len(n2) >= 5 and n1[:5] == n2[:5]:
+        return True
+    return False
+
 
 # -------------------------------------------------
 # Utilities
@@ -159,10 +259,18 @@ def fetch_single_race(driver, race_id: str) -> Optional[Dict[str, Any]]:
 # Fetch past races
 # -------------------------------------------------
 
-def fetch_race_history(driver, race_id: str, years: int = 10) -> List[Dict[str, Any]]:
+def fetch_race_history(
+    driver,
+    race_id: str,
+    years: int = 10,
+    expected_race_name: str = "",
+) -> List[Dict[str, Any]]:
     """
     Fetch past race winners for the same race ID across previous years.
     Example race_id: 202405030811
+
+    expected_race_name: 分析対象レースの正式名称。指定すると別レースが
+                        同一 race_id スロットに入っているページを自動スキップする。
     """
 
     try:
@@ -182,6 +290,11 @@ def fetch_race_history(driver, race_id: str, years: int = 10) -> List[Dict[str, 
         data = fetch_single_race(driver, new_race_id)
 
         if data:
+            # レース名照合: 別レースが同スロットに入っているページを除外
+            if expected_race_name and not race_names_match(
+                data.get("race_title", ""), expected_race_name
+            ):
+                continue
             history.append(data)
 
         # polite delay to avoid blocking
@@ -346,12 +459,13 @@ def analyze_with_chatgpt(history, race_name):
     }
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
+        response = safe_chat_create(
+            client,
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": "あなたは中央競馬の重賞傾向分析AIです。簡潔かつロジカルに答えてください。"},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}
-            ]
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
         )
 
         content = response.choices[0].message.content
@@ -387,7 +501,11 @@ def build_past_race_ids(current_race_id: str, years: int = 10) -> List[str]:
 
     return ids
 
-def fetch_past_10y_results(driver: Any, current_race_id: str) -> List[Dict[str, Any]]:
+def fetch_past_10y_results(
+    driver: Any,
+    current_race_id: str,
+    expected_race_name: str = "",
+) -> List[Dict[str, Any]]:
     past_ids = build_past_race_ids(current_race_id, years=10)
     results: List[Dict[str, Any]] = []
 
@@ -396,6 +514,15 @@ def fetch_past_10y_results(driver: Any, current_race_id: str) -> List[Dict[str, 
 
         try:
             driver.get(url)
+
+            # レース名照合: 別レースが同スロットに入っているページを除外
+            if expected_race_name:
+                try:
+                    page_title = driver.title or ""
+                except Exception:
+                    page_title = ""
+                if page_title and not race_names_match(page_title, expected_race_name):
+                    continue  # 例: スプリングSのはずがアネモネSだった場合
 
             rows = driver.find_elements("css selector", "table.RaceTable01 tbody tr")
             for row in rows[:3]:
@@ -532,17 +659,44 @@ def fetch_single_race_enriched(driver: Any, race_id: str) -> Optional[Dict[str, 
     -------
     {
         "race_id":   str,
+        "race_title": str,  # ページタイトル（レース混入チェックに使用）
         "n_runners": int,
         "runners":   List[Dict]  # rank, gate, horse_name, age, popularity, odds, running_style
     }
     None なら取得失敗
     """
+    # キャッシュヒット確認（過去レース結果は変わらないので長期キャッシュOK）
+    _cached = _load_enriched_cache(race_id)
+    if _cached:
+        return _cached
+
     url = f"https://db.netkeiba.com/race/{race_id}/"
     try:
         driver.get(url)
         random_sleep()
     except Exception:
         return None
+
+    # ページタイトルを取得（レース名照合用）
+    try:
+        page_race_title = driver.title or ""
+    except Exception:
+        page_race_title = ""
+
+    # 馬場状態を取得（レース情報ヘッダから）
+    track_condition: Optional[str] = None
+    try:
+        race_data_text = ""
+        for sel in (".RaceData01", ".race_data", "p.RaceData01"):
+            elems = driver.find_elements(By.CSS_SELECTOR, sel)
+            if elems:
+                race_data_text = elems[0].text
+                break
+        m = re.search(r"[／/]\s*(良|稍重|重|不良)", race_data_text)
+        if m:
+            track_condition = m.group(1)
+    except Exception:
+        track_condition = None
 
     rows = driver.find_elements(By.CSS_SELECTOR, ".race_table_01 tbody tr")
     if not rows:
@@ -558,49 +712,110 @@ def fetch_single_race_enriched(driver: Any, race_id: str) -> Optional[Dict[str, 
         if rank is None:
             continue
 
-        gate       = parse_int(safe_text(cols[1]))
-        horse      = safe_text(cols[3])
-        sex_age    = safe_text(cols[4])
-        passing    = safe_text(cols[10])
-        odds       = parse_float(safe_text(cols[12]))
-        popularity = parse_int(safe_text(cols[13]))
+        gate           = parse_int(safe_text(cols[1]))
+        horse          = safe_text(cols[3])
+        sex_age        = safe_text(cols[4])
+        jockey_weight  = parse_float(safe_text(cols[5]))   # 斤量
+        jockey         = safe_text(cols[6])                # 騎手名
+        passing        = safe_text(cols[10])
+        last_3f        = parse_float(safe_text(cols[11]))  # 上がり3F
+        odds           = parse_float(safe_text(cols[12]))
+        popularity     = parse_int(safe_text(cols[13]))
 
         age_match = re.search(r"(\d+)", sex_age)
         age = int(age_match.group(1)) if age_match else None
         style = infer_style(passing)
 
         runners.append({
-            "rank":          rank,
-            "gate":          gate,
-            "horse_name":    horse,
-            "age":           age,
-            "popularity":    popularity,
-            "odds":          odds,
-            "running_style": style,
+            "rank":            rank,
+            "gate":            gate,
+            "horse_name":      horse,
+            "age":             age,
+            "popularity":      popularity,
+            "odds":            odds,
+            "running_style":   style,
+            "last_3f":         last_3f,          # 上がり3F (秒)
+            "jockey_weight":   jockey_weight,     # 斤量 (kg)
+            "jockey":          jockey,            # 騎手名
+            "track_condition": track_condition,   # 馬場状態
         })
 
     if not runners:
         return None
 
-    return {
-        "race_id":   race_id,
-        "n_runners": len(runners),
-        "runners":   runners,
+    result = {
+        "race_id":    race_id,
+        "race_title": page_race_title,   # レース名照合用
+        "n_runners":  len(runners),
+        "runners":    runners,
     }
+    _save_enriched_cache(race_id, result)
+    return result
+
+
+def fetch_single_race_enriched_noselenium(race_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Selenium不要版の fetch_single_race_enriched。
+    dividend_scraper.scrape_race_result() を使ってrequestsで取得する。
+    キャッシュも共有する（fetch_single_race_enriched と同じキーを使用）。
+    """
+    # キャッシュヒット確認
+    _cached = _load_enriched_cache(race_id)
+    if _cached:
+        return _cached
+
+    from dividend_scraper import scrape_race_result
+
+    data = scrape_race_result(race_id)
+    if not data or not data.get("runners"):
+        return None
+
+    # fetch_single_race_enriched 互換フォーマットに変換
+    runners = []
+    for r in data["runners"]:
+        runners.append({
+            "rank":            r.get("rank"),
+            "gate":            r.get("gate"),
+            "horse_name":      r.get("horse_name", ""),
+            "age":             r.get("age"),
+            "popularity":      r.get("popularity"),
+            "odds":            r.get("win_odds"),       # win_odds → odds
+            "running_style":   r.get("running_style", "unknown"),
+            "last_3f":         r.get("last_3f"),
+            "jockey_weight":   r.get("jockey_weight"),
+            "jockey":          r.get("jockey", ""),
+            "track_condition": data.get("track_condition"),
+        })
+
+    result = {
+        "race_id":    race_id,
+        "race_title": data.get("race_name", ""),
+        "n_runners":  len(runners),
+        "runners":    runners,
+    }
+    _save_enriched_cache(race_id, result)
+    return result
 
 
 def fetch_race_history_enriched(
     driver: Any,
     race_id: str,
     years: int = 10,
+    expected_race_name: str = "",
 ) -> List[Dict[str, Any]]:
     """
     過去N年の同レースを全走者付きで返す。
+
+    driver=None の場合は Selenium を使わず requests ベースで取得する。
+    expected_race_name: 分析対象レースの正式名称。指定すると別レースが
+                        同一 race_id スロットに入っているページを自動スキップする。
     """
     try:
         current_year = int(str(race_id)[:4])
     except Exception:
         return []
+
+    use_selenium = driver is not None
 
     history: List[Dict[str, Any]] = []
     for year in range(current_year, current_year - years, -1):
@@ -609,12 +824,18 @@ def fetch_race_history_enriched(
         except Exception:
             continue
 
-        data = fetch_single_race_enriched(driver, new_race_id)
+        if use_selenium:
+            data = fetch_single_race_enriched(driver, new_race_id)
+        else:
+            data = fetch_single_race_enriched_noselenium(new_race_id)
+
         if data:
+            # レース名照合: 別レースが同スロットに入っているページを除外
+            if expected_race_name and not race_names_match(
+                data.get("race_title", ""), expected_race_name
+            ):
+                continue
             history.append(data)
         random_sleep(0.8, 1.6)
 
     return history
-
-
-    return result

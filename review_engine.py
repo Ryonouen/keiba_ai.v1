@@ -54,18 +54,34 @@ def _bought_names(tickets: List[Dict[str, Any]]) -> Set[str]:
 
 def _actual_bought_names(actual_bets_text: str) -> Set[str]:
     """
-    actual_bets テキストから馬名を抽出する（簡易版）。
+    actual_bets テキストから馬名を抽出する。
     形式例: "馬連 イクイノックス-ジャスティンパレス 500円"
     馬名はスペース・ハイフン・スラッシュで区切られていることが多い。
-    完全なパースは行わず、ユーザー入力の馬名が含まれているかを
-    フォールバックとして後処理で使う。
+    券種名・数字・金額表記・一般ノイズを除去してから返す。
     """
     if not actual_bets_text:
         return set()
     import re
-    # 数字・円・馬番・一般的な記号を除き残ったもの
-    tokens = re.split(r"[\s\-/・,、　]+", actual_bets_text)
-    return {t.strip() for t in tokens if t.strip() and not t.strip().isdigit() and "円" not in t}
+    # 除外ワード: 券種名・単位・その他ノイズ
+    _NOISE = frozenset({
+        "単勝", "複勝", "馬連", "馬単", "ワイド", "3連複", "3連単",
+        "枠連", "枠単", "円", "票", "点", "番", "着", "倍",
+    })
+    tokens = re.split(r"[\s\-/・,、　→×]+", actual_bets_text)
+    result: Set[str] = set()
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        if t.isdigit():
+            continue
+        # 末尾の円・倍などを除去した数字も除外
+        if re.fullmatch(r"[\d,]+[円倍票点]?", t):
+            continue
+        if t in _NOISE:
+            continue
+        result.add(t)
+    return result
 
 
 def _check_bet_hit_tickets(
@@ -83,11 +99,11 @@ def _check_bet_hit_tickets(
         combo = set(ticket.get("combination", []))
         if not combo:
             continue
-        if bet_type == "単勝"  and top1 in combo:             return True
-        if bet_type == "複勝"  and combo & top3:              return True
-        if bet_type == "馬連"  and combo <= top2:             return True
-        if bet_type == "ワイド" and len(combo & top3) >= 2:   return True
-        if bet_type == "3連複" and combo <= top3:             return True
+        if bet_type == "単勝"                        and top1 in combo:            return True
+        if bet_type == "複勝"                        and combo & top3:             return True
+        if bet_type == "馬連"                        and combo <= top2:            return True
+        if bet_type in ("ワイド", "ワイドBOX")       and len(combo & top3) >= 2:  return True
+        if bet_type in ("3連複", "3連複BOX")         and combo <= top3:           return True
     return False
 
 

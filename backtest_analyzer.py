@@ -35,6 +35,7 @@ COMMENT_THRESHOLDS: Dict[str, float] = {
     "roi_bad":                 0.85,   # この回収率以下は要見直し
     "avg_tickets_high":        4.5,    # 平均点数がこれ超で「点数過多」警告
     "rescue_in_money_low":     0.28,   # 取りこぼし注意馬3着内率がこれ未満で警告
+    "value_wrong_rate_high":   0.70,   # 妙味馬の着外率がこれ超で「拾いすぎ」警告
     "min_samples":             3,      # この件数以上ないとコメントを出さない
 }
 
@@ -341,14 +342,22 @@ def generate_improvement_comments(analytics: Dict[str, Any]) -> List[str]:
         elif d_correct >= 0.70:
             comments.append(f"【危険馬】消し推奨正解率 {d_correct*100:.1f}% — 高精度。")
 
-    # ── 妙味馬3着内率 ────────────────────────────────────────────────
-    v_total = value.get("value_total", 0)
-    v_rate  = value.get("value_in_money_rate", 0)
-    if v_total >= min_n and v_rate < thr["value_in_money_low"]:
-        comments.append(
-            f"【妙味馬】3着内率 {v_rate*100:.1f}%（目標 {thr['value_in_money_low']*100:.0f}% 以上）。"
-            f"VALUE_GAP_MIN を引き上げて、より厳選した妙味馬のみを対象にすることを推奨。"
-        )
+    # ── 妙味馬3着内率 / 拾いすぎ率 ──────────────────────────────────────────
+    v_total      = value.get("value_total", 0)
+    v_rate       = value.get("value_in_money_rate", 0)
+    v_wrong_rate = value.get("value_wrong_rate", 0)
+    v_wrong_n    = value.get("value_wrong_count", 0)
+    if v_total >= min_n:
+        if v_wrong_rate > thr["value_wrong_rate_high"]:
+            comments.append(
+                f"【妙味馬・拾いすぎ】着外 {v_wrong_n}回（着外率 {v_wrong_rate*100:.1f}%）。"
+                f"VALUE_MIN_WIN_PROB / VALUE_MIN_STABLE_SCORE の引き上げを推奨。"
+            )
+        elif v_rate < thr["value_in_money_low"]:
+            comments.append(
+                f"【妙味馬】3着内率 {v_rate*100:.1f}%（目標 {thr['value_in_money_low']*100:.0f}% 以上）。"
+                f"VALUE_GAP_MIN を引き上げて、より厳選した妙味馬のみを対象にすることを推奨。"
+            )
 
     # ── 取りこぼし注意馬3着内率 ──────────────────────────────────────
     rsc_total = rescue.get("rescue_total", 0)
