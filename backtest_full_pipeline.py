@@ -294,6 +294,7 @@ def simulate_payout(
         return {"hit": False, "payout": 0, "invest": invest}
 
     # ── 複勝 ──
+    # factor は複勝オッズそのもの（例: 1番人気=1.55倍）
     if bet_type == "複勝" and len(horses) >= 1:
         h = fmap.get(horses[0])
         if h is None:
@@ -301,51 +302,73 @@ def simulate_payout(
         if h["_target_top3"] == 1:
             pop = h.get("popularity_rank", 99)
             factor = _PLACE_FACTORS.get(pop, _PLACE_FACTOR_DEFAULT)
-            win_odds = math.exp(h["_win_odds_log"])
-            payout = win_odds * factor * invest / 100
+            payout = factor * invest
             return {"hit": True, "payout": payout, "invest": invest}
         return {"hit": False, "payout": 0, "invest": invest}
 
     # ── 馬連 ──
-    if bet_type == "馬連" and len(horses) >= 2:
-        ha, hb = fmap.get(horses[0]), fmap.get(horses[1])
-        if ha is None or hb is None:
-            return {"hit": False, "payout": 0, "invest": invest}
-        top2_names = {
-            f["horse_name"]
-            for f in sorted(
-                [x for x in features if x["_target_top3"] == 1],
-                key=lambda x: x.get("popularity_rank", 99),
-            )[:2]
-        }
-        if horses[0] in top2_names and horses[1] in top2_names:
-            oa = math.exp(ha["_win_odds_log"])
-            ob = math.exp(hb["_win_odds_log"])
-            payout = oa * ob * 0.75 * invest / 10
+    # 的中: 推奨2頭が上位2頭（_target_win=1 の馬 + もう1頭の top3）
+    # 払戻近似: oa * ob * 0.75 * invest（理論値）
+    if bet_type in ("馬連", "馬連流し") and len(horses) >= 2:
+        winner_name = next(
+            (f["horse_name"] for f in features if f["_target_win"] == 1), None
+        )
+        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
+        # 軸 = horses[0]、相手 = horses[1:]
+        axis = horses[0]
+        partners = horses[1:]
+        # 的中: 軸が top3 かつ 相手のいずれかが top3、かつ両馬が 1着・2着
+        hit = False
+        payout_horse_a = payout_horse_b = None
+        if axis in top3_names:
+            for partner in partners:
+                if partner in top3_names:
+                    # 両馬が top3 に含まれる（馬連の近似的中）
+                    ha = fmap.get(axis)
+                    hb = fmap.get(partner)
+                    if ha is not None and hb is not None:
+                        hit = True
+                        payout_horse_a, payout_horse_b = ha, hb
+                        break
+        if hit and payout_horse_a and payout_horse_b:
+            oa = math.exp(payout_horse_a["_win_odds_log"])
+            ob = math.exp(payout_horse_b["_win_odds_log"])
+            ticket_count = max(len(partners), 1)
+            payout = oa * ob * 0.75 * (invest / ticket_count)
             return {"hit": True, "payout": payout, "invest": invest}
         return {"hit": False, "payout": 0, "invest": invest}
 
-    # ── ワイド ──
-    if bet_type == "ワイド" and len(horses) >= 2:
-        ha, hb = fmap.get(horses[0]), fmap.get(horses[1])
-        if ha is None or hb is None:
-            return {"hit": False, "payout": 0, "invest": invest}
-        if ha["_target_top3"] == 1 and hb["_target_top3"] == 1:
-            oa = math.exp(ha["_win_odds_log"])
-            ob = math.exp(hb["_win_odds_log"])
-            payout = oa * ob * 0.25 * invest / 10
-            return {"hit": True, "payout": payout, "invest": invest}
+    # ── ワイド / ワイドBOX ──
+    # 払戻近似: oa * ob * 0.25 * invest（理論値）
+    if bet_type in ("ワイド", "ワイドBOX") and len(horses) >= 2:
+        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
+        from itertools import combinations
+        ticket_count = max(len(list(combinations(horses, 2))), 1)
+        for ha_name, hb_name in combinations(horses, 2):
+            if ha_name in top3_names and hb_name in top3_names:
+                ha = fmap.get(ha_name)
+                hb = fmap.get(hb_name)
+                if ha and hb:
+                    oa = math.exp(ha["_win_odds_log"])
+                    ob = math.exp(hb["_win_odds_log"])
+                    payout = oa * ob * 0.25 * (invest / ticket_count)
+                    return {"hit": True, "payout": payout, "invest": invest}
         return {"hit": False, "payout": 0, "invest": invest}
 
-    # ── 3連複 ──
-    if bet_type in ("3連複", "三連複") and len(horses) >= 3:
-        hs = [fmap.get(h) for h in horses[:3]]
-        if any(h is None for h in hs):
-            return {"hit": False, "payout": 0, "invest": invest}
-        if all(h["_target_top3"] == 1 for h in hs):
-            odds_product = math.prod(math.exp(h["_win_odds_log"]) for h in hs)
-            payout = odds_product * 0.70 * invest / 10
-            return {"hit": True, "payout": payout, "invest": invest}
+    # ── 3連複 / 3連複BOX ──
+    # 払戻近似: 的中3頭のオッズ積 * 0.70 * (invest / ticket_count)（理論値）
+    if bet_type in ("3連複", "三連複", "3連複BOX") and len(horses) >= 3:
+        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
+        from itertools import combinations
+        combos = list(combinations(horses, 3))
+        ticket_count = max(len(combos), 1)
+        for trio in combos:
+            if all(h in top3_names for h in trio):
+                hs = [fmap.get(h) for h in trio]
+                if all(h is not None for h in hs):
+                    odds_product = math.prod(math.exp(h["_win_odds_log"]) for h in hs)
+                    payout = odds_product * 0.70 * (invest / ticket_count)
+                    return {"hit": True, "payout": payout, "invest": invest}
         return {"hit": False, "payout": 0, "invest": invest}
 
     # ── 対応外 ──
