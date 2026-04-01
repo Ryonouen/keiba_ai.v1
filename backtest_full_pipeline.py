@@ -245,6 +245,18 @@ def run_value_ai_pipeline(
     if not ev_table:
         return EMPTY
 
+    # ── EV フィルタ（見送り判定） ─────────────────────────────────────
+    # value_ai の recommend_bet_plan は内部で常に構造型推奨を使うため
+    # EV_SKIP_THRESHOLD が実質無効化されている。
+    # バックテスト側で「妙味馬(value_gap >= 0.025)が1頭もいないレースは見送り」を適用する。
+    _VALUE_GAP_MIN = 0.025
+    has_value_horse = any(
+        (row.get("value_gap") or 0.0) >= _VALUE_GAP_MIN
+        for row in ev_table
+    )
+    if not has_value_horse:
+        return {**EMPTY, "skip_reason": "妙味馬なし（見送り）"}
+
     race_structure = classify_race_structure(features, pace_balance)
     plan = recommend_bet_plan(
         features=features,
