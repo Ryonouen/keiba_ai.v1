@@ -350,3 +350,218 @@ def simulate_payout(
 
     # ── 対応外 ──
     return {"hit": False, "payout": 0, "invest": invest}
+
+
+def run_backtest(
+    csv_path: str = TRAINING_CSV,
+    target_years: List[int] = TARGET_YEARS,
+    bankroll: int = BANKROLL,
+) -> Dict[str, Any]:
+    """
+    フルパイプラインバックテストを実行する。
+
+    Returns:
+        {
+            "total_races": int,
+            "recommended": int,
+            "hits": int,
+            "total_invest": float,
+            "total_payout": float,
+            "roi": float,
+            "by_year": {year: {"total_races", "recommended", "hits", "invest", "payout", "roi"}},
+            "by_bet_type": {bet_type: {"races", "hits", "invest", "payout"}},
+            "records": [{"race_id", "year", "bet_type", "horses", "hit", "invest", "payout"}],
+        }
+    """
+    print(f"CSVを読み込み中: {csv_path}")
+    df_full = pd.read_csv(csv_path, low_memory=False)
+    df_full["year"] = pd.to_datetime(df_full["race_date"], errors="coerce").dt.year
+
+    for col in ML_FEATURE_COLUMNS:
+        if col not in df_full.columns:
+            df_full[col] = 0.0
+        else:
+            df_full[col] = pd.to_numeric(df_full[col], errors="coerce").fillna(0.0)
+    if "feat_jockey_weight" not in df_full.columns:
+        df_full["feat_jockey_weight"] = 55.0
+    else:
+        df_full["feat_jockey_weight"] = df_full["feat_jockey_weight"].fillna(55.0)
+
+    print(f"総行数: {len(df_full):,}  対象年: {target_years}\n")
+
+    records: List[Dict[str, Any]] = []
+    by_year: Dict[int, Dict] = {}
+    by_bet_type: Dict[str, Dict] = defaultdict(
+        lambda: {"races": 0, "hits": 0, "invest": 0.0, "payout": 0.0}
+    )
+
+    for test_year in target_years:
+        print(f"[{test_year}] モデル訓練中（{test_year - 1}年以前）...", end=" ", flush=True)
+        model = train_lgbm_for_year(df_full, test_year=test_year)
+        print("完了")
+
+        year_df = df_full[df_full["year"] == test_year].copy()
+        race_groups = year_df.groupby("race_id")
+        race_ids = list(race_groups.groups.keys())
+        print(f"[{test_year}] レース数: {len(race_ids):,}")
+
+        y_total = y_recommended = y_hits = 0
+        y_invest = y_payout = 0.0
+
+        for idx, race_id in enumerate(race_ids):
+            group = race_groups.get_group(race_id)
+            rows = group.to_dict(orient="records")
+
+            X = group[ML_FEATURE_COLUMNS].fillna(0.0)
+            probs = model.predict(X.values)
+
+            features = [
+                build_feature_dict(row, win_prob=float(prob))
+                for row, prob in zip(rows, probs)
+            ]
+            pace_balance = build_pace_balance(rows)
+
+            plan = run_value_ai_pipeline(features, pace_balance, bankroll=bankroll)
+            y_total += 1
+
+            result = simulate_payout(plan, features)
+            if result is None:
+                continue
+
+            y_recommended += 1
+            hit = result["hit"]
+            payout = result["payout"]
+            invest = result["invest"]
+
+            if hit:
+                y_hits += 1
+            y_invest += invest
+            y_payout += payout
+
+            bet_type = plan.get("bet_type", "-")
+            by_bet_type[bet_type]["races"] += 1
+            by_bet_type[bet_type]["hits"] += int(hit)
+            by_bet_type[bet_type]["invest"] += invest
+            by_bet_type[bet_type]["payout"] += payout
+
+            records.append({
+                "race_id":  race_id,
+                "year":     test_year,
+                "bet_type": bet_type,
+                "horses":   ",".join(plan.get("horses", [])),
+                "hit":      hit,
+                "invest":   invest,
+                "payout":   round(payout, 0),
+            })
+
+            if (idx + 1) % 200 == 0:
+                roi_so_far = y_payout / y_invest if y_invest > 0 else 0.0
+                print(
+                    f"  [{test_year}] {idx+1}/{len(race_ids)} "
+                    f"推奨率:{y_recommended/(idx+1)*100:.0f}% "
+                    f"ROI:{roi_so_far*100:.1f}%",
+                    flush=True,
+                )
+
+        y_roi = y_payout / y_invest if y_invest > 0 else 0.0
+        by_year[test_year] = {
+            "total_races": y_total,
+            "recommended": y_recommended,
+            "hits":        y_hits,
+            "invest":      y_invest,
+            "payout":      y_payout,
+            "roi":         y_roi,
+        }
+        print(
+            f"[{test_year}] 完了 推奨:{y_recommended}/{y_total} "
+            f"的中:{y_hits} ROI:{y_roi*100:.1f}%\n"
+        )
+
+    total_invest = sum(v["invest"] for v in by_year.values())
+    total_payout = sum(v["payout"] for v in by_year.values())
+    total_hits   = sum(v["hits"]   for v in by_year.values())
+    total_rec    = sum(v["recommended"] for v in by_year.values())
+    total_races  = sum(v["total_races"] for v in by_year.values())
+
+    return {
+        "total_races":  total_races,
+        "recommended":  total_rec,
+        "hits":         total_hits,
+        "total_invest": total_invest,
+        "total_payout": total_payout,
+        "roi":          total_payout / total_invest if total_invest > 0 else 0.0,
+        "by_year":      by_year,
+        "by_bet_type":  dict(by_bet_type),
+        "records":      records,
+    }
+
+
+def print_summary(result: Dict[str, Any]) -> None:
+    """バックテスト結果をコンソールに整形して表示する。"""
+    total_races = result["total_races"]
+    recommended = result["recommended"]
+    hits        = result["hits"]
+    roi         = result["roi"]
+    by_year     = result["by_year"]
+    by_bet_type = result["by_bet_type"]
+
+    hit_rate = hits / recommended if recommended > 0 else 0.0
+    sel_rate = recommended / total_races if total_races > 0 else 0.0
+
+    print("\n" + "=" * 60)
+    print("  フルパイプライン バックテスト結果")
+    print("=" * 60)
+    print(f"\n【全体サマリー】")
+    print(f"  対象レース  : {total_races:,} 件")
+    print(f"  推奨あり    : {recommended:,} 件 ({sel_rate*100:.1f}%)")
+    print(f"  的中        : {hits:,} 件 ({hit_rate*100:.1f}%)")
+    print(f"  総ROI       : {roi*100:.1f}%  (100%=トントン)")
+
+    print(f"\n【年別ROI】")
+    for year, v in sorted(by_year.items()):
+        y_roi = v["roi"] * 100
+        y_sel = v["recommended"] / v["total_races"] * 100 if v["total_races"] > 0 else 0
+        print(
+            f"  {year}: ROI {y_roi:6.1f}%  "
+            f"推奨率 {y_sel:.0f}%  "
+            f"的中 {v['hits']}/{v['recommended']}"
+        )
+
+    print(f"\n【券種別】")
+    for bet_type, v in sorted(by_bet_type.items(), key=lambda x: -x[1]["invest"]):
+        if v["races"] == 0:
+            continue
+        b_hit = v["hits"] / v["races"] * 100
+        b_roi = v["payout"] / v["invest"] * 100 if v["invest"] > 0 else 0.0
+        note  = "  ※近似" if bet_type not in ("単勝", "複勝") else ""
+        print(f"  {bet_type:6s}: 的中率 {b_hit:5.1f}%  ROI {b_roi:6.1f}%  ({v['races']}件){note}")
+
+    print("\n" + "=" * 60)
+
+
+def save_records_csv(
+    result: Dict[str, Any],
+    out_path: str = "backtest_full_pipeline_result.csv",
+) -> None:
+    """レース別詳細を CSV に保存する。"""
+    if not result["records"]:
+        print("出力レコードなし")
+        return
+    df = pd.DataFrame(result["records"])
+    df.to_csv(out_path, index=False, encoding="utf-8")
+    print(f"\n詳細CSV保存: {out_path} ({len(df)} 件)")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="フルパイプライン バックテスト")
+    parser.add_argument("--csv", default=TRAINING_CSV)
+    parser.add_argument("--years", nargs="+", type=int, default=TARGET_YEARS)
+    parser.add_argument("--bankroll", type=int, default=BANKROLL)
+    parser.add_argument("--save-csv", action="store_true")
+    args = parser.parse_args()
+
+    result = run_backtest(csv_path=args.csv, target_years=args.years, bankroll=args.bankroll)
+    print_summary(result)
+    if args.save_csv:
+        save_records_csv(result)
