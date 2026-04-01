@@ -83,3 +83,84 @@ def load_and_group_csv(
         result[year][race_id].append(row.to_dict())
 
     return dict(result)
+
+
+def build_feature_dict(row: Dict[str, Any], win_prob: float) -> Dict[str, Any]:
+    """
+    CSV の 1行 dict を value_ai.py が期待するキー形式に変換する。
+
+    - win_odds: exp(feat_win_odds_log) で復元
+    - running_style: enc 値を文字列に変換
+    - jockey_delta / place_odds: 未収録のためデフォルト値
+
+    Raises:
+        なし（不正値はデフォルト値にフォールバック）
+    """
+    val_odds_log = row.get("feat_win_odds_log")
+    raw_odds_log = float(val_odds_log) if val_odds_log is not None else 0.0
+    win_odds = math.exp(raw_odds_log) if raw_odds_log != 0.0 else None
+
+    val_enc = row.get("feat_running_style_enc")
+    enc = int(float(val_enc)) if val_enc is not None else 3
+    running_style = _ENC_TO_STYLE.get(enc, "unknown")
+
+    val_pop = row.get("feat_popularity")
+    pop = int(float(val_pop)) if val_pop is not None else 99
+    place_factor = _PLACE_FACTORS.get(pop, _PLACE_FACTOR_DEFAULT)
+    place_odds = round(win_odds * place_factor / 100, 2) if win_odds else None
+
+    val_last3f = row.get("feat_last3f")
+    last3f = float(val_last3f) if val_last3f is not None else 0.0
+
+    val_gate = row.get("feat_gate")
+    gate = int(float(val_gate)) if val_gate is not None else 0
+
+    val_age = row.get("feat_age")
+    age = int(float(val_age)) if val_age is not None else 0
+
+    val_runners = row.get("feat_n_runners")
+    n_runners = int(float(val_runners)) if val_runners is not None else 0
+
+    val_target_win = row.get("target_win")
+    target_win = int(float(val_target_win)) if val_target_win is not None else 0
+
+    val_target_top3 = row.get("target_top3")
+    target_top3 = int(float(val_target_top3)) if val_target_top3 is not None else 0
+
+    return {
+        "horse_name":       str(row.get("horse_name") or ""),
+        "win_prob":         win_prob,
+        "model_score":      win_prob,
+        "win_odds":         win_odds,
+        "place_odds":       place_odds,
+        "popularity_rank":  pop,
+        "running_style":    running_style,
+        "last3f":           last3f,
+        "gate":             gate,
+        "age":              age,
+        "n_runners":        n_runners,
+        "jockey_delta":     0.0,   # CSV未収録
+        "jockey_reason_codes": [],
+        # 正解ラベル（払戻計算用、value_ai には渡さない）
+        "_target_win":      target_win,
+        "_target_top3":     target_top3,
+        "_win_odds_log":    raw_odds_log,
+    }
+
+
+def build_pace_balance(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    レース内の脚質カウントを返す（classify_race_structure の pace_balance 用）。
+
+    Returns:
+        {"逃げ": n, "先行": n, "差し": n, "追込": n}
+    """
+    pb: Dict[str, int] = {"逃げ": 0, "先行": 0, "差し": 0, "追込": 0}
+    style_map = {0: "逃げ", 1: "先行", 2: "差し", 3: "追込"}
+    for row in rows:
+        val = row.get("feat_running_style_enc")
+        enc = int(float(val)) if val is not None else 3
+        key = style_map.get(enc)
+        if key:
+            pb[key] += 1
+    return pb
