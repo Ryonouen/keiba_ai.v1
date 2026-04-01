@@ -164,3 +164,189 @@ def build_pace_balance(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         if key:
             pb[key] += 1
     return pb
+
+
+def train_lgbm_for_year(df: pd.DataFrame, test_year: int):
+    """
+    test_year より前のデータで LightGBM を訓練して返す。
+
+    Args:
+        df: 全年データ（'year' 列を含む）
+        test_year: テスト対象年（この年より前のみ訓練に使用）
+
+    Returns:
+        訓練済み lightgbm.Booster
+
+    Raises:
+        ValueError: 訓練データが0件の場合
+    """
+    import lightgbm as lgb
+
+    train_df = df[df["year"] < test_year].copy()
+    if len(train_df) == 0:
+        raise ValueError(f"訓練データが0件: test_year={test_year}")
+
+    for col in ML_FEATURE_COLUMNS:
+        if col not in train_df.columns:
+            train_df[col] = 0.0
+
+    X = train_df[ML_FEATURE_COLUMNS].fillna(0.0)
+    y = train_df["target_win"].fillna(0).astype(int)
+
+    params = {
+        "objective":        "binary",
+        "metric":           "binary_logloss",
+        "verbosity":        -1,
+        "learning_rate":    0.03,
+        "num_leaves":       31,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq":     5,
+        "seed":             42,
+    }
+    dataset = lgb.Dataset(X, label=y)
+    model = lgb.train(params, dataset, num_boost_round=200)
+    return model
+
+
+def run_value_ai_pipeline(
+    features: List[Dict[str, Any]],
+    pace_balance: Dict[str, int],
+    bankroll: int = BANKROLL,
+) -> Dict[str, Any]:
+    """
+    value_ai.py フルパイプラインを実行して推奨買い目を返す。
+
+    Args:
+        features: build_feature_dict で作成した馬リスト
+        pace_balance: build_pace_balance で作成した脚質カウント
+        bankroll: 仮想軍資金（円）
+
+    Returns:
+        recommend_bet_plan の戻り値 dict。skip=True なら見送り。
+    """
+    from value_ai import (
+        build_ev_table,
+        classify_race_structure,
+        recommend_bet_plan,
+    )
+
+    EMPTY: Dict[str, Any] = {
+        "bet_type": "-", "horses": [], "tickets": [],
+        "total_stake": 0, "ticket_count": 0,
+        "reason": "", "risk_level": "-", "ev_type": "-",
+        "skip": True, "skip_reason": "データ不足",
+    }
+
+    if not features:
+        return EMPTY
+
+    ev_table = build_ev_table(features)
+    if not ev_table:
+        return EMPTY
+
+    race_structure = classify_race_structure(features, pace_balance)
+    plan = recommend_bet_plan(
+        features=features,
+        ev_table=ev_table,
+        race_structure=race_structure,
+        bankroll=bankroll,
+        race_pace="medium",
+    )
+    return plan
+
+
+def simulate_payout(
+    plan: Dict[str, Any],
+    features: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    推奨買い目と実際の結果から払戻を計算する。
+
+    Args:
+        plan: run_value_ai_pipeline の戻り値
+        features: build_feature_dict で作成した馬リスト
+
+    Returns:
+        {"hit": bool, "payout": float, "invest": int} または
+        None（見送りの場合）
+
+    Note:
+        馬連・ワイド・3連複の払戻は理論近似値（実際の JRA 払戻とは乖離する場合あり）
+    """
+    if plan.get("skip"):
+        return None
+
+    bet_type = plan.get("bet_type", "-")
+    horses = plan.get("horses", [])
+    invest = int(plan.get("total_stake") or STAKE_UNIT)
+
+    fmap = {f["horse_name"]: f for f in features}
+
+    # ── 単勝 ──
+    if bet_type == "単勝" and len(horses) >= 1:
+        h = fmap.get(horses[0])
+        if h is None:
+            return {"hit": False, "payout": 0, "invest": invest}
+        if h["_target_win"] == 1:
+            payout = math.exp(h["_win_odds_log"]) * invest
+            return {"hit": True, "payout": payout, "invest": invest}
+        return {"hit": False, "payout": 0, "invest": invest}
+
+    # ── 複勝 ──
+    if bet_type == "複勝" and len(horses) >= 1:
+        h = fmap.get(horses[0])
+        if h is None:
+            return {"hit": False, "payout": 0, "invest": invest}
+        if h["_target_top3"] == 1:
+            pop = h.get("popularity_rank", 99)
+            factor = _PLACE_FACTORS.get(pop, _PLACE_FACTOR_DEFAULT)
+            win_odds = math.exp(h["_win_odds_log"])
+            payout = win_odds * factor * invest / 100
+            return {"hit": True, "payout": payout, "invest": invest}
+        return {"hit": False, "payout": 0, "invest": invest}
+
+    # ── 馬連 ──
+    if bet_type == "馬連" and len(horses) >= 2:
+        ha, hb = fmap.get(horses[0]), fmap.get(horses[1])
+        if ha is None or hb is None:
+            return {"hit": False, "payout": 0, "invest": invest}
+        top2_names = {
+            f["horse_name"]
+            for f in sorted(
+                [x for x in features if x["_target_top3"] == 1],
+                key=lambda x: x.get("popularity_rank", 99),
+            )[:2]
+        }
+        if horses[0] in top2_names and horses[1] in top2_names:
+            oa = math.exp(ha["_win_odds_log"])
+            ob = math.exp(hb["_win_odds_log"])
+            payout = oa * ob * 0.75 * invest / 10
+            return {"hit": True, "payout": payout, "invest": invest}
+        return {"hit": False, "payout": 0, "invest": invest}
+
+    # ── ワイド ──
+    if bet_type == "ワイド" and len(horses) >= 2:
+        ha, hb = fmap.get(horses[0]), fmap.get(horses[1])
+        if ha is None or hb is None:
+            return {"hit": False, "payout": 0, "invest": invest}
+        if ha["_target_top3"] == 1 and hb["_target_top3"] == 1:
+            oa = math.exp(ha["_win_odds_log"])
+            ob = math.exp(hb["_win_odds_log"])
+            payout = oa * ob * 0.25 * invest / 10
+            return {"hit": True, "payout": payout, "invest": invest}
+        return {"hit": False, "payout": 0, "invest": invest}
+
+    # ── 3連複 ──
+    if bet_type in ("3連複", "三連複") and len(horses) >= 3:
+        hs = [fmap.get(h) for h in horses[:3]]
+        if any(h is None for h in hs):
+            return {"hit": False, "payout": 0, "invest": invest}
+        if all(h["_target_top3"] == 1 for h in hs):
+            odds_product = math.prod(math.exp(h["_win_odds_log"]) for h in hs)
+            payout = odds_product * 0.70 * invest / 10
+            return {"hit": True, "payout": payout, "invest": invest}
+        return {"hit": False, "payout": 0, "invest": invest}
+
+    # ── 対応外 ──
+    return {"hit": False, "payout": 0, "invest": invest}
