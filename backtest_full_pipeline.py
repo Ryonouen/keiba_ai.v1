@@ -51,13 +51,21 @@ def load_and_group_csv(
 
     Returns:
         {year(int): {race_id(str): [row(dict), ...]}}
+
+    Raises:
+        FileNotFoundError: csv_path が存在しない場合（pandas から伝播）
     """
     if years is None:
         years = TARGET_YEARS
 
     df = pd.read_csv(csv_path, low_memory=False)
     df["year"] = pd.to_datetime(df["race_date"], errors="coerce").dt.year
+    na_count = df["year"].isna().sum()
+    if na_count > 0:
+        print(f"[警告] race_date パース失敗: {na_count}/{len(df)} 行を除外します")
     df = df[df["year"].isin(years)].copy()
+    if len(df) == 0:
+        print(f"[警告] 指定年 {years} に該当するデータが0件です。CSVパスとyears引数を確認してください。")
 
     # ML特徴量の欠損を 0 で埋める
     for col in ML_FEATURE_COLUMNS:
