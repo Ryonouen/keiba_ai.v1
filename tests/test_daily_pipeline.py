@@ -93,8 +93,8 @@ def test_generate_all_bets_returns_all_types():
          "confidence_ok": False, "reason": "", "confidence_score": 0.0, "no_pick_reason": ""},
     ]
     bets = daily_pipeline.generate_all_bets("202501050811", plans)
-    assert len(bets) > 0
-    # confidence_ok=True のチケットだけが含まれる
+    # tickets が空でないプランはすべて含まれる（単勝・複勝・ワイド・馬連（流し）の4件）
+    assert len(bets) == 4
     for bet in bets:
         assert "bet_type" in bet
         assert "bet_combination" in bet

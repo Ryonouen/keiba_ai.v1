@@ -159,8 +159,7 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
     }
     """
     from race_ai_engine import analyze_race
-    from value_ai import recommend_betmaster_plans, assign_roles, classify_race_structure
-    from value_ai import build_ev_table, detect_danger_favorites_v2
+    from value_ai import recommend_betmaster_plans, assign_roles
 
     race_ids = get_race_ids_by_date(date_str)
     summary: Dict[str, Any] = {
@@ -184,6 +183,7 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
 
             if not features:
                 summary["skipped"] += 1
+                summary["errors"].append({"race_id": race_id, "error": "features empty"})
                 print(f"    → features 空。スキップ", flush=True)
                 continue
 
