@@ -111,3 +111,80 @@ def test_generate_all_bets_skips_empty_tickets():
     ]
     bets = daily_pipeline.generate_all_bets("202501050811", plans)
     assert bets == []
+
+
+# ── Task 3 tests ──────────────────────────────────────────────
+
+def test_evaluate_bets_tansho_hit(tmp_path, monkeypatch):
+    """単勝が的中した場合に hit=True, payout が正しく計算されること。"""
+    _tmp_store(monkeypatch)
+
+    bets = [
+        {"bet_type": "tansho", "bet_type_label": "単勝",
+         "bet_combination": ["馬A"], "stake_amount": 100,
+         "selection_reason": "", "confidence": 0.8,
+         "expected_value": None, "implied_probability": None},
+    ]
+    pipeline_store.save_bet_suggestions("202501050811", bets)
+
+    race_result = {
+        "finish_order": ["馬A", "馬B", "馬C"],
+        "dividends": {"単勝": 320, "複勝": [130, 180, 220]},
+        "runners": [],
+    }
+    pipeline_store.save_pipeline_race_result("202501050811", race_result)
+
+    outcomes = daily_pipeline.evaluate_single_race("202501050811")
+    assert len(outcomes) == 1
+    assert outcomes[0]["hit"] is True
+    assert outcomes[0]["payout"] == 320
+    assert abs(outcomes[0]["roi"] - 3.2) < 0.01
+
+
+def test_evaluate_bets_tansho_miss(tmp_path, monkeypatch):
+    """単勝が外れた場合に hit=False, payout=0 であること。"""
+    _tmp_store(monkeypatch)
+
+    bets = [
+        {"bet_type": "tansho", "bet_type_label": "単勝",
+         "bet_combination": ["馬B"], "stake_amount": 100,
+         "selection_reason": "", "confidence": 0.6,
+         "expected_value": None, "implied_probability": None},
+    ]
+    pipeline_store.save_bet_suggestions("202501050811", bets)
+
+    race_result = {
+        "finish_order": ["馬A", "馬B", "馬C"],
+        "dividends": {"単勝": 320},
+        "runners": [],
+    }
+    pipeline_store.save_pipeline_race_result("202501050811", race_result)
+
+    outcomes = daily_pipeline.evaluate_single_race("202501050811")
+    assert outcomes[0]["hit"] is False
+    assert outcomes[0]["payout"] == 0
+    assert outcomes[0]["roi"] == 0.0
+
+
+def test_evaluate_bets_wide_hit(tmp_path, monkeypatch):
+    """ワイドが的中した場合に hit=True であること。"""
+    _tmp_store(monkeypatch)
+
+    bets = [
+        {"bet_type": "wide", "bet_type_label": "ワイド",
+         "bet_combination": ["馬A", "馬B"], "stake_amount": 100,
+         "selection_reason": "", "confidence": 0.6,
+         "expected_value": None, "implied_probability": None},
+    ]
+    pipeline_store.save_bet_suggestions("202501050811", bets)
+
+    race_result = {
+        "finish_order": ["馬A", "馬B", "馬C"],
+        "dividends": {"ワイド": [210, 350, 480]},
+        "runners": [],
+    }
+    pipeline_store.save_pipeline_race_result("202501050811", race_result)
+
+    outcomes = daily_pipeline.evaluate_single_race("202501050811")
+    assert outcomes[0]["hit"] is True
+    assert outcomes[0]["payout"] == 210  # 最小払戻（保守的）
