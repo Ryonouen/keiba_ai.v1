@@ -59,3 +59,55 @@ def test_save_and_load_bet_outcomes(tmp_path, monkeypatch):
     pipeline_store.save_bet_outcomes("202501050811", outcomes)
     loaded = pipeline_store.load_bet_outcomes("202501050811")
     assert loaded[0]["roi"] == 2.5
+
+
+# ── Task 2 tests ──────────────────────────────────────────────
+
+import daily_pipeline
+
+
+def test_generate_all_bets_returns_all_types():
+    """recommend_betmaster_plans の出力から全券種が変換されること。"""
+    plans = [
+        {"bet_type": "単勝",         "tickets": [{"combination": ["馬A"], "stake": 100}],
+         "confidence_ok": True, "reason": "テスト", "confidence_score": 0.8,
+         "no_pick_reason": ""},
+        {"bet_type": "複勝",         "tickets": [{"combination": ["馬A"], "stake": 100}],
+         "confidence_ok": True, "reason": "テスト", "confidence_score": 0.7,
+         "no_pick_reason": ""},
+        {"bet_type": "ワイド",       "tickets": [{"combination": ["馬A", "馬B"], "stake": 100}],
+         "confidence_ok": True, "reason": "テスト", "confidence_score": 0.6,
+         "no_pick_reason": ""},
+        {"bet_type": "馬連（流し）",  "tickets": [{"combination": ["馬A", "馬B"], "stake": 100}],
+         "confidence_ok": False, "reason": "テスト", "confidence_score": 0.4,
+         "no_pick_reason": "自信不足"},
+        {"bet_type": "馬単フォーメーション", "tickets": [], "confidence_ok": False,
+         "reason": "", "confidence_score": 0.0, "no_pick_reason": "自信不足"},
+        {"bet_type": "三連複フォーメーション（AI絞り）", "tickets": [],
+         "confidence_ok": False, "reason": "", "confidence_score": 0.0, "no_pick_reason": ""},
+        {"bet_type": "三連複フォーメーション（全頭）", "tickets": [],
+         "confidence_ok": False, "reason": "", "confidence_score": 0.0, "no_pick_reason": ""},
+        {"bet_type": "三連単フォーメーション（AI絞り）", "tickets": [],
+         "confidence_ok": False, "reason": "", "confidence_score": 0.0, "no_pick_reason": ""},
+        {"bet_type": "三連単フォーメーション（全頭）", "tickets": [],
+         "confidence_ok": False, "reason": "", "confidence_score": 0.0, "no_pick_reason": ""},
+    ]
+    bets = daily_pipeline.generate_all_bets("202501050811", plans)
+    assert len(bets) > 0
+    # confidence_ok=True のチケットだけが含まれる
+    for bet in bets:
+        assert "bet_type" in bet
+        assert "bet_combination" in bet
+        assert "stake_amount" in bet
+        assert "confidence" in bet
+        assert bet["stake_amount"] == 100
+
+
+def test_generate_all_bets_skips_empty_tickets():
+    """tickets=[] のプランは出力に含まれないこと。"""
+    plans = [
+        {"bet_type": "単勝", "tickets": [], "confidence_ok": False,
+         "reason": "", "confidence_score": 0.0, "no_pick_reason": "自信不足"},
+    ]
+    bets = daily_pipeline.generate_all_bets("202501050811", plans)
+    assert bets == []
