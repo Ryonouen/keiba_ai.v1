@@ -189,3 +189,56 @@ def test_evaluate_bets_wide_hit(tmp_path, monkeypatch):
     assert outcomes[0]["hit"] is True
     assert outcomes[0]["payout"] == 210  # 最小払戻（保守的）
     assert abs(outcomes[0]["roi"] - 2.1) < 0.01
+
+
+# ── Task 4 tests ──────────────────────────────────────────────
+
+def test_summarize_empty_returns_zeros(tmp_path, monkeypatch):
+    """データなしの場合にゼロ値で返ること。"""
+    _tmp_store(monkeypatch)
+    summary = daily_pipeline.summarize_weekend_performance(["20250405", "20250406"])
+    assert summary["total_races"] == 0
+    assert summary["total_stake"] == 0
+    assert summary["total_payout"] == 0
+    assert summary["by_bet_type"] == {}
+
+
+def test_summarize_accumulates_outcomes(tmp_path, monkeypatch):
+    """複数レースの的中・回収を正しく集計すること。"""
+    _tmp_store(monkeypatch)
+
+    # analysis_date="20250405" で予測を保存（集計フィルタのために必要）
+    pipeline_store.save_prediction(
+        "202501050811",
+        {"race_title": "テスト1", "race_date": "2025-04-05"},
+        [{"horse_name": "馬A", "win_prob": 0.3}],
+        analysis_date="20250405",
+    )
+    pipeline_store.save_prediction(
+        "202501050812",
+        {"race_title": "テスト2", "race_date": "2025-04-05"},
+        [{"horse_name": "馬B", "win_prob": 0.2}],
+        analysis_date="20250405",
+    )
+
+    # Race 1: 単勝的中
+    pipeline_store.save_bet_outcomes("202501050811", [
+        {"bet_type": "tansho", "bet_type_label": "単勝",
+         "bet_combination": ["馬A"], "stake": 100, "hit": True, "payout": 300, "roi": 3.0},
+    ])
+    # Race 2: 単勝外れ
+    pipeline_store.save_bet_outcomes("202501050812", [
+        {"bet_type": "tansho", "bet_type_label": "単勝",
+         "bet_combination": ["馬B"], "stake": 100, "hit": False, "payout": 0, "roi": 0.0},
+    ])
+
+    summary = daily_pipeline.summarize_weekend_performance(["20250405"])
+    assert summary["total_races"] == 2
+    assert summary["total_stake"] == 200
+    assert summary["total_payout"] == 300
+    assert abs(summary["total_roi"] - 1.5) < 0.01
+    bt = summary["by_bet_type"]["tansho"]
+    assert bt["bets"] == 2
+    assert bt["hits"] == 1
+    assert abs(bt["hit_rate"] - 0.5) < 0.01
+    assert abs(bt["roi"] - 1.5) < 0.01

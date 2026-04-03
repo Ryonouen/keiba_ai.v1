@@ -351,3 +351,148 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
             time.sleep(random.uniform(1.5, 3.0))
 
     return summary
+
+
+# =========================================================
+# Phase 4: 週末集計
+# =========================================================
+
+def summarize_weekend_performance(date_list: List[str]) -> Dict[str, Any]:
+    """
+    複数日の bet_outcomes を集計し、券種別の的中率・回収率を返す。
+
+    Parameters
+    ----------
+    date_list : ["20250405", "20250406"] 形式
+
+    Returns
+    -------
+    {
+        "dates":         List[str],
+        "total_races":   int,          # 買い目が存在したレース数
+        "total_bets":    int,          # 総買い目数
+        "total_stake":   int,          # 総投資額（円）
+        "total_payout":  int,          # 総払戻額（円）
+        "total_roi":     float,        # 総回収率（払戻/投資）
+        "by_bet_type":   {             # 券種別
+            "<bet_key>": {
+                "label":    str,
+                "bets":     int,
+                "hits":     int,
+                "stake":    int,
+                "payout":   int,
+                "hit_rate": float,
+                "roi":      float,
+            },
+            ...
+        },
+    }
+    """
+    all_outcomes    = pipeline_store.load_all_bet_outcomes()
+    all_predictions = pipeline_store.load_all_predictions()
+
+    # predictions の analysis_date（YYYYMMDD）を使って対象レースをフィルタする。
+    # race_id のフォーマットは YYYY+venue(2)+round(2)+day(2)+race(2) なので
+    # race_id[:8] は日付ではない点に注意。
+    target_dates = set(date_list)
+    target_race_ids: List[str] = [
+        race_id
+        for race_id, outcomes in all_outcomes.items()
+        if all_predictions.get(race_id, {}).get("analysis_date", "") in target_dates
+        and outcomes  # 空リストは除外
+    ]
+
+    summary: Dict[str, Any] = {
+        "dates":        date_list,
+        "total_races":  len(target_race_ids),
+        "total_bets":   0,
+        "total_stake":  0,
+        "total_payout": 0,
+        "total_roi":    0.0,
+        "by_bet_type":  {},
+    }
+
+    for race_id in target_race_ids:
+        for outcome in all_outcomes.get(race_id, []):
+            bet_key = str(outcome.get("bet_type") or "")
+            label   = str(outcome.get("bet_type_label") or bet_key)
+            stake   = int(outcome.get("stake") or 0)
+            payout  = int(outcome.get("payout") or 0)
+            hit     = bool(outcome.get("hit"))
+
+            summary["total_bets"]   += 1
+            summary["total_stake"]  += stake
+            summary["total_payout"] += payout
+
+            if bet_key not in summary["by_bet_type"]:
+                summary["by_bet_type"][bet_key] = {
+                    "label": label, "bets": 0, "hits": 0,
+                    "stake": 0, "payout": 0, "hit_rate": 0.0, "roi": 0.0,
+                }
+            bt = summary["by_bet_type"][bet_key]
+            bt["bets"]   += 1
+            bt["stake"]  += stake
+            bt["payout"] += payout
+            if hit:
+                bt["hits"] += 1
+
+    # 比率の計算
+    if summary["total_stake"] > 0:
+        summary["total_roi"] = round(summary["total_payout"] / summary["total_stake"], 4)
+
+    for bt in summary["by_bet_type"].values():
+        if bt["bets"] > 0:
+            bt["hit_rate"] = round(bt["hits"] / bt["bets"], 4)
+        if bt["stake"] > 0:
+            bt["roi"] = round(bt["payout"] / bt["stake"], 4)
+
+    return summary
+
+
+def print_summary(summary: Dict[str, Any]) -> None:
+    """券種別集計をターミナルに出力する。"""
+    print(f"\n{'='*60}", flush=True)
+    print(f"  週末集計レポート: {', '.join(summary['dates'])}", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"  総レース数  : {summary['total_races']}", flush=True)
+    print(f"  総買い目数  : {summary['total_bets']}", flush=True)
+    print(f"  総投資額    : ¥{summary['total_stake']:,}", flush=True)
+    print(f"  総払戻額    : ¥{summary['total_payout']:,}", flush=True)
+    print(f"  総回収率    : {summary['total_roi']:.1%}", flush=True)
+    print(f"\n  [券種別]", flush=True)
+    print(f"  {'券種':<30} {'点数':>5} {'的中':>5} {'的中率':>7} {'回収率':>7}", flush=True)
+    print(f"  {'-'*56}", flush=True)
+    for bt in sorted(summary["by_bet_type"].values(), key=lambda x: -x["roi"]):
+        print(
+            f"  {bt['label']:<30} {bt['bets']:>5} {bt['hits']:>5}"
+            f" {bt['hit_rate']:>7.1%} {bt['roi']:>7.1%}",
+            flush=True,
+        )
+    print(f"{'='*60}\n", flush=True)
+
+
+# =========================================================
+# CLI エントリポイント
+# =========================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="週末全レース自動分析パイプライン")
+    parser.add_argument("--analyze",   metavar="DATE", help="全レース分析（例: 20250406）")
+    parser.add_argument("--evaluate",  metavar="DATE", help="結果照合（例: 20250406）")
+    parser.add_argument("--summarize", metavar="DATES",
+                        help="週末集計（カンマ区切り例: 20250405,20250406）")
+    args = parser.parse_args()
+
+    if args.analyze:
+        run_daily_race_analysis(args.analyze)
+
+    elif args.evaluate:
+        evaluate_prediction_for_day(args.evaluate)
+
+    elif args.summarize:
+        dates   = [d.strip() for d in args.summarize.split(",")]
+        summary = summarize_weekend_performance(dates)
+        print_summary(summary)
+
+    else:
+        parser.print_help()
