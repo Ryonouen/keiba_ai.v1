@@ -220,8 +220,6 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
 
 def _lookup_payout(
     bet_key: str,
-    combination: List[str],
-    finish_order: List[str],
     dividends: Dict[str, Any],
 ) -> int:
     """
@@ -276,7 +274,7 @@ def evaluate_single_race(race_id: str) -> List[Dict[str, Any]]:
         # combination を result_store.check_bet_hit の ticket 形式に変換
         ticket = {"combination": combo}
         hit    = check_bet_hit(hit_type, [ticket], finish_order)
-        payout = _lookup_payout(bet_key, combo, finish_order, dividends) if hit else 0
+        payout = _lookup_payout(bet_key, dividends) if hit else 0
         roi    = round(payout / stake, 4) if stake > 0 else 0.0
 
         outcomes.append({
@@ -346,7 +344,6 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
             print(f"    → 完了（{len(outcomes)} 買い目 / {hit_count} 的中）", flush=True)
 
         except Exception as e:
-            summary["skipped"] += 1
             summary["errors"].append({"race_id": race_id, "error": str(e)})
             print(f"    → エラー: {e}", flush=True)
 

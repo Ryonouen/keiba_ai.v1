@@ -188,3 +188,4 @@ def test_evaluate_bets_wide_hit(tmp_path, monkeypatch):
     outcomes = daily_pipeline.evaluate_single_race("202501050811")
     assert outcomes[0]["hit"] is True
     assert outcomes[0]["payout"] == 210  # 最小払戻（保守的）
+    assert abs(outcomes[0]["roi"] - 2.1) < 0.01
