@@ -41,7 +41,8 @@ def load_race_results() -> List[Dict[str, Any]]:
 
 
 def _save_all(records: List[Dict[str, Any]]) -> None:
-    """全レコードをアトミックに書き込む。"""
+    """全レコードをアトミックに書き込む（開催日順でソート）。"""
+    records = sorted(records, key=lambda x: (x.get("race_date") or "", x.get("saved_at") or ""))
     dir_ = os.path.dirname(RESULTS_FILE) or "."
     fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix=".json.tmp")
     try:
@@ -163,7 +164,7 @@ def build_race_record(
 
     race_id   = _extract_race_id(race_url)
     race_name = race_meta.get("race_title", "不明")
-    race_date = datetime.now().strftime("%Y-%m-%d")
+    race_date = race_meta.get("race_date", "") or datetime.now().strftime("%Y-%m-%d")
 
     # インデックス構築
     marks_by_name  = {r["horse_name"]: r["mark"]  for r in horse_marks}
@@ -303,8 +304,12 @@ def check_bet_hit(
     top2 = set(finish_order[:2])
     top3 = set(finish_order[:3])
 
+    top2_ordered = finish_order[:2]
+    top3_ordered = finish_order[:3]
+
     for ticket in tickets:
-        combo = set(ticket.get("combination", []))
+        combo_list = ticket.get("combination", [])
+        combo = set(combo_list)
         if not combo:
             continue
         if bet_type == "単勝" and top1 in combo:
@@ -316,5 +321,9 @@ def check_bet_hit(
         if bet_type in ("ワイド", "ワイドBOX") and len(combo & top3) >= 2:
             return True
         if bet_type in ("3連複", "3連複BOX") and combo <= top3:
+            return True
+        if bet_type == "馬単" and len(combo_list) >= 2 and list(combo_list[:2]) == top2_ordered:
+            return True
+        if bet_type == "3連単" and len(combo_list) >= 3 and list(combo_list[:3]) == top3_ordered:
             return True
     return False
