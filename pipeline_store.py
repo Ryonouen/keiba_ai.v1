@@ -101,6 +101,81 @@ def load_all_predictions() -> Dict[str, Any]:
     return _load(PREDICTIONS_FILE)
 
 
+def load_race_start_times(date_str: str) -> Dict[str, str]:
+    """
+    指定 analysis_date の全レースの {race_id: start_datetime} を返す。
+    start_datetime が空のエントリは除外する。
+    """
+    data = _load(PREDICTIONS_FILE)
+    result: Dict[str, str] = {}
+    for race_id, pred in data.items():
+        if pred.get("analysis_date") != date_str:
+            continue
+        sdt = pred.get("start_datetime", "")
+        if sdt:
+            result[race_id] = sdt
+    return result
+
+
+def update_prediction_odds_in_store(
+    race_id: str,
+    new_odds_by_name: Dict[str, float],     # {horse_name: win_odds}
+    updated_horses: List[Dict[str, Any]],   # 更新済み horses リスト
+    odds_status: str,
+    odds_source: str,
+    coverage_ratio: float,
+) -> None:
+    """
+    オッズ更新後の予測データを store に書き戻す。
+    prediction_version を +1 し、prediction_history・odds_after・odds_update_history を更新する。
+    odds_status が "not_open" / "failed" 系の場合は呼ばない（呼び出し元が制御）。
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = _load(PREDICTIONS_FILE)
+    pred = data.get(race_id)
+    if pred is None:
+        return
+
+    old_version = pred.get("prediction_version", 1)
+    new_version = old_version + 1
+
+    # odds_after を horse_number ベースで構築
+    horse_number_map = pred.get("horse_number_map", {})
+    name_to_no = {v: k for k, v in horse_number_map.items()}  # 逆引き
+    tansho_after = {
+        name_to_no.get(name, name): odds
+        for name, odds in new_odds_by_name.items()
+    }
+    # 未取得馬は null
+    for no in horse_number_map:
+        tansho_after.setdefault(no, None)
+
+    pred["prediction_version"] = new_version
+    pred["horses"] = updated_horses
+    pred["prediction_history"].append({
+        "version":    new_version,
+        "created_at": now_str,
+        "source":     f"odds_update_{odds_source}",
+        "horses":     [{"horse_name": h["horse_name"], "ai_win_prob": h["ai_win_prob"]}
+                       for h in updated_horses],
+    })
+    pred["odds_after"] = {
+        "status":         odds_status,
+        "source":         odds_source,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "tansho":         tansho_after,
+        "fukusho":        {no: None for no in horse_number_map},  # 今回は単勝のみ
+    }
+    pred["odds_update_history"].append({
+        "at":                       now_str,
+        "source":                   odds_source,
+        "coverage_ratio":           round(coverage_ratio, 4),
+        "prediction_version_after": new_version,
+    })
+    data[race_id] = pred
+    _save(PREDICTIONS_FILE, data)
+
+
 def _extract_start_time(race_info_text: str) -> str:
     """
     "15:45発走 / 芝..." または "15時45分発走 ..." から "HH:MM" を抽出。

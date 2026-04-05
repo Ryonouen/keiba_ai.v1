@@ -109,3 +109,55 @@ def test_odds_status_roundtrip(monkeypatch):
     pred = pipeline_store.load_prediction("202609020411")
     assert pred["odds_before"]["status"] == "not_open"
     assert pred["odds_after"]["status"] == "not_open"
+
+
+def test_load_race_start_times(monkeypatch):
+    """`load_race_start_times("20260405")` が analysis_date でフィルタして返す"""
+    _tmp(monkeypatch)
+    pipeline_store.save_prediction_v2(
+        race_id="202609020411",
+        race_meta={"race_title": "大阪杯", "race_info_text": "15:45発走", "race_date": "2026-04-05"},
+        features=_make_features(), ev_table=[], race_structure={}, danger_v2=[],
+        analysis_date="20260405",
+    )
+    pipeline_store.save_prediction_v2(
+        race_id="202609020412",
+        race_meta={"race_title": "阪神12R", "race_info_text": "16:25発走", "race_date": "2026-04-05"},
+        features=_make_features(), ev_table=[], race_structure={}, danger_v2=[],
+        analysis_date="20260405",
+    )
+    times = pipeline_store.load_race_start_times("20260405")
+    assert "202609020411" in times
+    assert times["202609020411"] == "2026-04-05T15:45:00"
+    assert "202609020412" in times
+    assert times["202609020412"] == "2026-04-05T16:25:00"
+
+
+def test_update_prediction_odds_in_store(monkeypatch):
+    """オッズ更新後に prediction_version が 2、odds_after が保存される"""
+    _tmp(monkeypatch)
+    pipeline_store.save_prediction_v2(
+        race_id="202609020411",
+        race_meta={"race_title": "大阪杯", "race_info_text": "15:45発走", "race_date": "2026-04-05"},
+        features=_make_features(), ev_table=[], race_structure={}, danger_v2=[],
+        analysis_date="20260405",
+    )
+    new_odds = {"ショウヘイ": 5.6}
+    updated_horses = [
+        {"horse_name": "ショウヘイ", "ai_win_prob": 0.142,
+         "win_odds": 5.6, "feature_dict": {"feat_win_odds_log": 1.7228}}
+    ]
+    pipeline_store.update_prediction_odds_in_store(
+        race_id="202609020411",
+        new_odds_by_name=new_odds,
+        updated_horses=updated_horses,
+        odds_status="success",
+        odds_source="api",
+        coverage_ratio=0.93,
+    )
+    pred = pipeline_store.load_prediction("202609020411")
+    assert pred["prediction_version"] == 2
+    assert len(pred["prediction_history"]) == 2
+    assert pred["prediction_history"][1]["source"] == "odds_update_api"
+    assert pred["odds_after"]["status"] == "success"
+    assert pred["odds_after"]["tansho"]["1"] == 5.6   # horse_no "1" に変換
