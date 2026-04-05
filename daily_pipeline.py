@@ -620,6 +620,7 @@ def _recalc_downstream(features: List[Dict[str, Any]], new_probs: List[float]) -
         f["fair_win_odds"]     = fair_odds(p)
         f["fair_place_odds"]   = fair_odds(f["place_prob"])
         f["win_ev"]            = calc_expected_value(p, f.get("win_odds"))
+        # place_odds is from the morning analysis snapshot and may be None (market not yet open)
         f["place_ev"]          = calc_expected_value(f["place_prob"], f.get("place_odds"))
         f["win_market_edge"]   = calc_market_edge(p, f.get("win_odds"))
         f["place_market_edge"] = calc_market_edge(f["place_prob"], f.get("place_odds"))
@@ -766,6 +767,9 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
         new_odds_by_name=new_odds or {},
         updated_horses=updated_horses,
         odds_status=status,
+        # NOTE: odds_source is "api" for both requests-based and Selenium-partial paths,
+        # since fetch_win_odds merges both into the same status string ("success"/"partial").
+        # Only explicit selenium_failed carries "selenium" in the status.
         odds_source="api" if "selenium" not in status else "selenium",
         coverage_ratio=coverage,
     )
