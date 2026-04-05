@@ -210,7 +210,7 @@ def _fetch_win_odds_by_requests(
             continue
 
         logger.info("[odds_fetcher] %s | attempt %d/%d | HTTP %d",
-                    race_id, attempt, len(BACKOFF_DELAYS) + 1, resp.status_code)
+                    race_id, attempt, len(BACKOFF_DELAYS), resp.status_code)
 
         if resp.status_code in _BLOCK_STATUS_CODES:
             logger.warning("[odds_fetcher] %s | ブロック検知 HTTP %d → api_failed",
@@ -218,7 +218,8 @@ def _fetch_win_odds_by_requests(
             return "api_failed", None
 
         if not resp.ok:
-            time.sleep(delay)
+            if attempt < len(BACKOFF_DELAYS):
+                time.sleep(delay)
             continue
 
         # 200 OK
