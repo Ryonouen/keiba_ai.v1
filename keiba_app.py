@@ -41,7 +41,7 @@ def _render_bet_type_table(races: List[Dict]) -> None:
         return
     df = pd.DataFrame(rows)[["label", "count", "hit", "hit_rate", "roi"]]
     df.columns = ["券種", "買い目数", "的中", "的中率(%)", "ROI(%)"]
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
 
 def _render_race_cards(races: List[Dict]) -> None:
@@ -96,7 +96,7 @@ def _render_race_cards(races: List[Dict]) -> None:
                             "脚質":   h["running_style"] or "未取得",
                         }
                     )
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 # ──────────────────────────────────────────────────────────────
