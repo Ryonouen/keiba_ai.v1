@@ -357,3 +357,133 @@ def fetch_win_odds(
         return status2, result2
 
     return "failed", None
+
+
+# ──────────────────────────────────────────────────────
+# 脚質取得
+# ──────────────────────────────────────────────────────
+
+def _parse_newspaper_html(html: str, horse_number_map: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """
+    新聞ページ HTML から {horse_name: running_style} を抽出する。
+    style_char_to_running_style() は race_ai_engine から借用する。
+    取得できなかった馬は含まない（呼び出し元がカバレッジ判定）。
+    """
+    try:
+        from race_ai_engine import style_char_to_running_style
+    except ImportError:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    result: Dict[str, str] = {}
+    all_names = set(horse_number_map.values())
+
+    for row in soup.select("tr"):
+        name_cell = row.select_one(".HorseName, .Horse_Name, td.name")
+        style_cell = row.select_one(".RunningStyle, .Style, td.style")
+        if not name_cell or not style_cell:
+            continue
+        name = name_cell.get_text(strip=True)
+        style_char = style_cell.get_text(strip=True)
+        if name in all_names and style_char:
+            result[name] = style_char_to_running_style(style_char)
+
+    return result if result else None
+
+
+def _fetch_newspaper_styles_by_requests(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    url = NEWSPAPER_URL_TEMPLATE.format(race_id=race_id)
+    try:
+        resp = _request_get(url, timeout=REQUEST_TIMEOUT, headers=_REQUEST_HEADERS)
+    except Exception as e:
+        logger.warning("[odds_fetcher] %s | newspaper requests 失敗: %s", race_id, e)
+        return "api_failed", None
+
+    if not resp.ok:
+        logger.warning("[odds_fetcher] %s | newspaper HTTP %d", race_id, resp.status_code)
+        return "api_failed", None
+
+    result = _parse_newspaper_html(resp.text, horse_number_map)
+    if result is None:
+        logger.warning("[odds_fetcher] %s | newspaper HTML parse 失敗", race_id)
+        return "api_failed", None
+
+    total = len(horse_number_map)
+    ratio = len(result) / total if total > 0 else 0.0
+    status = "success" if ratio >= STYLE_COVERAGE_THRESHOLD else "partial"
+    logger.info("[odds_fetcher] %s | newspaper style coverage=%.0f%%", race_id, ratio * 100)
+    return status, result
+
+
+def _fetch_newspaper_styles_by_selenium(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    try:
+        from race_ai_engine import (
+            build_webdriver, safe_get, warmup_netkeiba_session,
+            fetch_newspaper_records, style_char_to_running_style,
+        )
+    except ImportError as e:
+        logger.error("[odds_fetcher] Selenium import 失敗: %s", e)
+        return "selenium_failed", None
+
+    url = NEWSPAPER_URL_TEMPLATE.format(race_id=race_id)
+    driver = None
+    try:
+        driver = build_webdriver(headless=True)
+        driver = warmup_netkeiba_session(driver, headless=True)
+        driver = safe_get(driver, url, headless=True, retries=1)
+        records = fetch_newspaper_records(driver)
+
+        result: Dict[str, str] = {}
+        all_names = set(horse_number_map.values())
+        for name, entry in records.items():
+            if name not in all_names:
+                continue
+            style_char = str(entry.get("style_char", "")) if isinstance(entry, dict) else ""
+            result[name] = style_char_to_running_style(style_char) if style_char else "unknown"
+
+        if not result:
+            return "selenium_failed", None
+
+        total = len(horse_number_map)
+        ratio = len(result) / total if total > 0 else 0.0
+        status = "success" if ratio >= STYLE_COVERAGE_THRESHOLD else "partial"
+        return status, result
+
+    except Exception as e:
+        logger.error("[odds_fetcher] %s | newspaper Selenium 失敗: %s", race_id, e)
+        return "selenium_failed", None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def fetch_newspaper_styles(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    """
+    新聞ページから脚質を取得。requests → Selenium fallback。
+
+    Returns
+    -------
+    (status, {horse_name: running_style_str} | None)
+    status: "success" | "partial" | "api_failed" | "selenium_failed" | "failed"
+    """
+    status, result = _fetch_newspaper_styles_by_requests(race_id, horse_number_map)
+    if status in ("success", "partial"):
+        return status, result
+
+    status2, result2 = _fetch_newspaper_styles_by_selenium(race_id, horse_number_map)
+    if status2 in ("success", "partial"):
+        return status2, result2
+
+    return "failed", None

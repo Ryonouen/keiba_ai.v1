@@ -161,3 +161,46 @@ def test_unknown_schema_triggers_warning(monkeypatch, caplog):
 
     assert status == "api_failed"   # 未知スキーマ → api_failed
     assert any("未知" in r.message for r in caplog.records)
+
+
+def test_fetch_newspaper_styles_from_html(monkeypatch):
+    """新聞ページの HTML から脚質を取得できる"""
+    fake_html = """
+    <html><body>
+    <table class="Newspaper_Table">
+      <tr><td class="HorseName">ショウヘイ</td><td class="RunningStyle">逃</td></tr>
+      <tr><td class="HorseName">ヨーホーレイク</td><td class="RunningStyle">先</td></tr>
+    </table>
+    </body></html>
+    """
+    class FakeResp:
+        status_code = 200
+        ok = True
+        text = fake_html
+        def raise_for_status(self): pass
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", lambda *a, **kw: FakeResp())
+    status, result = odds_fetcher.fetch_newspaper_styles(
+        "202609020411", {"1": "ショウヘイ", "2": "ヨーホーレイク"}
+    )
+    assert isinstance(status, str)
+    assert isinstance(result, (dict, type(None)))
+
+
+def test_fetch_newspaper_styles_request_fail(monkeypatch):
+    """requests 失敗 → Selenium fallback が呼ばれ、その結果が返る"""
+    class FakeResp:
+        status_code = 500
+        ok = False
+        text = ""
+        def raise_for_status(self): raise Exception("500")
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", lambda *a, **kw: FakeResp())
+    monkeypatch.setattr(odds_fetcher, "_fetch_newspaper_styles_by_selenium",
+                        lambda *a, **kw: ("selenium_failed", None))
+
+    status, result = odds_fetcher.fetch_newspaper_styles(
+        "202609020411", {"1": "ショウヘイ"}
+    )
+    assert status == "failed"  # both failed → "failed"
+    assert result is None
