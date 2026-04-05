@@ -191,8 +191,15 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
             horse_roles = assign_roles(features, ev_table, race_structure, danger_v2)
 
             # 予測保存（analysis_date を渡す → summarize のフィルタに使用）
-            pipeline_store.save_prediction(race_id, race_meta, features,
-                                           analysis_date=date_str)
+            pipeline_store.save_prediction_v2(
+                race_id=race_id,
+                race_meta=race_meta,
+                features=features,
+                ev_table=ev_table,
+                race_structure=race_structure,
+                danger_v2=danger_v2,
+                analysis_date=date_str,
+            )
 
             # 全券種買い目生成・保存
             plans = recommend_betmaster_plans(features, race_structure, horse_roles)
@@ -472,15 +479,107 @@ def print_summary(summary: Dict[str, Any]) -> None:
 
 
 # =========================================================
+# CSV エクスポート
+# =========================================================
+
+def export_summary_csv(summary: Dict[str, Any], out_path: str = "") -> str:
+    """
+    週末集計をCSVに出力する。
+
+    Parameters
+    ----------
+    summary  : summarize_weekend_performance() の戻り値
+    out_path : 出力パス。省略時は pipeline_summary_YYYYMMDD.csv
+
+    Returns
+    -------
+    出力ファイルパス
+    """
+    import csv
+    import os
+
+    dates_str = "_".join(summary.get("dates") or ["unknown"])
+    if not out_path:
+        out_path = f"pipeline_summary_{dates_str}.csv"
+
+    rows = []
+    for bet_key, bt in sorted(summary["by_bet_type"].items()):
+        rows.append({
+            "date":       dates_str,
+            "bet_type":   bet_key,
+            "label":      bt["label"],
+            "bets":       bt["bets"],
+            "hits":       bt["hits"],
+            "stake":      bt["stake"],
+            "payout":     bt["payout"],
+            "hit_rate":   round(bt["hit_rate"], 4),
+            "roi":        round(bt["roi"], 4),
+        })
+
+    if not rows:
+        print("[export_summary_csv] 集計データなし。出力スキップ。", flush=True)
+        return out_path
+
+    fieldnames = ["date", "bet_type", "label", "bets", "hits",
+                  "stake", "payout", "hit_rate", "roi"]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[export_summary_csv] 保存: {out_path} ({len(rows)}件)", flush=True)
+    return out_path
+
+
+def get_race_meta_by_date(date_str: str) -> List[Dict[str, Any]]:
+    """
+    指定日の全レースID＋メタ情報（開催場・R番号）を返す。
+
+    Parameters
+    ----------
+    date_str : "20250406" 形式
+
+    Returns
+    -------
+    List of {
+        "race_id":   str,
+        "venue":     str,   # 開催場名（例: "阪神"）
+        "race_no":   int,   # レース番号
+        "venue_code": str,  # 場所コード（例: "09"）
+    }
+    """
+    _VENUE_NAME: Dict[str, str] = {
+        "01": "札幌", "02": "函館", "03": "福島", "04": "新潟",
+        "05": "東京", "06": "中山", "07": "中京", "08": "京都",
+        "09": "阪神", "10": "小倉",
+    }
+    race_ids = get_race_ids_by_date(date_str)
+    result = []
+    for rid in race_ids:
+        venue_code = rid[4:6]
+        race_no    = int(rid[10:12]) if rid[10:12].isdigit() else 0
+        result.append({
+            "race_id":    rid,
+            "venue":      _VENUE_NAME.get(venue_code, f"場所{venue_code}"),
+            "race_no":    race_no,
+            "venue_code": venue_code,
+        })
+    return result
+
+
+# =========================================================
 # CLI エントリポイント
 # =========================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="週末全レース自動分析パイプライン")
-    parser.add_argument("--analyze",   metavar="DATE", help="全レース分析（例: 20250406）")
-    parser.add_argument("--evaluate",  metavar="DATE", help="結果照合（例: 20250406）")
-    parser.add_argument("--summarize", metavar="DATES",
+    parser.add_argument("--analyze",    metavar="DATE",  help="全レース分析（例: 20250406）")
+    parser.add_argument("--evaluate",   metavar="DATE",  help="結果照合（例: 20250406）")
+    parser.add_argument("--summarize",  metavar="DATES",
                         help="週末集計（カンマ区切り例: 20250405,20250406）")
+    parser.add_argument("--export-csv", metavar="DATES",
+                        help="週末集計をCSV出力（カンマ区切り例: 20250405,20250406）")
+    parser.add_argument("--list",       metavar="DATE",  help="指定日のレース一覧を表示")
     args = parser.parse_args()
 
     if args.analyze:
@@ -493,6 +592,18 @@ if __name__ == "__main__":
         dates   = [d.strip() for d in args.summarize.split(",")]
         summary = summarize_weekend_performance(dates)
         print_summary(summary)
+
+    elif args.export_csv:
+        dates   = [d.strip() for d in args.export_csv.split(",")]
+        summary = summarize_weekend_performance(dates)
+        print_summary(summary)
+        export_summary_csv(summary)
+
+    elif args.list:
+        races = get_race_meta_by_date(args.list)
+        print(f"{args.list} のレース一覧 ({len(races)}件):")
+        for r in races:
+            print(f"  {r['venue']} {r['race_no']:>2}R  {r['race_id']}")
 
     else:
         parser.print_help()

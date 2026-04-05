@@ -242,3 +242,75 @@ def test_summarize_accumulates_outcomes(tmp_path, monkeypatch):
     assert bt["hits"] == 1
     assert abs(bt["hit_rate"] - 0.5) < 0.01
     assert abs(bt["roi"] - 1.5) < 0.01
+
+
+# ── Task 6 (v2 integration) ──────────────────────────────
+
+def test_run_daily_saves_v2_fields(tmp_path, monkeypatch):
+    """run_daily_race_analysis が start_time / horse_number_map / feature_dict を保存する"""
+    import sys
+    _tmp_store(monkeypatch)
+
+    fake_result = {
+        "race_meta": {
+            "race_title": "テストレース",
+            "race_info_text": "10:00発走 / 芝1200m",
+            "race_date": "2026-04-05",
+        },
+        "features": [
+            {
+                "horse_name": "テスト馬A", "win_prob": 0.25,
+                "win_odds": 4.0, "place_odds": 1.8,
+                "running_style": "front", "records_source": "newspaper",
+                "horse_number": 1,
+                "link": "https://db.netkeiba.com/horse/2022100001/",
+                "feat_gate": 1, "feat_age": 4, "feat_popularity": 1,
+                "feat_win_odds_log": 1.386, "feat_last3f": 33.0,
+                "feat_jockey_weight": 55.0, "feat_n_runners": 8,
+                "feat_running_style_enc": 0, "feat_track_condition_enc": 0,
+                "feat_signal_total_adjust": 0.0,
+                "feat_cond_diff_age": 0.0, "feat_cond_diff_gate": 0.0,
+                "feat_cond_diff_style": 0.0, "feat_cond_diff_popularity": 0.0,
+                "feat_cond_diff_last3f": 0.0, "feat_cond_diff_weight": 0.0,
+                "feat_cond_diff_jockey": 0.0, "feat_cond_diff_track": 0.0,
+                "feat_recent_form": 0.5, "feat_trend_index": 0.6,
+                "feat_consistency_index": 0.7,
+            }
+        ],
+        "race_structure": {"pace": "medium"},
+        "ev_table": [],
+        "danger_favorites_v2": [],
+    }
+
+    def fake_analyze(url, headless=True):
+        return fake_result
+
+    def fake_get_ids(date_str):
+        return ["202609020401"]
+
+    def fake_assign_roles(features, ev_table, race_structure=None, danger_horses=None):
+        return []
+
+    def fake_recommend(features, race_structure, horse_roles=None, race_pace="medium"):
+        return []
+
+    # Monkeypatch sys.modules to fake race_ai_engine and value_ai
+    fake_engine = type(sys)("race_ai_engine_fake")
+    fake_engine.analyze_race = fake_analyze
+    monkeypatch.setitem(sys.modules, "race_ai_engine", fake_engine)
+
+    fake_value = type(sys)("value_ai_fake")
+    fake_value.recommend_betmaster_plans = fake_recommend
+    fake_value.assign_roles = fake_assign_roles
+    monkeypatch.setitem(sys.modules, "value_ai", fake_value)
+
+    monkeypatch.setattr(daily_pipeline, "get_race_ids_by_date", fake_get_ids)
+
+    daily_pipeline.run_daily_race_analysis("20260405")
+
+    pred = pipeline_store.load_prediction("202609020401")
+    assert pred is not None
+    assert pred.get("start_time") == "10:00"
+    assert pred.get("horse_number_map") == {"1": "テスト馬A"}
+    assert pred["horses"][0]["feature_dict"]["feat_gate"] == 1
+    assert pred["prediction_version"] == 1
