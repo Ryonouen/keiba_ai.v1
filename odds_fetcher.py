@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Dict, Optional, Tuple
 
 import requests
@@ -174,3 +175,184 @@ def _eval_coverage(
     if ratio >= ODDS_COVERAGE_THRESHOLD:
         return "success", named
     return "partial", named
+
+
+# ──────────────────────────────────────────────────────
+# requests ベース取得
+# ──────────────────────────────────────────────────────
+
+def _build_session(race_id: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(_REQUEST_HEADERS)
+    s.headers["Referer"] = SHUTUBA_URL_TEMPLATE.format(race_id=race_id)
+    return s
+
+
+def _fetch_win_odds_by_requests(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, float]]]:
+    """
+    requests で単勝オッズを取得し (status, {horse_name: odds} | None) を返す。
+    status: "success" | "partial" | "not_open" | "api_failed"
+    """
+    url = ODDS_API_URL
+    params = {"race_id": race_id, "type": "b1", "action": "all"}
+    session = _build_session(race_id)
+
+    for attempt, delay in enumerate(BACKOFF_DELAYS, 1):
+        try:
+            resp = _request_get(url, params=params, timeout=REQUEST_TIMEOUT,
+                                headers=dict(session.headers))
+        except Exception as e:
+            logger.warning("[odds_fetcher] %s | request exception: %s", race_id, e)
+            time.sleep(delay)
+            continue
+
+        logger.info("[odds_fetcher] %s | attempt %d/%d | HTTP %d",
+                    race_id, attempt, len(BACKOFF_DELAYS) + 1, resp.status_code)
+
+        if resp.status_code in _BLOCK_STATUS_CODES:
+            logger.warning("[odds_fetcher] %s | ブロック検知 HTTP %d → api_failed",
+                           race_id, resp.status_code)
+            return "api_failed", None
+
+        if not resp.ok:
+            time.sleep(delay)
+            continue
+
+        # 200 OK
+        try:
+            data = resp.json()
+        except Exception:
+            logger.warning("[odds_fetcher] %s | JSON parse 失敗 → api_failed", race_id)
+            return "api_failed", None
+
+        parsed = _parse_odds_response(data)
+        if parsed is None:
+            logger.warning(
+                "[odds_fetcher] %s | 未知のレスポンス構造 → api_failed", race_id
+            )
+            return "api_failed", None
+
+        # Rebuild as path-1 format for _eval_coverage
+        fake_data = {"data": {"Odds": {k: str(v) for k, v in parsed.items()}}}
+        status, named = _eval_coverage(fake_data, horse_number_map)
+        logger.info("[odds_fetcher] %s | %s | coverage (from requests)", race_id, status)
+        return status, named
+
+    logger.warning("[odds_fetcher] %s | 全リトライ失敗 → api_failed", race_id)
+    return "api_failed", None
+
+
+# ──────────────────────────────────────────────────────
+# Selenium フォールバック
+# ──────────────────────────────────────────────────────
+
+def _fetch_win_odds_by_selenium(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, float]]]:
+    """
+    Selenium で shutuba ページから単勝オッズを取得する（軽量版）。
+    新聞・馬個別ページは開かない。ブラウザは即クローズ。
+    status: "success" | "partial" | "not_open" | "selenium_failed"
+    """
+    try:
+        from race_ai_engine import build_webdriver, safe_get, warmup_netkeiba_session
+        from selenium.webdriver.common.by import By
+        import time as _time
+    except ImportError as e:
+        logger.error("[odds_fetcher] Selenium import 失敗: %s", e)
+        return "selenium_failed", None
+
+    url = SHUTUBA_URL_TEMPLATE.format(race_id=race_id)
+    driver = None
+    try:
+        driver = build_webdriver(headless=True)
+        driver = warmup_netkeiba_session(driver, headless=True)
+        driver = safe_get(driver, url, headless=True, retries=1)
+
+        # オッズが描画されるまで待機（最大 SELENIUM_WAIT_MAX 秒）
+        odds_raw: Dict[str, float] = {}
+        for _ in range(SELENIUM_WAIT_MAX):
+            rows = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
+            for row in rows:
+                try:
+                    no_text = row.find_element(By.CSS_SELECTOR, ".Umaban").text.strip()
+                    odds_text = row.find_element(By.CSS_SELECTOR, ".Odds").text.strip()
+                    if odds_text in ("–", "-", "", "---"):
+                        continue
+                    no = _normalize_horse_no(no_text)
+                    odds_raw[no] = float(odds_text)
+                except Exception:
+                    continue
+            if odds_raw:
+                break
+            _time.sleep(1)
+
+        if not odds_raw:
+            return "not_open", None
+
+        named: Dict[str, float] = {
+            horse_number_map[no]: v
+            for no, v in odds_raw.items()
+            if no in horse_number_map
+        }
+        total = len(horse_number_map)
+        ratio = len(named) / total if total > 0 else 0.0
+        logger.info("[odds_fetcher] %s | selenium | coverage=%.0f%% (%d/%d頭)",
+                    race_id, ratio * 100, len(named), total)
+
+        if len(named) == 0:
+            return "not_open", None
+        status = "success" if ratio >= ODDS_COVERAGE_THRESHOLD else "partial"
+        return status, named
+
+    except Exception as e:
+        logger.error("[odds_fetcher] %s | Selenium 失敗: %s", race_id, e)
+        return "selenium_failed", None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+# ──────────────────────────────────────────────────────
+# 公開 API
+# ──────────────────────────────────────────────────────
+
+def fetch_win_odds(
+    race_id: str,
+    horse_number_map: Dict[str, str],
+) -> Tuple[str, Optional[Dict[str, float]]]:
+    """
+    単勝オッズを取得。requests → Selenium fallback。
+
+    Parameters
+    ----------
+    race_id          : 12桁 race_id
+    horse_number_map : {"1": "ショウヘイ", ...}
+
+    Returns
+    -------
+    (status, {horse_name: win_odds_float} | None)
+    status: "success" | "partial" | "not_open" | "api_failed" | "selenium_failed" | "failed"
+    """
+    status, result = _fetch_win_odds_by_requests(race_id, horse_number_map)
+    logger.info("[odds_fetcher] %s | requests → %s", race_id, status)
+
+    if status in ("success", "partial", "not_open"):
+        return status, result
+
+    # requests 失敗 → Selenium fallback
+    logger.info("[odds_fetcher] %s | Selenium fallback 開始", race_id)
+    status2, result2 = _fetch_win_odds_by_selenium(race_id, horse_number_map)
+    logger.info("[odds_fetcher] %s | selenium → %s", race_id, status2)
+
+    if status2 in ("success", "partial", "not_open"):
+        return status2, result2
+
+    return "failed", None

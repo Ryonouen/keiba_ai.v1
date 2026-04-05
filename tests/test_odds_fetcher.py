@@ -94,3 +94,70 @@ def test_status_not_open_nested_schema():
     status, result = odds_fetcher._eval_coverage(raw, HORSE_MAP)
     assert status == "not_open"
     assert result is None
+
+
+def test_backoff_retry_transient(monkeypatch):
+    """HTTP 503 が 2 回続いてから成功する場合、リトライして取得できる"""
+    call_count = {"n": 0}
+    good_json = {"data": {"Odds": {"1": "5.6", "2": "12.3", "3": "8.0",
+                                   "4": "15.1", "5": "22.5", "6": "7.2",
+                                   "7": "18.0", "8": "9.9"}}}
+
+    class FakeResp:
+        def __init__(self, code, json_data=None):
+            self.status_code = code
+            self.ok = code == 200
+            self._json = json_data
+        def json(self):
+            return self._json
+
+    def fake_get(url, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return FakeResp(503)
+        return FakeResp(200, good_json)
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", fake_get)
+    monkeypatch.setattr(odds_fetcher, "BACKOFF_DELAYS", [0.0, 0.0, 0.0])  # 3 attempts, zero wait
+    status, result = odds_fetcher._fetch_win_odds_by_requests("202609020411", HORSE_MAP)
+    assert status == "success"
+    assert result is not None
+    assert call_count["n"] == 3
+
+
+def test_block_no_retry(monkeypatch):
+    """HTTP 403 → 即 api_failed（リトライしない）"""
+    call_count = {"n": 0}
+
+    class FakeResp:
+        status_code = 403
+        ok = False
+        def json(self): return {}
+
+    def fake_get(url, **kwargs):
+        call_count["n"] += 1
+        return FakeResp()
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", fake_get)
+    status, result = odds_fetcher._fetch_win_odds_by_requests("202609020411", HORSE_MAP)
+    assert status == "api_failed"
+    assert result is None
+    assert call_count["n"] == 1   # リトライなし
+
+
+def test_unknown_schema_triggers_warning(monkeypatch, caplog):
+    """未知スキーマ受信時に warning ログが出る"""
+    import logging
+
+    class FakeResp:
+        status_code = 200
+        ok = True
+        def json(self): return {"totally": "unexpected"}
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", lambda *a, **kw: FakeResp())
+
+    with caplog.at_level(logging.WARNING, logger="odds_fetcher"):
+        status, result = odds_fetcher._fetch_win_odds_by_requests("202609020411", HORSE_MAP)
+
+    assert status == "api_failed"   # 未知スキーマ → api_failed
+    assert any("未知" in r.message for r in caplog.records)
