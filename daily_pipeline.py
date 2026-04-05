@@ -17,12 +17,16 @@ daily_pipeline.py
 from __future__ import annotations
 
 import argparse
+import math as _math
+import logging as _logging
 import random
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pipeline_store
+
+_logger = _logging.getLogger(__name__)
 
 # =========================================================
 # 定数
@@ -565,6 +569,215 @@ def get_race_meta_by_date(date_str: str) -> List[Dict[str, Any]]:
             "venue_code": venue_code,
         })
     return result
+
+
+# =========================================================
+# Phase 2b: オッズ更新・再予測
+# =========================================================
+
+def _run_lgbm_prediction(features: List[Dict[str, Any]]) -> List[float]:
+    """
+    LightGBM で win_prob を再計算し、正規化された確率リストを返す。
+    モデルがない場合はフォールバック（一様分布）を返す。
+    テストで monkeypatch しやすいよう分離。
+    """
+    from race_ai_engine import predict_win_probability_with_model, MODEL_FILE
+    probs = predict_win_probability_with_model(features, MODEL_FILE)
+    if probs is not None:
+        return probs
+    n = len(features)
+    return [1.0 / n] * n if n > 0 else []
+
+
+def _recalc_downstream(features: List[Dict[str, Any]], new_probs: List[float]) -> None:
+    """
+    オッズ更新後に win_prob とその downstream フィールドを in-place 更新する。
+
+    更新する: win_prob, place_prob, fair_win_odds, fair_place_odds,
+              win_ev, place_ev, win_market_edge, place_market_edge,
+              odds_distortion_index, value_flag, win_value_label,
+              place_value_label, expected_value_score, bet_suitability
+    更新しない: feat_gate/feat_age 等の発走当日不変フィールド、place_odds
+    """
+    try:
+        from race_ai_engine import (
+            estimate_place_prob, fair_odds, calc_expected_value, calc_market_edge,
+            calc_odds_distortion, calc_expected_value_score, classify_bet_suitability,
+            classify_value_label,
+        )
+    except ImportError:
+        # フォールバック: win_prob のみ更新
+        for f, p in zip(features, new_probs):
+            f["win_prob"] = round(p, 4)
+        return
+
+    for f, p in zip(features, new_probs):
+        f["win_prob"]          = round(p, 4)
+        f["place_prob"]        = estimate_place_prob(p)
+        f["fair_win_odds"]     = fair_odds(p)
+        f["fair_place_odds"]   = fair_odds(f["place_prob"])
+        f["win_ev"]            = calc_expected_value(p, f.get("win_odds"))
+        f["place_ev"]          = calc_expected_value(f["place_prob"], f.get("place_odds"))
+        f["win_market_edge"]   = calc_market_edge(p, f.get("win_odds"))
+        f["place_market_edge"] = calc_market_edge(f["place_prob"], f.get("place_odds"))
+        f["odds_distortion_index"] = calc_odds_distortion(f)
+        odi = f["odds_distortion_index"]
+        f["value_flag"] = (
+            "SUPER_VALUE" if odi >= 1.4 else
+            "VALUE"       if odi >= 1.15 else
+            "NORMAL"
+        )
+        f["win_value_label"]       = classify_value_label(f["win_market_edge"], f["win_ev"])
+        f["place_value_label"]     = classify_value_label(f["place_market_edge"], f["place_ev"])
+        f["expected_value_score"]  = calc_expected_value_score(f)
+        f["bet_suitability"]       = classify_bet_suitability(f)
+
+
+def update_race_odds(race_id: str) -> Dict[str, Any]:
+    """
+    1 レースのオッズを取得し、予測と買い目を更新する。
+
+    Returns
+    -------
+    {
+        "race_id":  str,
+        "status":   str,   # fetch_win_odds のステータス
+        "coverage": float,
+        "version_before": int,
+        "version_after":  int,
+    }
+    """
+    import odds_fetcher
+    from value_ai import assign_roles, recommend_betmaster_plans
+
+    pred = pipeline_store.load_prediction(race_id)
+    if pred is None:
+        _logger.error("[update_race_odds] %s | 予測データなし", race_id)
+        return {"race_id": race_id, "status": "failed", "coverage": 0.0,
+                "version_before": 0, "version_after": 0}
+
+    horse_number_map: Dict[str, str] = pred.get("horse_number_map") or {}
+    ev_table         = pred.get("ev_table") or []
+    race_structure   = pred.get("race_structure") or {}
+    danger_v2        = pred.get("danger_v2") or []
+    version_before   = pred.get("prediction_version", 1)
+
+    # オッズ取得
+    status, new_odds = odds_fetcher.fetch_win_odds(race_id, horse_number_map)
+    _logger.info("[update_race_odds] %s | status=%s | v%d",
+                 race_id, status, version_before)
+
+    if status in ("not_open", "api_failed", "selenium_failed", "failed"):
+        _logger.info("[update_race_odds] %s | スキップ（%s）", race_id, status)
+        return {"race_id": race_id, "status": status, "coverage": 0.0,
+                "version_before": version_before, "version_after": version_before}
+
+    # feature_dict を horses から復元
+    features: List[Dict[str, Any]] = [
+        dict(h["feature_dict"]) for h in pred.get("horses", [])
+        if h.get("feature_dict")
+    ]
+    if not features:
+        _logger.error("[update_race_odds] %s | feature_dict なし", race_id)
+        return {"race_id": race_id, "status": "failed", "coverage": 0.0,
+                "version_before": version_before, "version_after": version_before}
+
+    # feat_win_odds_log と win_odds を更新
+    for f in features:
+        name = str(f.get("horse_name") or "")
+        odds = new_odds.get(name) if new_odds else None
+        if odds is not None:
+            f["win_odds"] = odds
+            f["feat_win_odds_log"] = round(_math.log(max(odds, 1.0)), 4)
+
+    # 脚質 missing 馬の再試行
+    missing_styles = [
+        h["horse_name"] for h in pred.get("horses", [])
+        if h.get("running_style_missing")
+    ]
+    if missing_styles:
+        _logger.info("[update_race_odds] %s | 脚質 missing %d頭 → 再取得試行",
+                     race_id, len(missing_styles))
+        st, styles = odds_fetcher.fetch_newspaper_styles(race_id, horse_number_map)
+        if styles:
+            for f in features:
+                name = str(f.get("horse_name") or "")
+                if name in missing_styles and name in styles:
+                    f["running_style"] = styles[name]
+                    from race_ai_engine import _RUNNING_STYLE_ENC
+                    f["feat_running_style_enc"] = _RUNNING_STYLE_ENC.get(
+                        styles[name], 3)
+
+    # LightGBM 再予測
+    new_probs = _run_lgbm_prediction(features)
+    if not new_probs:
+        return {"race_id": race_id, "status": "failed", "coverage": 0.0,
+                "version_before": version_before, "version_after": version_before}
+
+    # downstream 再計算
+    _recalc_downstream(features, new_probs)
+
+    # ログ: top 馬の変化
+    old_top = max(pred.get("horses", []),
+                  key=lambda h: h.get("ai_win_prob", 0),
+                  default=None)
+    new_top = max(features, key=lambda f: f.get("win_prob", 0), default=None)
+    if old_top and new_top:
+        _logger.info(
+            "[update_race_odds] %s | top: %s %.1f%%→%.1f%% @ %.1f倍",
+            race_id,
+            new_top.get("horse_name"),
+            old_top.get("ai_win_prob", 0) * 100,
+            new_top.get("win_prob", 0) * 100,
+            new_top.get("win_odds") or 0,
+        )
+
+    # 役割・買い目 再計算
+    horse_roles = assign_roles(features, ev_table, race_structure, danger_v2)
+    plans = recommend_betmaster_plans(features, race_structure, horse_roles)
+    bets  = generate_all_bets(race_id, plans)
+
+    # 保存用 horses リスト（feature_dict も更新）
+    old_horses_by_name = {h["horse_name"]: h for h in pred.get("horses", [])}
+    updated_horses = []
+    for f in features:
+        name = str(f.get("horse_name") or "")
+        old_h = old_horses_by_name.get(name, {})
+        updated_horses.append({
+            **old_h,
+            "ai_win_prob": round(float(f.get("win_prob", 0)), 4),
+            "win_odds":    f.get("win_odds"),
+            "popularity":  f.get("feat_popularity"),
+            "running_style":         f.get("running_style", "unknown"),
+            "running_style_missing": f.get("running_style", "unknown") == "unknown",
+            "feature_dict": dict(f),
+        })
+
+    total = len(horse_number_map)
+    ok    = len(new_odds) if new_odds else 0
+    coverage = ok / total if total > 0 else 0.0
+
+    # store 更新
+    pipeline_store.update_prediction_odds_in_store(
+        race_id=race_id,
+        new_odds_by_name=new_odds or {},
+        updated_horses=updated_horses,
+        odds_status=status,
+        odds_source="api" if "selenium" not in status else "selenium",
+        coverage_ratio=coverage,
+    )
+    pipeline_store.save_bet_suggestions(race_id, bets)
+
+    _logger.info("[update_race_odds] %s | 完了 | v%d→v%d | coverage=%.0f%%",
+                 race_id, version_before, version_before + 1, coverage * 100)
+
+    return {
+        "race_id":       race_id,
+        "status":        status,
+        "coverage":      coverage,
+        "version_before": version_before,
+        "version_after":  version_before + 1,
+    }
 
 
 # =========================================================
