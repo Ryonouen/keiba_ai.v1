@@ -65,3 +65,23 @@ def test_horse_number_normalization():
     norm = {odds_fetcher._normalize_horse_no(k): v for k, v in result.items()}
     assert norm["1"] == 5.6
     assert norm["2"] == 12.3
+
+
+def test_parse_api_response_win_odds_path():
+    """data["data"]["WinOdds"] パス（パス2）から正常にパースできる"""
+    raw = {"data": {"WinOdds": {"1": "5.6", "2": "12.3", "3": "8.0", "4": "15.1",
+                                "5": "22.5", "6": "7.2", "7": "18.0", "8": "9.9"}}}
+    result = odds_fetcher._parse_odds_response(raw)
+    assert result is not None
+    assert result["1"] == 5.6
+    assert result["8"] == 9.9
+
+
+def test_parse_api_response_nested_win_odds_path():
+    """data["data"]["Odds"]["WinOdds"] パス（パス3）から正常にパースできる"""
+    raw = {"data": {"Odds": {"WinOdds": {"1": "5.6", "2": "12.3", "3": "8.0", "4": "15.1",
+                                         "5": "22.5", "6": "7.2", "7": "18.0", "8": "9.9"}}}}
+    result = odds_fetcher._parse_odds_response(raw)
+    assert result is not None
+    assert result["1"] == 5.6
+    assert result["8"] == 9.9

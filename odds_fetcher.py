@@ -14,9 +14,7 @@ odds_fetcher.py
 from __future__ import annotations
 
 import logging
-import math
 import re
-import time
 from typing import Dict, Optional, Tuple
 
 import requests
@@ -146,7 +144,9 @@ def _eval_coverage(
 
     parsed = _parse_odds_response(data)
     if parsed is None:
-        return "not_open", None
+        # Response received but schema unrecognized — not the same as "not open"
+        logger.warning("[odds_fetcher] 未知レスポンス構造 → status=failed")
+        return "failed", None
 
     # horse_name に変換
     named: Dict[str, float] = {}
