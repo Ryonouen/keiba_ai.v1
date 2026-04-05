@@ -20,8 +20,11 @@ import argparse
 import math as _math
 import logging as _logging
 import random
+import signal as _signal
+import sys as _sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta as _td
+from datetime import datetime as _dt
 from typing import Any, Dict, List, Optional
 
 import pipeline_store
@@ -781,6 +784,144 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
 
 
 # =========================================================
+# Phase 2c: オッズ監視ループ
+# =========================================================
+
+def _get_update_targets(
+    start_times: Dict[str, str],
+    now: Any,
+    updated_ids: set,
+) -> List[str]:
+    """
+    更新ウィンドウ（発走 -35min ≤ now ≤ 発走 -20min）内にあり、
+    まだ updated_ids に入っていないレース ID のリストを返す。
+    """
+    targets = []
+    for race_id, sdt_str in start_times.items():
+        if race_id in updated_ids:
+            continue
+        try:
+            start = _dt.fromisoformat(sdt_str)
+        except ValueError:
+            continue
+        lo = start - _td(minutes=35)
+        hi = start - _td(minutes=20)
+        if lo <= now <= hi:
+            targets.append(race_id)
+    return targets
+
+
+def _should_exit(
+    start_times: Dict[str, str],
+    updated_ids: set,
+    now: Any,
+) -> bool:
+    """
+    停止条件:
+      (A) 全レースが updated_ids に入り、かつ全発走時刻 < now
+      (B) 全レースの start + 90min < now
+    どちらかを満たせば True。
+    """
+    if not start_times:
+        return True
+
+    all_done = all(rid in updated_ids for rid in start_times)
+    all_past = all(
+        _dt.fromisoformat(sdt) < now
+        for sdt in start_times.values()
+        if sdt
+    )
+    if all_done and all_past:
+        return True
+
+    all_expired = all(
+        _dt.fromisoformat(sdt) + _td(minutes=90) < now
+        for sdt in start_times.values()
+        if sdt
+    )
+    return all_expired
+
+
+def watch_odds(date_str: str, poll_interval: int = 60) -> None:
+    """
+    指定日の全レースを監視し、発走 30 分前にオッズを自動更新する。
+
+    フォアグラウンドブロッキング。SIGINT で正常終了。
+
+    Parameters
+    ----------
+    date_str      : "20260405" 形式
+    poll_interval : ポーリング間隔（秒）
+    """
+    start_times = pipeline_store.load_race_start_times(date_str)
+    if not start_times:
+        print(f"[watch_odds] {date_str} に分析済みレースがありません。"
+              " 先に --analyze を実行してください。", flush=True)
+        return
+
+    total = len(start_times)
+    print(f"[watch_odds] {date_str} | 監視対象: {total} レース", flush=True)
+    for rid, sdt in sorted(start_times.items(), key=lambda x: x[1]):
+        print(f"  {rid}  発走: {sdt[11:16]}", flush=True)
+    print(flush=True)
+
+    updated_ids: set = set()
+    failed_ids:  set = set()
+
+    # SIGINT ハンドラ
+    def _on_sigint(*_):
+        print(
+            f"\n[watch_odds] 中断。更新済み {len(updated_ids)}/{total}件"
+            f" | 失敗 {len(failed_ids)}件",
+            flush=True,
+        )
+        _sys.exit(0)
+
+    _signal.signal(_signal.SIGINT, _on_sigint)
+
+    import time as _time
+
+    while True:
+        now = _dt.now()
+
+        if _should_exit(start_times, updated_ids | failed_ids, now):
+            break
+
+        targets = _get_update_targets(start_times, now, updated_ids | failed_ids)
+        for race_id in targets:
+            sdt_str = start_times.get(race_id, "")
+            print(f"[watch_odds] {now.strftime('%H:%M')} | {race_id}"
+                  f" (発走 {sdt_str[11:16]}) | オッズ更新中...", flush=True)
+
+            result = update_race_odds(race_id)
+            status = result.get("status", "failed")
+
+            print(
+                f"[watch_odds] {now.strftime('%H:%M')} | {race_id}"
+                f" | {status}"
+                f" | coverage={result.get('coverage', 0):.0%}"
+                f" | v{result.get('version_before')}→v{result.get('version_after')}",
+                flush=True,
+            )
+
+            if status in ("success", "partial"):
+                updated_ids.add(race_id)
+            elif status == "not_open":
+                pass   # 次サイクルで再試行
+            else:
+                failed_ids.add(race_id)
+
+        _time.sleep(poll_interval)
+
+    print(
+        f"[watch_odds] {date_str} | 完了"
+        f" | 更新済み {len(updated_ids)}/{total}件"
+        f" | 失敗 {len(failed_ids)}件",
+        flush=True,
+    )
+
+
+# =========================================================
 # CLI エントリポイント
 # =========================================================
 
@@ -793,6 +934,10 @@ if __name__ == "__main__":
     parser.add_argument("--export-csv", metavar="DATES",
                         help="週末集計をCSV出力（カンマ区切り例: 20250405,20250406）")
     parser.add_argument("--list",       metavar="DATE",  help="指定日のレース一覧を表示")
+    parser.add_argument("--watch-odds",    metavar="DATE",
+                        help="オッズ自動監視（例: 20250406）")
+    parser.add_argument("--poll-interval", type=int, default=60,
+                        help="watch-odds のポーリング間隔（秒、デフォルト: 60）")
     args = parser.parse_args()
 
     if args.analyze:
@@ -817,6 +962,9 @@ if __name__ == "__main__":
         print(f"{args.list} のレース一覧 ({len(races)}件):")
         for r in races:
             print(f"  {r['venue']} {r['race_no']:>2}R  {r['race_id']}")
+
+    elif args.watch_odds:
+        watch_odds(args.watch_odds, poll_interval=args.poll_interval)
 
     else:
         parser.print_help()

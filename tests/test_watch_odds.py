@@ -81,3 +81,54 @@ def test_version_increments_on_success(tmp_path, monkeypatch):
     assert pred["horses"][0]["feature_dict"]["feat_win_odds_log"] == pytest.approx(
         __import__("math").log(5.6), abs=1e-3
     )
+
+
+from datetime import datetime, timedelta
+
+
+def test_window_detection():
+    """T-30min 付近のレースのみが更新対象として選ばれる"""
+    now = datetime(2026, 4, 5, 15, 15, 0)   # 15:15
+    start_times = {
+        "202609020401": "2026-04-05T10:00:00",   # 発走済み（対象外）
+        "202609020410": "2026-04-05T15:40:00",   # T-25min（対象）
+        "202609020411": "2026-04-05T15:45:00",   # T-30min（対象）
+        "202609020412": "2026-04-05T16:25:00",   # T-70min（対象外）
+    }
+    # 発走時刻 - 35min ≤ now ≤ 発走時刻 - 20min
+    targets = daily_pipeline._get_update_targets(start_times, now, updated_ids=set())
+    assert "202609020410" in targets
+    assert "202609020411" in targets
+    assert "202609020401" not in targets   # 発走済み
+    assert "202609020412" not in targets   # まだ早すぎる
+
+
+def test_already_updated_skip():
+    """`updated_ids` に入っているレースはスキップされる"""
+    now = datetime(2026, 4, 5, 15, 15, 0)
+    start_times = {
+        "202609020411": "2026-04-05T15:45:00",
+    }
+    targets = daily_pipeline._get_update_targets(
+        start_times, now, updated_ids={"202609020411"}
+    )
+    assert "202609020411" not in targets
+
+
+def test_exit_condition_all_past():
+    """全レースが start + 90min を過ぎていれば _should_exit が True"""
+    now = datetime(2026, 4, 5, 20, 0, 0)
+    start_times = {
+        "202609020401": "2026-04-05T10:00:00",
+        "202609020412": "2026-04-05T17:00:00",
+    }
+    assert daily_pipeline._should_exit(start_times, updated_ids=set(), now=now) is True
+
+
+def test_no_exit_when_races_remain():
+    """まだ発走前のレースがあれば _should_exit が False"""
+    now = datetime(2026, 4, 5, 15, 0, 0)
+    start_times = {
+        "202609020411": "2026-04-05T15:45:00",
+    }
+    assert daily_pipeline._should_exit(start_times, updated_ids=set(), now=now) is False
