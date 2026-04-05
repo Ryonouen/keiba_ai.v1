@@ -118,33 +118,40 @@ def _eval_coverage(
       "not_open"  — 全馬が "–"（未発売）
       "success"   — coverage >= ODDS_COVERAGE_THRESHOLD
       "partial"   — 0 < coverage < ODDS_COVERAGE_THRESHOLD
+      "failed"    — レスポンス構造が未知でパース不能
     """
     total = len(horse_number_map)
 
-    # 全オッズが "–" かチェック（not_open 判定用）
-    raw_check = None
+    # 「馬番→オッズ」のフラット辞書を特定する（ネスト辞書は除外）
+    raw_odds: Optional[dict] = None
     for path_fn in [
         lambda d: d["data"]["Odds"],
         lambda d: d["data"]["WinOdds"],
         lambda d: d["data"]["Odds"]["WinOdds"],
     ]:
         try:
-            raw_check = path_fn(data)
-            break
+            candidate = path_fn(data)
+            if isinstance(candidate, dict) and all(
+                not isinstance(v, dict) for v in candidate.values()
+            ):
+                raw_odds = candidate
+                break
         except (KeyError, TypeError):
             continue
 
-    if raw_check and isinstance(raw_check, dict):
-        all_dash = all(
-            str(v) in ("–", "-", "---", "", "0")
-            for v in raw_check.values()
-        )
-        if all_dash:
-            return "not_open", None
+    if raw_odds is None:
+        logger.warning("[odds_fetcher] 未知レスポンス構造 → status=failed")
+        return "failed", None
+
+    # 全オッズが "–" かチェック（not_open 判定）
+    all_dash = all(
+        str(v) in ("–", "-", "---", "", "0") for v in raw_odds.values()
+    )
+    if all_dash:
+        return "not_open", None
 
     parsed = _parse_odds_response(data)
     if parsed is None:
-        # Response received but schema unrecognized — not the same as "not open"
         logger.warning("[odds_fetcher] 未知レスポンス構造 → status=failed")
         return "failed", None
 

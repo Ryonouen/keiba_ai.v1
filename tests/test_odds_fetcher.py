@@ -85,3 +85,12 @@ def test_parse_api_response_nested_win_odds_path():
     assert result is not None
     assert result["1"] == 5.6
     assert result["8"] == 9.9
+
+
+def test_status_not_open_nested_schema():
+    """path-3 スキーマ（data["data"]["Odds"]["WinOdds"]）で全オッズ "–" → status=not_open"""
+    raw = {"data": {"Odds": {"WinOdds": {"1": "–", "2": "–", "3": "–", "4": "–",
+                                          "5": "–", "6": "–", "7": "–", "8": "–"}}}}
+    status, result = odds_fetcher._eval_coverage(raw, HORSE_MAP)
+    assert status == "not_open"
+    assert result is None
