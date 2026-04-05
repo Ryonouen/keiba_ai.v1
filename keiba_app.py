@@ -22,12 +22,6 @@ STATUS_LABEL: Dict[str, str] = {
     "result":   "✅ 結果済み",
 }
 
-BET_TYPE_ORDER = [
-    "tansho", "fukusho", "wide",
-    "umaren", "umatan",
-    "sanrenpuku", "sanrenpuku_ai", "sanrentan",
-]
-
 
 # ──────────────────────────────────────────────────────────────
 # 共通ウィジェット
@@ -147,10 +141,13 @@ def _tab_history() -> None:
 
     selected = st.selectbox("日付を選択", dates, index=0)
 
+    # 全日付を一度だけロード
+    races_by_date = {d: dl.load_races_for_date(d) for d in dates}
+
     # 全期間累計 KPI
     all_races: List[Dict] = []
-    for d in dates:
-        all_races.extend(dl.load_races_for_date(d))
+    for day_races in races_by_date.values():
+        all_races.extend(day_races)
 
     kpi_all = dl.calc_kpi(all_races)
     st.subheader("全期間累計")
@@ -163,8 +160,7 @@ def _tab_history() -> None:
     # ROI 推移グラフ
     roi_rows = []
     for d in sorted(dates):
-        day_races = dl.load_races_for_date(d)
-        k = dl.calc_kpi(day_races)
+        k = dl.calc_kpi(races_by_date[d])
         if k["total_stake"] > 0:
             roi_rows.append({"日付": d, "ROI(%)": k["roi"]})
 
@@ -175,7 +171,7 @@ def _tab_history() -> None:
 
     # 選択日のレース
     st.subheader(f"{selected} のレース")
-    day_races = dl.load_races_for_date(selected)
+    day_races = races_by_date.get(selected, [])
     if day_races:
         kpi_day = dl.calc_kpi(day_races)
         _render_kpi(kpi_day)
