@@ -59,7 +59,7 @@ def _race_status(start_datetime: Optional[str], outcomes: List[Dict]) -> str:
             t = datetime.fromisoformat(start_datetime)
             if datetime.now() > t + timedelta(minutes=30):
                 return "awaiting"
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     return "prerace"
 
@@ -70,10 +70,11 @@ def _build_horse_row(horse: Dict) -> Dict:
     v2: horse["feature_dict"]["win_odds"] / ["running_style"]
     v1: horse["win_odds"] = null
     """
-    fd = horse.get("feature_dict") or {}
-    win_odds_raw       = fd.get("win_odds") if fd else horse.get("win_odds")
-    running_style_raw  = fd.get("running_style") if fd else horse.get("running_style")
-    popularity_raw     = fd.get("feat_popularity") if fd else horse.get("popularity")
+    fd = horse.get("feature_dict")
+    is_v2 = fd is not None
+    win_odds_raw      = fd.get("win_odds")        if is_v2 else horse.get("win_odds")
+    running_style_raw = fd.get("running_style")   if is_v2 else horse.get("running_style")
+    popularity_raw    = fd.get("feat_popularity") if is_v2 else horse.get("popularity")
     return {
         "horse_name":    horse.get("horse_name", ""),
         "ai_win_prob":   horse.get("ai_win_prob"),
