@@ -1,5 +1,4 @@
 # tests/test_dashboard_loader.py
-import json
 import os
 import sys
 import pytest
@@ -176,6 +175,29 @@ def test_race_status_result():
     with patch.object(dl, "_load_json", side_effect=_mock_load(PRED_V2, BETS, OUTCOMES_HIT)):
         races = dl.load_races_for_date("20260405")
     assert races[0]["status"] == "result"
+
+
+def test_kpi_calculation_miss_does_not_increment_hit_count():
+    """外れ馬券は hit_count に加算されない。"""
+    with patch.object(dl, "_load_json", side_effect=_mock_load(PRED_V2, BETS, OUTCOMES_MISS)):
+        races = dl.load_races_for_date("20260405")
+    kpi = dl.calc_kpi(races)
+    assert kpi["hit_count"] == 0
+    assert kpi["total_bets"] == 1
+    assert kpi["total_payout"] == 0
+
+
+def test_race_status_awaiting():
+    """outcomes なし・start_datetime が 30分以上前 → status == 'awaiting'。"""
+    past_pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "start_datetime": (datetime.now() - timedelta(hours=1)).isoformat(),
+        }
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(past_pred, {}, {})):
+        races = dl.load_races_for_date("20260405")
+    assert races[0]["status"] == "awaiting"
 
 
 def test_date_list_descending():
