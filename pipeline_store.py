@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -98,6 +99,132 @@ def load_prediction(race_id: str) -> Optional[Dict[str, Any]]:
 
 def load_all_predictions() -> Dict[str, Any]:
     return _load(PREDICTIONS_FILE)
+
+
+def _extract_start_time(race_info_text: str) -> str:
+    """
+    "15:45発走 / 芝..." または "15時45分発走 ..." から "HH:MM" を抽出。
+    取得できなければ "" を返す。
+    """
+    m = _re.search(r'(\d{1,2})[時:](\d{2})分?発走', race_info_text or "")
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return ""
+
+
+def _parse_horse_id(link: str) -> str:
+    """
+    "https://db.netkeiba.com/horse/2022105123/" → "2022105123"
+    取得できなければ "" を返す。
+    """
+    m = _re.search(r'/horse/(\d+)', link or "")
+    return m.group(1) if m else ""
+
+
+def _build_odds_shell(horse_number_map: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    初期状態の odds_before / odds_after シェル（全馬 null、status=not_open）を返す。
+    """
+    nulls = {no: None for no in horse_number_map}
+    return {
+        "status": "not_open",
+        "tansho": dict(nulls),
+        "fukusho": dict(nulls),
+    }
+
+
+def save_prediction_v2(
+    race_id: str,
+    race_meta: Dict[str, Any],
+    features: List[Dict[str, Any]],
+    ev_table: List[Dict[str, Any]],
+    race_structure: Dict[str, Any],
+    danger_v2: List[Dict[str, Any]],
+    analysis_date: str = "",
+) -> None:
+    """
+    analyze_race() の結果を v2 スキーマで pipeline_predictions.json に保存する。
+
+    既存 save_prediction() と共存。load_prediction() はどちらのフォーマットも読める。
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    race_info_text = race_meta.get("race_info_text", "")
+    race_date = race_meta.get("race_date", "")
+
+    start_time = _extract_start_time(race_info_text)
+    start_datetime = f"{race_date}T{start_time}:00" if start_time and race_date else ""
+
+    # horse_number_map と horse_id_map を features から構築
+    horse_number_map: Dict[str, str] = {}
+    horse_id_map: Dict[str, str] = {}
+    for f in features:
+        no = f.get("horse_number")
+        name = str(f.get("horse_name") or "")
+        link = str(f.get("link") or "")
+        if no is not None and name:
+            horse_number_map[str(no)] = name
+        if name and link:
+            hid = _parse_horse_id(link)
+            if hid:
+                horse_id_map[name] = hid
+
+    # 馬ごとのデータ
+    horses = []
+    for f in features:
+        name = str(f.get("horse_name") or "")
+        running_style = str(f.get("running_style") or "unknown")
+        records_source = str(f.get("records_source") or "none")
+        # running_style_source の決定
+        if records_source == "newspaper":
+            rs_source = "newspaper"
+        elif running_style == "unknown":
+            rs_source = "unknown"
+        else:
+            rs_source = "inferred"
+
+        horses.append({
+            "horse_name":             name,
+            "horse_id":               horse_id_map.get(name, ""),
+            "ai_win_prob":            round(float(f.get("win_prob") or 0.0), 4),
+            "win_odds":               f.get("win_odds"),
+            "popularity":             f.get("popularity") or f.get("feat_popularity"),
+            "running_style":          running_style,
+            "running_style_source":   rs_source,
+            "running_style_missing":  running_style == "unknown",
+            "feature_dict":           dict(f),   # 全フィールドを保存
+        })
+
+    initial_history_entry = {
+        "version":    1,
+        "created_at": now_str,
+        "source":     "initial_analysis",
+        "horses":     [{"horse_name": h["horse_name"], "ai_win_prob": h["ai_win_prob"]}
+                       for h in horses],
+    }
+    odds_shell = _build_odds_shell(horse_number_map)
+
+    data = _load(PREDICTIONS_FILE)
+    data[race_id] = {
+        "race_id":        race_id,
+        "race_name":      race_meta.get("race_title", ""),
+        "race_date":      race_date,
+        "analysis_date":  analysis_date,
+        "analyzed_at":    now_str,
+        "start_time":     start_time,
+        "start_datetime": start_datetime,
+        "horse_number_map": horse_number_map,
+        "horse_id_map":     horse_id_map,
+        "prediction_version": 1,
+        "prediction_history": [initial_history_entry],
+        "horses":             horses,
+        "ev_table":           ev_table,
+        "race_structure":     race_structure,
+        "danger_v2":          danger_v2,
+        "odds_update_history": [],
+        "odds_before":        dict(odds_shell),
+        "odds_after":         dict(odds_shell),
+    }
+    _save(PREDICTIONS_FILE, data)
 
 
 # =========================================================
