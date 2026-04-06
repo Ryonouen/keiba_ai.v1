@@ -179,6 +179,33 @@ def train_model():
 
 
 # ──────────────────────────────────────────────
+# モード⑤: LightGBM Ranker 学習
+# ──────────────────────────────────────────────
+
+def train_ranker(profile: str = "balanced") -> None:
+    from ranker_engine import train_ranker_model, RANKER_PROFILES
+
+    csv_path = TRAINING_CSV if Path(TRAINING_CSV).exists() else "keiba_training_data.csv"
+
+    print(f"\n=== LightGBM Ranker 学習 (profile={profile}) ===")
+    if not Path(csv_path).exists():
+        print(f"  エラー: {csv_path} が存在しません。先にCSV出力を実行してください。")
+        return
+
+    import pandas as pd
+    df = pd.read_csv(csv_path, low_memory=False)
+    print(f"  学習データ: {len(df):,} 行 / {df['race_id'].nunique():,} レース")
+    desc = RANKER_PROFILES[profile]["description"]
+    print(f"  プロファイル: {profile} — {desc}")
+
+    ok = train_ranker_model(csv_path, profile=profile)
+    if ok:
+        print(f"  ✓ Ranker 学習完了。")
+    else:
+        print(f"  ✗ Ranker 学習失敗。")
+
+
+# ──────────────────────────────────────────────
 # メインメニュー
 # ──────────────────────────────────────────────
 
@@ -200,7 +227,17 @@ q. 終了
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["range", "name", "csv", "train"], help="実行モード")
+    parser.add_argument(
+        "--mode",
+        choices=["range", "name", "csv", "train", "ranker"],
+        help="実行モード (ranker は --profile と組み合わせて使用)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["conservative", "balanced", "aggressive"],
+        default="balanced",
+        help="Rankerプロファイル (--mode ranker 専用)",
+    )
     args = parser.parse_args()
 
     if args.mode == "range":
@@ -214,6 +251,9 @@ def main():
         return
     if args.mode == "train":
         train_model()
+        return
+    if args.mode == "ranker":
+        train_ranker(profile=args.profile)
         return
 
     # インタラクティブメニュー
