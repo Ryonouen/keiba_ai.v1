@@ -29,6 +29,8 @@ from race_ai_engine import ML_FEATURE_COLUMNS, TRAINING_CSV
 
 RANKER_MODEL_DIR: str = os.path.dirname(os.path.abspath(__file__))
 
+_MODEL_CACHE: Dict[str, Any] = {}
+
 RANKER_PROFILES: Dict[str, Dict] = {
     "conservative": {
         "model_file": "keiba_lgbm_ranker_conservative.txt",
@@ -130,7 +132,7 @@ def train_ranker_model(
     df[ML_FEATURE_COLUMNS] = df[ML_FEATURE_COLUMNS].fillna(0.0)
 
     df = df.sort_values("race_id").reset_index(drop=True)
-    groups = df.groupby("race_id", sort=False).size().values.tolist()
+    groups = df.groupby("race_id", sort=True).size().values.tolist()
 
     X = df[ML_FEATURE_COLUMNS]
     y = df["_relevance"]
@@ -164,7 +166,9 @@ def predict_rank_score(
         return None
 
     try:
-        model = lgb.Booster(model_file=model_file)
+        if model_file not in _MODEL_CACHE:
+            _MODEL_CACHE[model_file] = lgb.Booster(model_file=model_file)
+        model = _MODEL_CACHE[model_file]
         X = pd.DataFrame(
             [{col: float(f.get(col) or 0.0) for col in ML_FEATURE_COLUMNS} for f in features]
         )
