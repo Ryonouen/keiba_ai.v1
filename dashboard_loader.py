@@ -84,6 +84,65 @@ def _build_horse_row(horse: Dict) -> Dict:
     }
 
 
+# ──────────────────────────────────────────────────────────────
+# 荒れスコア
+# ──────────────────────────────────────────────────────────────
+
+_UPSET_LEVELS = [
+    (30,  "堅い",     "#27ae60"),
+    (45,  "やや堅い", "#8bc34a"),
+    (60,  "中間",     "#ff9800"),
+    (75,  "やや荒れ", "#e64a19"),
+    (101, "荒れ",     "#c0392b"),
+]
+
+
+def calc_upset_score(horses: List[Dict]) -> Dict[str, Any]:
+    """
+    馬リストから荒れスコア (0–100 整数) を計算する。
+
+    Returns
+    -------
+    {"score": int, "label": str, "color": str}
+    """
+    import math
+
+    probs = [float(h.get("ai_win_prob") or 0.0) for h in horses]
+    probs = [p for p in probs if p > 0.0]
+
+    if not probs:
+        return {"score": 50, "label": "中間", "color": "#ff9800"}
+
+    # Shannon エントロピー → 0–100 に正規化
+    total = sum(probs)
+    norm_p = [p / total for p in probs]
+    entropy = -sum(p * math.log2(p) for p in norm_p if p > 0.0)
+    max_entropy = math.log2(len(norm_p)) if len(norm_p) > 1 else 1.0
+    entropy_score = (entropy / max_entropy * 100.0) if max_entropy > 0.0 else 0.0
+
+    # 1番人気オッズ → 0–100 に変換（最大 30 倍で cap）
+    odds_list = [
+        float(h.get("win_odds"))
+        for h in horses
+        if h.get("win_odds") is not None
+    ]
+    if odds_list:
+        top_odds = min(odds_list)          # 最低オッズ = 1番人気
+        odds_score = min(top_odds, 30.0) / 30.0 * 100.0
+        w_e, w_o = 0.6, 0.4
+    else:
+        odds_score = 0.0
+        w_e, w_o = 1.0, 0.0               # オッズなし → エントロピーのみ
+
+    score = max(0, min(100, round(w_e * entropy_score + w_o * odds_score)))
+
+    for threshold, label, color in _UPSET_LEVELS:
+        if score < threshold:
+            return {"score": score, "label": label, "color": color}
+
+    return {"score": score, "label": "荒れ", "color": "#c0392b"}
+
+
 def get_available_dates() -> List[str]:
     """
     pipeline_predictions.json に存在する analysis_date の一覧を降順で返す。

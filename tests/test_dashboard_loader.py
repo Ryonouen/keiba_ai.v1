@@ -210,3 +210,42 @@ def test_date_list_descending():
     with patch.object(dl, "_load_json", return_value=preds):
         dates = dl.get_available_dates()
     assert dates == ["20260405", "20260404", "20260403"]
+
+
+# ── Task 1: calc_upset_score ──────────────────────────────────
+
+def test_upset_score_concentrated():
+    """1頭が勝率90%を占める → エントロピー低 → 低スコア（堅い or やや堅い）"""
+    horses = [
+        {"horse_name": "A", "ai_win_prob": 0.9,  "win_odds": 1.2},
+        {"horse_name": "B", "ai_win_prob": 0.05, "win_odds": 20.0},
+        {"horse_name": "C", "ai_win_prob": 0.05, "win_odds": 20.0},
+    ]
+    result = dl.calc_upset_score(horses)
+    assert result["score"] < 40
+    assert result["label"] in ("堅い", "やや堅い")
+    assert "color" in result
+
+
+def test_upset_score_uniform():
+    """10頭均等分布 → エントロピー最大 → 高スコア（やや荒れ or 荒れ）"""
+    horses = [
+        {"horse_name": str(i), "ai_win_prob": 0.1, "win_odds": 10.0}
+        for i in range(10)
+    ]
+    result = dl.calc_upset_score(horses)
+    assert result["score"] >= 55
+    assert result["label"] in ("やや荒れ", "荒れ", "中間")
+
+
+def test_upset_score_no_odds():
+    """オッズが全馬 None → エントロピーのみで計算、戻り値のキーが揃っている"""
+    horses = [
+        {"horse_name": "A", "ai_win_prob": 0.5, "win_odds": None},
+        {"horse_name": "B", "ai_win_prob": 0.3, "win_odds": None},
+        {"horse_name": "C", "ai_win_prob": 0.2, "win_odds": None},
+    ]
+    result = dl.calc_upset_score(horses)
+    assert 0 <= result["score"] <= 100
+    assert result["label"] in ("堅い", "やや堅い", "中間", "やや荒れ", "荒れ")
+    assert result["color"].startswith("#")
