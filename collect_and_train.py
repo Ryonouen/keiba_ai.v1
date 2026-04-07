@@ -14,6 +14,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 RACE_IDS_FILE = "collected_race_ids.json"
 TRAINING_CSV  = "keiba_training_data.csv"
@@ -206,6 +207,40 @@ def train_ranker(profile: str = "balanced") -> None:
 
 
 # ──────────────────────────────────────────────
+# モード⑥: アンサンブル検証レポート出力
+# ──────────────────────────────────────────────
+
+def run_ensemble(test_year: int = 2025, output: Optional[str] = None) -> None:
+    from ensemble_validator import run_validation, _report_to_markdown, REPORT_DIR
+    from pathlib import Path as _Path
+    import json as _json
+    from datetime import datetime as _datetime
+
+    csv_path = TRAINING_CSV if Path(TRAINING_CSV).exists() else "keiba_training_data.csv"
+
+    print(f"\n=== アンサンブル検証 ===")
+    if not Path(csv_path).exists():
+        print(f"  エラー: {csv_path} が存在しません。")
+        return
+
+    import pandas as pd
+    df = pd.read_csv(csv_path, low_memory=False)
+    print(f"  学習データ: {len(df):,} 行  テスト年: {test_year}")
+
+    report = run_validation(df, test_year=test_year)
+
+    if output is None:
+        _Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+        date_str = _datetime.now().strftime("%Y-%m-%d")
+        output = f"{REPORT_DIR}/ensemble_report_{date_str}.md"
+
+    md = _report_to_markdown(report)
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(md)
+    print(f"\n  ✓ レポートを保存しました: {output}")
+
+
+# ──────────────────────────────────────────────
 # メインメニュー
 # ──────────────────────────────────────────────
 
@@ -229,7 +264,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["range", "name", "csv", "train", "ranker"],
+        choices=["range", "name", "csv", "train", "ranker", "ensemble"],
         help="実行モード (ranker は --profile と組み合わせて使用)",
     )
     parser.add_argument(
@@ -237,6 +272,12 @@ def main():
         choices=["conservative", "balanced", "aggressive"],
         default="balanced",
         help="Rankerプロファイル (--mode ranker 専用)",
+    )
+    parser.add_argument(
+        "--test-year",
+        type=int,
+        default=2025,
+        help="アンサンブル検証のテスト年 (--mode ensemble 専用)",
     )
     args = parser.parse_args()
 
@@ -254,6 +295,9 @@ def main():
         return
     if args.mode == "ranker":
         train_ranker(profile=args.profile)
+        return
+    if args.mode == "ensemble":
+        run_ensemble(test_year=args.test_year)
         return
 
     # インタラクティブメニュー
