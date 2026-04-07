@@ -1567,6 +1567,92 @@ def kelly_fraction(prob: float, odds: Optional[float]) -> float:
 
 
 # =========================================================
+# 近走成績キャッシュ（LightGBM 特徴量用）
+# =========================================================
+
+_horse_history_cache: Optional[Dict[str, List]] = None
+_RF_DECAY_WEIGHTS = [0.40, 0.25, 0.15, 0.10, 0.07, 0.03]
+
+
+def _load_horse_history() -> Dict[str, List]:
+    """CSV から馬ごとの近走成績履歴をロード（初回のみ、以降キャッシュ）。"""
+    global _horse_history_cache
+    if _horse_history_cache is not None:
+        return _horse_history_cache
+
+    cache: Dict[str, List] = {}
+    if not Path(TRAINING_CSV).exists():
+        _horse_history_cache = cache
+        return cache
+
+    try:
+        _df = pd.read_csv(
+            TRAINING_CSV,
+            usecols=["horse_name", "race_date", "feat_n_runners",
+                     "feat_popularity", "race_class_index",
+                     "target_win", "target_top3"],
+            low_memory=False,
+        )
+        _df["_n"]  = pd.to_numeric(_df["feat_n_runners"], errors="coerce").fillna(1).clip(lower=1)
+        _df["_pop"] = pd.to_numeric(_df["feat_popularity"], errors="coerce").fillna(0)
+        _df["_ci"] = pd.to_numeric(_df["race_class_index"], errors="coerce").fillna(0.45)
+        _df["_win"]  = _df["target_win"].astype(str).str.strip() == "1"
+        _df["_top3"] = _df["target_top3"].astype(str).str.strip() == "1"
+
+        def _ri(row):
+            n = row["_n"]
+            if row["_win"]:
+                return 1.0
+            if row["_top3"]:
+                return max(0.0, 1.0 - 1.5 / max(n - 1, 1))
+            p = row["_pop"]
+            if p > 0 and n > 1:
+                return max(0.0, 1.0 - (p - 1) / (n - 1))
+            return 0.3
+
+        _df["_ri"] = _df.apply(_ri, axis=1)
+
+        for hname, grp in _df.groupby("horse_name", sort=False):
+            grp_sorted = grp.sort_values("race_date")
+            cache[str(hname)] = list(zip(
+                grp_sorted["race_date"].astype(str),
+                grp_sorted["_ri"].astype(float),
+                grp_sorted["_ci"].astype(float),
+            ))
+    except Exception as _e:
+        print(f"[WARN] horse_history load: {_e}")
+
+    _horse_history_cache = cache
+    return cache
+
+
+def _compute_recent_form(horse_name: str, before_date: str) -> Dict[str, float]:
+    """horse_name の before_date より前の履歴から近走特徴量を返す。"""
+    history = _load_horse_history().get(horse_name, [])
+    past = [(d, ri, ci) for d, ri, ci in history if str(d) < before_date]
+    past = list(reversed(past))[:len(_RF_DECAY_WEIGHTS)]
+
+    if not past:
+        return {"feat_recent_form": 0.5, "feat_trend_index": 0.0,
+                "feat_consistency_index": 0.5}
+
+    weights = _RF_DECAY_WEIGHTS[:len(past)]
+    total_w = sum(weights)
+    recent_form = sum(w * ri * ci for w, (_, ri, ci) in zip(weights, past)) / total_w
+    ri_list = [ri for _, ri, _ in past]
+    trend = ri_list[0] - ri_list[-1]
+
+    import statistics as _stat
+    consistency = max(0.0, 1.0 - _stat.stdev(ri_list) / 0.5) if len(ri_list) >= 2 else 1.0
+
+    return {
+        "feat_recent_form":       round(recent_form, 5),
+        "feat_trend_index":       round(trend, 5),
+        "feat_consistency_index": round(consistency, 5),
+    }
+
+
+# =========================================================
 # LightGBM
 # =========================================================
 
@@ -1591,6 +1677,10 @@ ML_FEATURE_COLUMNS: List[str] = [
     "feat_cond_diff_weight",
     "feat_cond_diff_jockey",
     "feat_cond_diff_track",
+    # 近走成績特徴量
+    "feat_recent_form",
+    "feat_trend_index",
+    "feat_consistency_index",
 ]
 
 
@@ -1612,13 +1702,17 @@ def _inject_ml_features(
     features: List[Dict[str, Any]],
     condition_stats: Optional[Dict[str, Any]],
     n_runners: int,
+    race_date: str = "",
 ) -> None:
     """
     feature dict に ML_FEATURE_COLUMNS に対応する feat_* フィールドを追加する。
     LightGBM 予測の前に呼ぶ。in-place で更新する。
     """
     import math as _math
+    from datetime import datetime as _dt
     from trend_stats import get_condition_keys
+
+    _today = race_date or _dt.now().strftime("%Y-%m-%d")
 
     for f in features:
         win_odds = float(f.get("win_odds") or 1.0)
@@ -1657,6 +1751,12 @@ def _inject_ml_features(
             "feat_cond_diff_jockey":     cond_diffs.get("feat_cond_diff_jockey", 0.0),
             "feat_cond_diff_track":      cond_diffs.get("feat_cond_diff_track", 0.0),
         })
+        # 近走成績特徴量（CSVキャッシュから計算）
+        _rf = _compute_recent_form(
+            str(f.get("horse_name") or ""),
+            _today,
+        )
+        f.update(_rf)
 
 
 def train_lightgbm_model(csv_path: str = TRAINING_CSV, model_file: str = MODEL_FILE) -> bool:
@@ -3397,6 +3497,7 @@ def analyze_race(
     # netkeibaの結果ページから実日付を取得する。取得失敗時は年のみのフォールバック。
     _rid_m = re.search(r"race_id=(\d{8,})", shutuba_url)
     _cutoff_date: Optional[str] = None
+    _race_date_str: str = ""
     if _rid_m:
         _rid = _rid_m.group(1)
         try:
@@ -3424,6 +3525,9 @@ def analyze_race(
         if _cached_rid and _input_rid and _cached_rid != _input_rid:
             cached_result = None  # race_id 不一致 → このキャッシュは別レースのもの、破棄
         else:
+            # キャッシュに race_date がなければ今回取得した実日付を補完する
+            if _race_date_str and not cached_result["race_meta"].get("race_date"):
+                cached_result["race_meta"]["race_date"] = _race_date_str
             return refresh_result_payload(cached_result)
 
     driver = build_webdriver(headless=headless)
@@ -3830,7 +3934,7 @@ def analyze_race(
         features = apply_jockey_adjustments(features)
 
         # ML特徴量を feature dict に注入（LightGBM予測で使用）
-        _inject_ml_features(features, condition_stats, len(features))
+        _inject_ml_features(features, condition_stats, len(features), race_date=_race_date_str)
 
         ml_probs = predict_win_probability_with_model(features, MODEL_FILE)
 
@@ -3933,7 +4037,7 @@ def analyze_race(
 
         ai_bets = generate_ai_bets(features)
         result = {
-            "race_meta": race_meta.__dict__,
+            "race_meta": {**race_meta.__dict__, "race_date": _race_date_str},
             "features": features,
             "ai_bets": ai_bets,
             "value_summary": build_value_summary(features),
@@ -4808,3 +4912,9 @@ if __name__ == "__main__":
     recommendations = recommend_bets(result.get("features", []), bankroll=bankroll)
     print_recommendations(recommendations)
     
+
+# ── 拡張特徴量列（feature_expander.py で追加される列を含む）─────────────
+from feature_expander import EXPANDED_COLS as _EXP_COLS
+ML_FEATURE_COLUMNS_EXPANDED: List[str] = ML_FEATURE_COLUMNS + [
+    c for c in _EXP_COLS if c not in ML_FEATURE_COLUMNS
+]

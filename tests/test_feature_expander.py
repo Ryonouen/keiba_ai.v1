@@ -135,3 +135,17 @@ def test_expand_surface_turf():
     result = fe.expand_features(df, stats)
     row = result[result["horse_name"] == "ホースA"].iloc[0]
     assert row["feat_surface_turf_flag"] == 1
+
+# ── ML_FEATURE_COLUMNS_EXPANDED ───────────────────────────────────
+
+def test_expanded_cols_superset_of_base():
+    from race_ai_engine import ML_FEATURE_COLUMNS
+    from feature_expander import EXPANDED_COLS
+    from race_ai_engine import ML_FEATURE_COLUMNS_EXPANDED
+    assert set(ML_FEATURE_COLUMNS).issubset(set(ML_FEATURE_COLUMNS_EXPANDED))
+    for col in EXPANDED_COLS:
+        assert col in ML_FEATURE_COLUMNS_EXPANDED, f"Missing: {col}"
+
+def test_expanded_cols_no_duplicates():
+    from race_ai_engine import ML_FEATURE_COLUMNS_EXPANDED
+    assert len(ML_FEATURE_COLUMNS_EXPANDED) == len(set(ML_FEATURE_COLUMNS_EXPANDED))
