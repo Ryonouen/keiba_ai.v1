@@ -186,6 +186,8 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
     """
     from race_ai_engine import analyze_race
     from value_ai import recommend_betmaster_plans, assign_roles
+    from kelly_staking import load_kelly_config
+    kelly_config = load_kelly_config()
 
     race_ids = get_race_ids_by_date(date_str)
     summary: Dict[str, Any] = {
@@ -229,7 +231,7 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
 
             # 全券種買い目生成・保存
             plans = recommend_betmaster_plans(features, race_structure, horse_roles)
-            bets  = generate_all_bets(race_id, plans)
+            bets  = generate_all_bets(race_id, plans, kelly_config=kelly_config)
             pipeline_store.save_bet_suggestions(race_id, bets)
 
             summary["success"] += 1
@@ -780,9 +782,10 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
         )
 
     # 役割・買い目 再計算
+    from kelly_staking import load_kelly_config as _load_kelly_config
     horse_roles = assign_roles(features, ev_table, race_structure, danger_v2)
     plans = recommend_betmaster_plans(features, race_structure, horse_roles)
-    bets  = generate_all_bets(race_id, plans)
+    bets  = generate_all_bets(race_id, plans, kelly_config=_load_kelly_config())
 
     # 保存用 horses リスト（feature_dict も更新）
     old_horses_by_name = {h["horse_name"]: h for h in pred.get("horses", [])}
