@@ -38,6 +38,10 @@ SHUTUBA_URL_TEMPLATE = "https://race.netkeiba.com/race/shutuba.html?race_id={rac
 SLEEP_MIN = 5.0   # analyze_race はSeleniumを使うため長めに
 SLEEP_MAX = 10.0
 
+import os as _os_dp
+_HERE_DP = _os_dp.path.dirname(_os_dp.path.abspath(__file__))
+EXPANDED_MODEL_FILE: str = _os_dp.path.join(_HERE_DP, "keiba_lgbm_model_expanded.txt")
+
 # 券種名の正規化マップ（recommend_betmaster_plans → 保存用キー）
 BET_TYPE_KEY_MAP: Dict[str, str] = {
     "単勝":                         "tansho",
@@ -590,10 +594,24 @@ def get_race_meta_by_date(date_str: str) -> List[Dict[str, Any]]:
 def _run_lgbm_prediction(features: List[Dict[str, Any]]) -> List[float]:
     """
     LightGBM で win_prob を再計算し、正規化された確率リストを返す。
-    モデルがない場合はフォールバック（一様分布）を返す。
+    拡張モデル (keiba_lgbm_model_expanded.txt) が存在する場合は優先使用し、
+    ない場合は既存モデルにフォールバック。モデルがない場合は一様分布を返す。
     テストで monkeypatch しやすいよう分離。
     """
+    import os as _os
     from race_ai_engine import predict_win_probability_with_model, MODEL_FILE
+
+    # 拡張モデルが存在する場合は優先使用
+    if _os.path.exists(EXPANDED_MODEL_FILE):
+        try:
+            from race_ai_engine import ML_FEATURE_COLUMNS_EXPANDED
+            probs = predict_win_probability_with_model(features, EXPANDED_MODEL_FILE, feature_columns=ML_FEATURE_COLUMNS_EXPANDED)
+            if probs is not None:
+                return probs
+        except Exception as _e:
+            _logger.debug("拡張モデル推論失敗、既存モデルにフォールバック: %s", _e)
+
+    # 既存モデルにフォールバック
     probs = predict_win_probability_with_model(features, MODEL_FILE)
     if probs is not None:
         return probs

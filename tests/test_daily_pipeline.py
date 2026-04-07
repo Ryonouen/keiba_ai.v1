@@ -346,3 +346,17 @@ def test_generate_all_bets_non_tansho_ev_none():
     bets = generate_all_bets("race_001", plans)
     assert len(bets) == 1
     assert bets[0]["expected_value"] is None
+
+
+def test_run_lgbm_prediction_falls_back_when_expanded_missing(monkeypatch, tmp_path):
+    """拡張モデルがない場合は既存モデルにフォールバックすること"""
+    from daily_pipeline import _run_lgbm_prediction
+    from race_ai_engine import ML_FEATURE_COLUMNS
+    import daily_pipeline as dp
+
+    monkeypatch.setattr(dp, "EXPANDED_MODEL_FILE", str(tmp_path / "nonexistent.txt"))
+    features = [{col: 1.0 for col in ML_FEATURE_COLUMNS} for _ in range(4)]
+    monkeypatch.setattr("race_ai_engine.predict_win_probability_with_model", lambda *a: None)
+    result = _run_lgbm_prediction(features)
+    assert len(result) == 4
+    assert abs(sum(result) - 1.0) < 1e-6
