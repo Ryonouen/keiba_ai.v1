@@ -41,14 +41,6 @@ EXPANDED_COLS = [
     "feat_surface_turf_flag",
 ]
 
-# 距離帯境界 (m)
-_DIST_BUCKETS = [
-    (0,    1399, 0),   # 短距離
-    (1400, 1799, 1),   # マイル
-    (1800, 2199, 2),   # 中距離
-    (2200, 9999, 3),   # 長距離
-]
-
 # jockey_stats.csv の by_distance の condition_value
 _DIST_LABEL_MAP = {
     0: "短距離",
@@ -69,6 +61,15 @@ _VENUE_CODE_MAP = {
 # ヘルパー関数
 # =========================================================
 
+def _safe_int(val: Any) -> int:
+    """NaN/None/invalid を 0 に変換する整数変換。"""
+    try:
+        f = float(val)
+        return 0 if math.isnan(f) else int(f)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _distance_to_bucket(distance: float) -> int:
     """距離（m）を 0-3 の帯エンコードに変換する。NaN → 0。"""
     try:
@@ -77,10 +78,13 @@ def _distance_to_bucket(distance: float) -> int:
             return 0
     except (TypeError, ValueError):
         return 0
-    for lo, hi, enc in _DIST_BUCKETS:
-        if lo <= d <= hi:
-            return enc
-    return 0
+    if d < 1400:
+        return 0  # 短距離
+    if d < 1800:
+        return 1  # マイル
+    if d < 2200:
+        return 2  # 中距離
+    return 3      # 長距離
 
 
 def _surface_to_flag(surface: Optional[str]) -> int:
@@ -106,9 +110,9 @@ def build_jockey_lookup(
         name  = str(row.get("jockey_name") or "").strip()
         ctype = str(row.get("condition_type") or "")
         cval  = str(row.get("condition_value") or "").strip()
-        rides = int(row.get("rides") or 0)
-        wins  = int(row.get("wins") or 0)
-        top3  = int(row.get("top3") or 0)
+        rides = _safe_int(row.get("rides"))
+        wins  = _safe_int(row.get("wins"))
+        top3  = _safe_int(row.get("top3"))
 
         if not name or rides == 0:
             continue
