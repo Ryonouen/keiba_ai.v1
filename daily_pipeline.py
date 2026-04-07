@@ -521,15 +521,15 @@ def export_summary_csv(summary: Dict[str, Any], out_path: str = "") -> str:
     rows = []
     for bet_key, bt in sorted(summary["by_bet_type"].items()):
         rows.append({
-            "date":       dates_str,
-            "bet_type":   bet_key,
-            "label":      bt["label"],
-            "bets":       bt["bets"],
-            "hits":       bt["hits"],
-            "stake":      bt["stake"],
-            "payout":     bt["payout"],
-            "hit_rate":   round(bt["hit_rate"], 4),
-            "roi":        round(bt["roi"], 4),
+            "date":          dates_str,
+            "bet_type":      bet_key,
+            "label":         bt["label"],
+            "bets":          bt["bets"],
+            "hits":          bt["hits"],
+            "stake":         bt["stake"],
+            "payout":        bt["payout"],
+            "hit_rate(%)":   round(bt["hit_rate"] * 100, 1),
+            "roi(%)":        round(bt["roi"] * 100, 1),
         })
 
     if not rows:
@@ -537,7 +537,7 @@ def export_summary_csv(summary: Dict[str, Any], out_path: str = "") -> str:
         return out_path
 
     fieldnames = ["date", "bet_type", "label", "bets", "hits",
-                  "stake", "payout", "hit_rate", "roi"]
+                  "stake", "payout", "hit_rate(%)", "roi(%)"]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
