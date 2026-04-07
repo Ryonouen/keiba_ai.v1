@@ -974,6 +974,26 @@ if __name__ == "__main__":
         summary = summarize_weekend_performance(dates)
         print_summary(summary)
 
+        # ROI レポート自動出力
+        from roi_reporter import aggregate_by_bet_type, generate_markdown_report, generate_csv_report, filter_outcomes_by_dates
+        from pathlib import Path as _Path
+        import os as _os
+
+        all_outcomes = pipeline_store.load_all_bet_outcomes()
+        all_preds    = pipeline_store.load_all_predictions()
+        filtered     = filter_outcomes_by_dates(all_outcomes, all_preds, dates)
+        roi_summary  = aggregate_by_bet_type(filtered)
+        report_dir   = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "reports")
+        _Path(report_dir).mkdir(parents=True, exist_ok=True)
+        date_label = "_".join(sorted(dates))
+        md_path  = _os.path.join(report_dir, f"roi_{date_label}.md")
+        csv_path = _os.path.join(report_dir, f"roi_{date_label}.csv")
+        md_text  = generate_markdown_report(roi_summary, dates=dates)
+        with open(md_path, "w", encoding="utf-8") as _f:
+            _f.write(md_text)
+        generate_csv_report(roi_summary, csv_path, dates=dates)
+        print(f"ROIレポートを保存しました: {md_path} / {csv_path}")
+
     elif args.export_csv:
         dates   = [d.strip() for d in args.export_csv.split(",")]
         summary = summarize_weekend_performance(dates)
