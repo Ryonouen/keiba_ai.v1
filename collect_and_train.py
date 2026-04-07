@@ -239,6 +239,78 @@ def run_ensemble(test_year: int = 2025, output: Optional[str] = None) -> None:
 
 
 # ──────────────────────────────────────────────
+# モード⑦: 特徴量拡充 → 拡張モデル学習
+# ──────────────────────────────────────────────
+
+def expand_and_train() -> None:
+    """特徴量拡充 CSV を生成し、拡張 LightGBM モデルを学習する。"""
+    from feature_expander import expand_features, EXPANDED_COLS
+    from race_ai_engine import ML_FEATURE_COLUMNS_EXPANDED, TRAINING_CSV as _TCSV
+    import pandas as pd
+
+    _HERE = Path(TRAINING_CSV).parent
+    jockey_stats_path = _HERE / "jockey_stats.csv"
+    expanded_csv      = _HERE / "keiba_training_data_expanded.csv"
+    expanded_model    = _HERE / "keiba_lgbm_model_expanded.txt"
+
+    print(f"\n=== 特徴量拡充 + 拡張モデル学習 ===")
+
+    if not Path(TRAINING_CSV).exists():
+        print(f"  エラー: {TRAINING_CSV} が存在しません。先に CSV 出力を実行してください。")
+        return
+    if not jockey_stats_path.exists():
+        print(f"  エラー: {jockey_stats_path} が存在しません。先に generate_jockey_stats.py を実行してください。")
+        return
+
+    # Step 1: 特徴量拡充
+    print(f"  CSV 読み込み中: {TRAINING_CSV}")
+    df = pd.read_csv(TRAINING_CSV, low_memory=False)
+    jstats = pd.read_csv(jockey_stats_path)
+    print(f"  {len(df):,} 行  +  jockey_stats {len(jstats):,} 行")
+
+    df_exp = expand_features(df, jstats)
+    df_exp.to_csv(expanded_csv, index=False)
+    print(f"  拡張 CSV 保存: {expanded_csv}  ({len(df_exp.columns)} 列)")
+    for col in EXPANDED_COLS:
+        nonzero = (df_exp[col] != 0).sum()
+        print(f"    {col}: {nonzero:,} 行に値あり")
+
+    # Step 2: 拡張モデル学習（LightGBM 直接呼び出し）
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        print("  エラー: LightGBM がインストールされていません。")
+        return
+
+    required = set(ML_FEATURE_COLUMNS_EXPANDED + ["target_win"])
+    missing  = required - set(df_exp.columns)
+    if missing:
+        print(f"  エラー: 必要列が不足しています: {missing}")
+        return
+
+    df_train = df_exp.dropna(subset=["target_win"])
+    X = df_train[ML_FEATURE_COLUMNS_EXPANDED].fillna(0.0)
+    y = df_train["target_win"].astype(int)
+
+    print(f"  拡張モデル学習中 (features={len(ML_FEATURE_COLUMNS_EXPANDED)}, rows={len(X):,})...")
+    params = {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "verbosity": -1,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "seed": 42,
+    }
+    dataset = lgb.Dataset(X, label=y)
+    model   = lgb.train(params, dataset, num_boost_round=200)
+    model.save_model(str(expanded_model))
+    print(f"  ✓ 拡張モデルを保存: {expanded_model}")
+
+
+# ──────────────────────────────────────────────
 # メインメニュー
 # ──────────────────────────────────────────────
 
@@ -262,8 +334,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--mode",
-        choices=["range", "name", "csv", "train", "ranker", "ensemble"],
-        help="実行モード (ranker は --profile と組み合わせて使用)",
+        choices=["range", "name", "csv", "train", "ranker", "ensemble", "expand"],
+        help="実行モード (expand = 特徴量拡充+拡張モデル学習)",
     )
     parser.add_argument(
         "--profile",
@@ -296,6 +368,9 @@ def main():
         return
     if args.mode == "ensemble":
         run_ensemble(test_year=args.test_year)
+        return
+    if args.mode == "expand":
+        expand_and_train()
         return
 
     # インタラクティブメニュー
