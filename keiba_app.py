@@ -93,27 +93,25 @@ def _render_race_summary(race: Dict) -> None:
             f'padding:2px 8px;border-radius:10px;margin-left:4px">🔥 {len(hot_bets)}件</span>'
         )
 
-    html = f"""
-<div style="background:#16213e;border-radius:6px;padding:10px 14px;
-            margin-bottom:2px;display:flex;align-items:center;gap:10px;
-            font-family:sans-serif;">
-  <div style="background:#293174;color:#fff;font-size:13px;font-weight:bold;
-              width:40px;height:40px;border-radius:6px;display:flex;
-              align-items:center;justify-content:center;flex-shrink:0;">{r_num}</div>
-  <div style="flex:1;min-width:0;">
-    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">
-      <span style="color:#e0e0e0;font-weight:bold;font-size:13px">{venue}</span>
-      <span style="color:#888;font-size:12px">{start_time}発走</span>
-      {status_html}
-    </div>
-    <div>{marks_html}</div>
-  </div>
-  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
-    {hot_html}
-    {upset_html}
-  </div>
-</div>
-"""
+    html = (
+        f'<div style="background:#16213e;border-radius:6px;padding:10px 14px;'
+        f'margin-bottom:2px;display:flex;align-items:center;gap:10px;font-family:sans-serif;">'
+        f'<div style="background:#293174;color:#fff;font-size:13px;font-weight:bold;'
+        f'width:40px;height:40px;border-radius:6px;display:flex;'
+        f'align-items:center;justify-content:center;flex-shrink:0;">{r_num}</div>'
+        f'<div style="flex:1;min-width:0;">'
+        f'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">'
+        f'<span style="color:#e0e0e0;font-weight:bold;font-size:13px">{venue}</span>'
+        f'<span style="color:#888;font-size:12px">{start_time}発走</span>'
+        f'{status_html}'
+        f'</div>'
+        f'<div>{marks_html}</div>'
+        f'</div>'
+        f'<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">'
+        f'{hot_html}{upset_html}'
+        f'</div>'
+        f'</div>'
+    )
     st.markdown(html, unsafe_allow_html=True)
 
 
