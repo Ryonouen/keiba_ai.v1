@@ -167,6 +167,16 @@ def backfill_dates(date_strs: List[str]) -> None:
                     n = len(group)
                     raw_probs = [1.0 / n] * n
 
+                # Ranker ブレンド（モデルが存在する場合のみ）
+                try:
+                    from ranker_engine import predict_rank_score, blend_scores
+                    feat_dicts = feat_matrix.to_dict("records")
+                    rank_scores = predict_rank_score(feat_dicts, profile="balanced")
+                    if rank_scores is not None:
+                        raw_probs = blend_scores(list(raw_probs), rank_scores, weight_ranker=0.3)
+                except Exception:
+                    pass
+
                 # features リスト構築
                 features = _build_features(group, list(raw_probs))
                 ev_table = _build_ev_table(features)

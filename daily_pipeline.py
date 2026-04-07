@@ -727,6 +727,15 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
         return {"race_id": race_id, "status": "failed", "coverage": 0.0,
                 "version_before": version_before, "version_after": version_before}
 
+    # Ranker ブレンド（モデルが存在する場合のみ。失敗しても継続）
+    try:
+        from ranker_engine import predict_rank_score, blend_scores
+        rank_scores = predict_rank_score(features, profile="balanced")
+        if rank_scores is not None:
+            new_probs = blend_scores(new_probs, rank_scores, weight_ranker=0.3)
+    except Exception as _e:
+        _logger.debug("ranker blend skipped: %s", _e)
+
     # downstream 再計算
     _recalc_downstream(features, new_probs)
 
@@ -965,24 +974,26 @@ if __name__ == "__main__":
         print_summary(summary)
 
         # ROI レポート自動出力
-        from roi_reporter import aggregate_by_bet_type, generate_markdown_report, generate_csv_report, filter_outcomes_by_dates
-        from pathlib import Path as _Path
-        import os as _os
+        try:
+            from roi_reporter import aggregate_by_bet_type, generate_markdown_report, generate_csv_report, filter_outcomes_by_dates
+            import os as _os
 
-        all_outcomes = pipeline_store.load_all_bet_outcomes()
-        all_preds    = pipeline_store.load_all_predictions()
-        filtered     = filter_outcomes_by_dates(all_outcomes, all_preds, dates)
-        roi_summary  = aggregate_by_bet_type(filtered)
-        report_dir   = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "reports")
-        _Path(report_dir).mkdir(parents=True, exist_ok=True)
-        date_label = "_".join(sorted(dates))
-        md_path  = _os.path.join(report_dir, f"roi_{date_label}.md")
-        csv_path = _os.path.join(report_dir, f"roi_{date_label}.csv")
-        md_text  = generate_markdown_report(roi_summary, dates=dates)
-        with open(md_path, "w", encoding="utf-8") as _f:
-            _f.write(md_text)
-        generate_csv_report(roi_summary, csv_path, dates=dates)
-        print(f"ROIレポートを保存しました: {md_path} / {csv_path}")
+            all_outcomes = pipeline_store.load_all_bet_outcomes()
+            all_preds    = pipeline_store.load_all_predictions()
+            filtered     = filter_outcomes_by_dates(all_outcomes, all_preds, dates)
+            roi_summary  = aggregate_by_bet_type(filtered)
+            report_dir   = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "reports")
+            Path(report_dir).mkdir(parents=True, exist_ok=True)
+            date_label = "_".join(sorted(dates))
+            md_path  = _os.path.join(report_dir, f"roi_{date_label}.md")
+            csv_path = _os.path.join(report_dir, f"roi_{date_label}.csv")
+            md_text  = generate_markdown_report(roi_summary, dates=dates)
+            with open(md_path, "w", encoding="utf-8") as _f:
+                _f.write(md_text)
+            generate_csv_report(roi_summary, csv_path, dates=dates)
+            print(f"ROIレポートを保存しました: {md_path} / {csv_path}")
+        except Exception as _roi_err:
+            print(f"[警告] ROIレポート生成に失敗しました: {_roi_err}")
 
     elif args.export_csv:
         dates   = [d.strip() for d in args.export_csv.split(",")]
