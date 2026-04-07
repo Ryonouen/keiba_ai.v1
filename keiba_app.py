@@ -80,7 +80,7 @@ def _render_race_cards(races: List[Dict]) -> None:
                 for b in bets:
                     combo_list = b.get("bet_combination") or []
                     combo_str  = "・".join(combo_list)
-                    label      = b.get("bet_type_label", "")
+                    bet_label  = b.get("bet_type_label", "")
                     stake      = b.get("stake_amount", 100)
                     o = outcome_map.get((b.get("bet_type", ""), combo_str))
                     if o is not None:
@@ -92,7 +92,7 @@ def _render_race_cards(races: List[Dict]) -> None:
                         hit_str    = "-"
                         payout_str = "-"
                     rows.append({
-                        "券種":   label,
+                        "券種":   bet_label,
                         "組み合わせ": combo_str,
                         "投資":   f"¥{stake}",
                         "的中":   hit_str,

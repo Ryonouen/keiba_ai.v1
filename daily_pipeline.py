@@ -65,17 +65,7 @@ DIVIDEND_KEY_MAP: Dict[str, str] = {
 }
 
 # check_bet_hit で使う bet_type 名（result_store.check_bet_hit の引数）
-HIT_CHECK_TYPE_MAP: Dict[str, str] = {
-    "tansho":        "単勝",
-    "fukusho":       "複勝",
-    "wide":          "ワイド",
-    "umaren":        "馬連",
-    "umatan":        "馬単",
-    "sanrenpuku_ai": "3連複",
-    "sanrenpuku_all":"3連複",
-    "sanrentan_ai":  "3連単",
-    "sanrentan_all": "3連単",
-}
+HIT_CHECK_TYPE_MAP = DIVIDEND_KEY_MAP
 
 
 # =========================================================

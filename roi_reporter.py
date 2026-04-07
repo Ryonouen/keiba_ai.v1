@@ -224,13 +224,14 @@ def main() -> None:
 
     if out.endswith(".csv"):
         generate_csv_report(summary, out, dates=dates_used)
+        md = generate_markdown_report(summary, dates=dates_used)
     else:
         md = generate_markdown_report(summary, dates=dates_used)
         with open(out, "w", encoding="utf-8") as f:
             f.write(md)
 
     print(f"レポートを保存しました: {out}")
-    print(generate_markdown_report(summary, dates=dates_used))
+    print(md)
 
 
 if __name__ == "__main__":
