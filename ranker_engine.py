@@ -170,7 +170,7 @@ def predict_rank_score(
             _MODEL_CACHE[model_file] = lgb.Booster(model_file=model_file)
         model = _MODEL_CACHE[model_file]
         X = pd.DataFrame(
-            [{col: float(f.get(col) or 0.0) for col in ML_FEATURE_COLUMNS} for f in features]
+            [{col: float(f[col]) if f.get(col) is not None else 0.0 for col in ML_FEATURE_COLUMNS} for f in features]
         )
         return [float(s) for s in model.predict(X)]
     except Exception as exc:
