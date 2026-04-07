@@ -27,6 +27,7 @@ from datetime import datetime as _dt, timedelta as _td
 from typing import Any, Dict, List, Optional
 
 import pipeline_store
+from kelly_staking import apply_kelly_to_bets
 
 _logger = _logging.getLogger(__name__)
 
@@ -100,7 +101,11 @@ def _race_url(race_id: str) -> str:
 # Phase 2: 全レース分析 + 買い目生成・保存
 # =========================================================
 
-def generate_all_bets(race_id: str, plans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def generate_all_bets(
+    race_id: str,
+    plans: List[Dict[str, Any]],
+    kelly_config: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     recommend_betmaster_plans() の出力を保存用スキーマに変換する。
 
@@ -144,6 +149,8 @@ def generate_all_bets(race_id: str, plans: List[Dict[str, Any]]) -> List[Dict[st
                 "confidence":         round(confidence, 4),
                 "expected_value":     _ev,
                 "implied_probability": None,
+                "_win_prob":          plan.get("_horse_win_prob"),
+                "_win_odds":          plan.get("_horse_win_odds"),
             })
 
     # 同一券種・同一組み合わせの重複排除
@@ -156,7 +163,7 @@ def generate_all_bets(race_id: str, plans: List[Dict[str, Any]]) -> List[Dict[st
         if key not in seen:
             seen.add(key)
             deduped.append(b)
-    return deduped
+    return apply_kelly_to_bets(deduped, kelly_config)
 
 
 def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
