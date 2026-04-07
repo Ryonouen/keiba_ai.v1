@@ -271,3 +271,42 @@ def test_hot_bets_ev_none_passes():
     """expected_value が None なら EV 条件をスキップして通過"""
     bets = [{"bet_type": "tansho", "confidence": 0.80, "expected_value": None}]
     assert len(dl.calc_hot_bets(bets)) == 1
+
+
+# ── Task 3: load_races_for_date 出力拡張 ──────────────────────
+
+def test_load_races_includes_upset_and_hot():
+    """load_races_for_date の出力に upset_score / upset_label / upset_color / hot_bets が含まれる"""
+    preds = {
+        "202606030401": {
+            "race_id": "202606030401",
+            "race_name": "テスト | 2026年4月5日 中山1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [
+                {"horse_name": "A", "ai_win_prob": 0.4,
+                 "feature_dict": {"win_odds": 3.0, "feat_popularity": 1, "running_style": "front"}},
+                {"horse_name": "B", "ai_win_prob": 0.3,
+                 "feature_dict": {"win_odds": 5.0, "feat_popularity": 2, "running_style": "stalker"}},
+            ],
+        }
+    }
+    bets = {
+        "202606030401": [
+            {"bet_type": "tansho", "confidence": 0.80, "expected_value": None,
+             "bet_combination": ["A"], "stake_amount": 100}
+        ]
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(preds, bets, {})):
+        races = dl.load_races_for_date("20260405")
+
+    assert len(races) == 1
+    race = races[0]
+    assert "upset_score" in race
+    assert "upset_label" in race
+    assert "upset_color" in race
+    assert "hot_bets" in race
+    assert isinstance(race["upset_score"], int)
+    assert 0 <= race["upset_score"] <= 100
+    assert race["upset_label"] in ("堅い", "やや堅い", "中間", "やや荒れ", "荒れ")
+    assert race["upset_color"].startswith("#")
+    assert len(race["hot_bets"]) == 1

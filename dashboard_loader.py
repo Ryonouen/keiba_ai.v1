@@ -188,7 +188,8 @@ def load_races_for_date(date_str: str) -> List[Dict]:
     List[Dict] — 各要素のキー:
         race_id, race_name, venue, race_number,
         start_time, start_datetime, status,
-        horses, bets, outcomes
+        horses, bets, outcomes,
+        upset_score, upset_label, upset_color, hot_bets
     """
     preds    = _load_json(_PREDICTIONS_FILE)
     bets_all = _load_json(_BET_SUGGESTIONS_FILE)
@@ -208,6 +209,9 @@ def load_races_for_date(date_str: str) -> List[Dict]:
         horses        = [_build_horse_row(h) for h in (pred.get("horses") or [])]
         horses.sort(key=lambda h: -(h["ai_win_prob"] or 0))
 
+        upset = calc_upset_score(horses)
+        hot   = calc_hot_bets(bets)
+
         races.append(
             {
                 "race_id":        race_id,
@@ -220,6 +224,10 @@ def load_races_for_date(date_str: str) -> List[Dict]:
                 "horses":         horses,
                 "bets":           bets,
                 "outcomes":       outcomes,
+                "upset_score":    upset["score"],
+                "upset_label":    upset["label"],
+                "upset_color":    upset["color"],
+                "hot_bets":       hot,
             }
         )
 
