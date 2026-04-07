@@ -15,12 +15,10 @@ pipeline_predictions.json / pipeline_bet_suggestions.json / pipeline_bet_outcome
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
 import time
-import random
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -251,5 +249,8 @@ def _parse_args() -> List[str]:
 
 if __name__ == "__main__":
     dates = _parse_args()
+    if not dates:
+        print("処理対象日なし。CSV に対象データがありません。")
+        sys.exit(0)
     print(f"処理対象: {len(dates)} 日  {dates[0]} 〜 {dates[-1]}")
     backfill_dates(dates)

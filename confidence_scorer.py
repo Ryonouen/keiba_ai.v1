@@ -52,18 +52,18 @@ def compute_race_confidence(features: List[Dict[str, Any]]) -> float:
         return 0.0
 
     # ── EV スコア ──────────────────────────────────────────────────
-    evs = [float(f.get("win_ev") or 0.0) for f in features]
+    evs = [float(f["win_ev"]) if f.get("win_ev") is not None else 0.0 for f in features]
     max_ev  = max(evs) if evs else 0.0
     ev_score = _sigmoid(max_ev * _EV_SCALE)
 
     # ── market_edge スコア ──────────────────────────────────────────
-    edges = [float(f.get("win_market_edge") or 0.0) for f in features]
+    edges = [float(f["win_market_edge"]) if f.get("win_market_edge") is not None else 0.0 for f in features]
     max_edge   = max(edges) if edges else 0.0
     edge_score = _sigmoid(max_edge * _EDGE_SCALE)
 
     # ── 予測集中度 ──────────────────────────────────────────────────
     probs = sorted(
-        [float(f.get("win_prob") or 0.0) for f in features],
+        [float(f["win_prob"]) if f.get("win_prob") is not None else 0.0 for f in features],
         reverse=True,
     )
     top3_sum = sum(probs[:3]) if len(probs) >= 3 else sum(probs)

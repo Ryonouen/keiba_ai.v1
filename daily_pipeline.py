@@ -23,8 +23,7 @@ import random
 import signal as _signal
 import sys as _sys
 import time
-from datetime import datetime, timedelta as _td
-from datetime import datetime as _dt
+from datetime import datetime as _dt, timedelta as _td
 from typing import Any, Dict, List, Optional
 
 import pipeline_store
@@ -377,6 +376,7 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
             print(f"    → 完了（{len(outcomes)} 買い目 / {hit_count} 的中）", flush=True)
 
         except Exception as e:
+            summary["skipped"] += 1
             summary["errors"].append({"race_id": race_id, "error": str(e)})
             print(f"    → エラー: {e}", flush=True)
 

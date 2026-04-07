@@ -211,10 +211,8 @@ def train_ranker(profile: str = "balanced") -> None:
 # ──────────────────────────────────────────────
 
 def run_ensemble(test_year: int = 2025, output: Optional[str] = None) -> None:
+    from datetime import datetime
     from ensemble_validator import run_validation, _report_to_markdown, REPORT_DIR
-    from pathlib import Path as _Path
-    import json as _json
-    from datetime import datetime as _datetime
 
     csv_path = TRAINING_CSV if Path(TRAINING_CSV).exists() else "keiba_training_data.csv"
 
@@ -230,8 +228,8 @@ def run_ensemble(test_year: int = 2025, output: Optional[str] = None) -> None:
     report = run_validation(df, test_year=test_year)
 
     if output is None:
-        _Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
-        date_str = _datetime.now().strftime("%Y-%m-%d")
+        Path(REPORT_DIR).mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime("%Y-%m-%d")
         output = f"{REPORT_DIR}/ensemble_report_{date_str}.md"
 
     md = _report_to_markdown(report)
