@@ -22,10 +22,101 @@ STATUS_LABEL: Dict[str, str] = {
     "result":   "✅ 結果済み",
 }
 
+# 印と色
+_MARKS = ["◎", "○", "▲"]
+_MARK_COLORS = {"◎": "#e74c3c", "○": "#e67e22", "▲": "#27ae60"}
+
 
 # ──────────────────────────────────────────────────────────────
 # 共通ウィジェット
 # ──────────────────────────────────────────────────────────────
+def _render_race_summary(race: Dict) -> None:
+    """レースカードの常時表示サマリー行を HTML で描画する。"""
+    venue      = race.get("venue") or ""
+    r_num      = race.get("race_number") or ""
+    start_time = race.get("start_time") or "??:??"
+    status     = race.get("status", "prerace")
+
+    # ── ステータスバッジ ──
+    if status == "result" and race.get("outcomes"):
+        any_hit = any(o.get("hit") for o in race["outcomes"])
+        if any_hit:
+            status_html = (
+                '<span style="background:#1d6a27;color:#6fcf97;font-size:11px;'
+                'padding:2px 8px;border-radius:10px">✅ 的中</span>'
+            )
+        else:
+            status_html = (
+                '<span style="background:#4a1a1a;color:#e57373;font-size:11px;'
+                'padding:2px 8px;border-radius:10px">❌ 外れ</span>'
+            )
+    elif status == "awaiting":
+        status_html = (
+            '<span style="background:#4a3f00;color:#f1c40f;font-size:11px;'
+            'padding:2px 8px;border-radius:10px">⏳ 集計待ち</span>'
+        )
+    else:
+        status_html = (
+            '<span style="background:#1a3a5c;color:#7fb3d3;font-size:11px;'
+            'padding:2px 8px;border-radius:10px">🕐 発走前</span>'
+        )
+
+    # ── 上位3頭の印 ──
+    marks_parts = []
+    for i, h in enumerate(race.get("horses", [])[:3]):
+        mark  = _MARKS[i]
+        color = _MARK_COLORS[mark]
+        prob  = h.get("ai_win_prob")
+        pstr  = f"{prob * 100:.1f}%" if prob is not None else "-"
+        name  = h.get("horse_name", "")
+        marks_parts.append(
+            f'<span style="color:{color};font-size:12px;margin-right:10px">'
+            f'{mark} {name} <b>{pstr}</b></span>'
+        )
+    marks_html = "".join(marks_parts)
+
+    # ── 荒れスコアバッジ ──
+    upset_label = race.get("upset_label", "")
+    upset_color = race.get("upset_color", "#ff9800")
+    upset_score = race.get("upset_score", "")
+    upset_html = (
+        f'<span style="background:{upset_color};color:#fff;font-size:11px;'
+        f'padding:2px 8px;border-radius:10px">{upset_label} {upset_score}</span>'
+    )
+
+    # ── 激熱バッジ ──
+    hot_bets = race.get("hot_bets") or []
+    hot_html = ""
+    if hot_bets:
+        hot_html = (
+            f'<span style="background:#c0392b;color:#fff;font-size:11px;'
+            f'padding:2px 8px;border-radius:10px;margin-left:4px">🔥 {len(hot_bets)}件</span>'
+        )
+
+    html = f"""
+<div style="background:#16213e;border-radius:6px;padding:10px 14px;
+            margin-bottom:2px;display:flex;align-items:center;gap:10px;
+            font-family:sans-serif;">
+  <div style="background:#293174;color:#fff;font-size:13px;font-weight:bold;
+              width:40px;height:40px;border-radius:6px;display:flex;
+              align-items:center;justify-content:center;flex-shrink:0;">{r_num}</div>
+  <div style="flex:1;min-width:0;">
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">
+      <span style="color:#e0e0e0;font-weight:bold;font-size:13px">{venue}</span>
+      <span style="color:#888;font-size:12px">{start_time}発走</span>
+      {status_html}
+    </div>
+    <div>{marks_html}</div>
+  </div>
+  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">
+    {hot_html}
+    {upset_html}
+  </div>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _render_kpi(kpi: Dict) -> None:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("投資額",   f"¥{kpi['total_stake']:,}")
@@ -45,29 +136,15 @@ def _render_bet_type_table(races: List[Dict]) -> None:
 
 
 def _render_race_cards(races: List[Dict]) -> None:
-    from confidence_scorer import compute_race_confidence
     for race in races:
-        venue      = race["venue"]
-        r_num      = race["race_number"]
-        start_time = race["start_time"] or "??:??"
-        status_lbl = STATUS_LABEL.get(race["status"], race["status"])
-        if race["status"] == "result" and race["outcomes"]:
-            any_hit   = any(o.get("hit") for o in race["outcomes"])
-            hit_lbl   = "  ✅ 的中" if any_hit else "  ❌ 外れ"
-        else:
-            hit_lbl = ""
-        conf = compute_race_confidence(race.get("horses") or [])
-        if conf >= 0.7:
-            conf_lbl = f"  🔥{conf:.2f}"
-        elif conf >= 0.55:
-            conf_lbl = f"  ⭐{conf:.2f}"
-        else:
-            conf_lbl = ""
-        label = f"🏇 {venue}{r_num}  {start_time}発走  {status_lbl}{hit_lbl}{conf_lbl}"
+        # ── 常時表示サマリー行 ──
+        _render_race_summary(race)
 
-        with st.expander(label, expanded=False):
-            # 買い目 + 結果を統合テーブルで表示
-            bets = race["bets"]
+        # ── 折りたたみ詳細 ──
+        venue = race.get("venue") or ""
+        r_num = race.get("race_number") or ""
+        with st.expander(f"▼ {venue}{r_num} 詳細を開く", expanded=False):
+            bets     = race["bets"]
             outcomes = race["outcomes"]
             outcome_map = {
                 (o.get("bet_type", ""), "・".join(o.get("bet_combination") or [])): o
@@ -84,19 +161,18 @@ def _render_race_cards(races: List[Dict]) -> None:
                     stake      = b.get("stake_amount", 100)
                     o = outcome_map.get((b.get("bet_type", ""), combo_str))
                     if o is not None:
-                        hit     = o.get("hit", False)
-                        payout  = o.get("payout", 0)
-                        hit_str    = "✅" if hit else "❌"
-                        payout_str = f"¥{payout:,}" if hit else "-"
+                        hit_str    = "✅" if o.get("hit") else "❌"
+                        payout     = o.get("payout", 0)
+                        payout_str = f"¥{payout:,}" if o.get("hit") else "-"
                     else:
                         hit_str    = "-"
                         payout_str = "-"
                     rows.append({
-                        "券種":   bet_label,
+                        "券種":       bet_label,
                         "組み合わせ": combo_str,
-                        "投資":   f"¥{stake}",
-                        "的中":   hit_str,
-                        "払戻":   payout_str,
+                        "投資":       f"¥{stake}",
+                        "的中":       hit_str,
+                        "払戻":       payout_str,
                     })
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             else:
@@ -122,15 +198,13 @@ def _render_race_cards(races: List[Dict]) -> None:
                 st.markdown("**馬別AI予測**")
                 rows = []
                 for h in horses:
-                    rows.append(
-                        {
-                            "馬名":   h["horse_name"],
-                            "AI勝率": f"{h['ai_win_prob'] * 100:.1f}%" if h["ai_win_prob"] is not None else "-",
-                            "オッズ": f"{h['win_odds']:.1f}" if h["win_odds"] is not None else "未取得",
-                            "人気":   str(h["popularity"]) if h["popularity"] is not None else "未取得",
-                            "脚質":   h["running_style"] or "未取得",
-                        }
-                    )
+                    rows.append({
+                        "馬名":   h["horse_name"],
+                        "AI勝率": f"{h['ai_win_prob'] * 100:.1f}%" if h["ai_win_prob"] is not None else "-",
+                        "オッズ": f"{h['win_odds']:.1f}" if h["win_odds"] is not None else "未取得",
+                        "人気":   str(h["popularity"]) if h["popularity"] is not None else "未取得",
+                        "脚質":   h["running_style"] or "未取得",
+                    })
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
