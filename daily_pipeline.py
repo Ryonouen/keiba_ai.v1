@@ -131,6 +131,14 @@ def generate_all_bets(race_id: str, plans: List[Dict[str, Any]]) -> List[Dict[st
         confidence = float(plan.get("confidence_score") or 0.0)
         reason     = str(plan.get("reason") or "")
 
+        # 単勝EVは plan に _horse_win_prob / _horse_win_odds が付いている場合のみ計算
+        _win_prob = plan.get("_horse_win_prob")
+        _win_odds = plan.get("_horse_win_odds")
+        if bet_type_raw == "単勝" and _win_prob and _win_odds:
+            _ev = round(float(_win_prob) * float(_win_odds) - 1.0, 4)
+        else:
+            _ev = None
+
         for ticket in tickets:
             combo = ticket.get("combination") or []
             stake = int(ticket.get("stake") or 100)
@@ -141,10 +149,21 @@ def generate_all_bets(race_id: str, plans: List[Dict[str, Any]]) -> List[Dict[st
                 "stake_amount":       stake,
                 "selection_reason":   reason,
                 "confidence":         round(confidence, 4),
-                "expected_value":     None,   # 将来拡張用
-                "implied_probability": None,  # 将来拡張用
+                "expected_value":     _ev,
+                "implied_probability": None,
             })
-    return result
+
+    # 同一券種・同一組み合わせの重複排除
+    # sanrenpuku_ai/sanrenpuku_all など実際に同じ馬券になるものを DIVIDEND_KEY_MAP で正規化
+    seen: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for b in result:
+        actual_type = DIVIDEND_KEY_MAP.get(b["bet_type"], b["bet_type"])
+        key = (actual_type, tuple(b["bet_combination"]))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(b)
+    return deduped
 
 
 def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:

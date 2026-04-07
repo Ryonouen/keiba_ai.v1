@@ -314,3 +314,35 @@ def test_run_daily_saves_v2_fields(tmp_path, monkeypatch):
     assert pred.get("horse_number_map") == {"1": "テスト馬A"}
     assert pred["horses"][0]["feature_dict"]["feat_gate"] == 1
     assert pred["prediction_version"] == 1
+
+
+def test_generate_all_bets_tansho_ev_filled():
+    """単勝のbetに expected_value が計算されること"""
+    from daily_pipeline import generate_all_bets
+    plans = [{
+        "bet_type": "単勝",
+        "confidence_score": 0.8,
+        "reason": "test",
+        "tickets": [{"combination": ["ホワイトホース"], "stake": 100}],
+        "_horse_win_prob": 0.25,
+        "_horse_win_odds": 4.0,
+    }]
+    bets = generate_all_bets("race_001", plans)
+    assert len(bets) == 1
+    ev = bets[0].get("expected_value")
+    # EV = 0.25 * 4.0 - 1 = 0.0
+    assert ev is not None
+    assert abs(ev - 0.0) < 0.01
+
+def test_generate_all_bets_non_tansho_ev_none():
+    """単勝以外のbetはexpected_valueがNoneのまま"""
+    from daily_pipeline import generate_all_bets
+    plans = [{
+        "bet_type": "馬連（流し）",
+        "confidence_score": 0.6,
+        "reason": "test",
+        "tickets": [{"combination": ["A", "B"], "stake": 100}],
+    }]
+    bets = generate_all_bets("race_001", plans)
+    assert len(bets) == 1
+    assert bets[0]["expected_value"] is None
