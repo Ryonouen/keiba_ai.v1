@@ -6,6 +6,7 @@ Streamlit に非依存。pipeline_*.json を読み取り専用で参照する。
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections import defaultdict
@@ -105,8 +106,6 @@ def calc_upset_score(horses: List[Dict]) -> Dict[str, Any]:
     -------
     {"score": int, "label": str, "color": str}
     """
-    import math
-
     probs = [float(h.get("ai_win_prob") or 0.0) for h in horses]
     probs = [p for p in probs if p > 0.0]
 
