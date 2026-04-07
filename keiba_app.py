@@ -219,6 +219,39 @@ def _tab_history() -> None:
 # エントリポイント
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="競馬AI ダッシュボード", layout="wide")
+
+# ──────────────────────────────────────────────────────────────
+# サイドバー: Kelly 基準設定
+# ──────────────────────────────────────────────────────────────
+from kelly_staking import load_kelly_config, save_kelly_config
+
+_kcfg = load_kelly_config()
+
+with st.sidebar:
+    st.header("⚙️ 設定")
+    st.subheader("ケリー基準")
+    kelly_enabled = st.checkbox("ケリー基準で賭け金を自動調整", value=bool(_kcfg.get("enabled")))
+    kelly_bankroll = st.number_input(
+        "バンクロール（円）",
+        min_value=1000,
+        max_value=1_000_000,
+        value=int(_kcfg.get("bankroll") or 10_000),
+        step=1000,
+    )
+    kelly_fraction = st.select_slider(
+        "ケリー係数（フルケリーに対する割合）",
+        options=[0.1, 0.25, 0.5, 1.0],
+        value=float(_kcfg.get("fraction") or 0.25),
+        format_func=lambda v: f"{int(v*100)}%",
+    )
+    if st.button("設定を保存"):
+        save_kelly_config({
+            "enabled": kelly_enabled,
+            "bankroll": int(kelly_bankroll),
+            "fraction": float(kelly_fraction),
+        })
+        st.success("保存しました。次回の --analyze 実行から適用されます。")
+
 st.title("🏇 競馬AI パイプライン ダッシュボード")
 
 tab_today, tab_history = st.tabs(["📅 当日", "📊 履歴"])
