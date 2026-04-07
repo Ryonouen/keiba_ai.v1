@@ -142,6 +142,31 @@ def calc_upset_score(horses: List[Dict]) -> Dict[str, Any]:
     return {"score": score, "label": "荒れ", "color": "#c0392b"}
 
 
+def calc_hot_bets(bets: List[Dict]) -> List[Dict]:
+    """
+    confidence >= 0.75 かつ expected_value > 1.1（None は条件スキップ）
+    の買い目リストを返す。
+
+    Parameters
+    ----------
+    bets : pipeline_bet_suggestions.json から読んだ買い目リスト
+
+    Returns
+    -------
+    条件を満たした bet dict のリスト
+    """
+    result: List[Dict] = []
+    for bet in bets:
+        conf = float(bet.get("confidence") or 0.0)
+        if conf < 0.75:
+            continue
+        ev = bet.get("expected_value")
+        if ev is not None and float(ev) <= 1.1:
+            continue
+        result.append(bet)
+    return result
+
+
 def get_available_dates() -> List[str]:
     """
     pipeline_predictions.json に存在する analysis_date の一覧を降順で返す。

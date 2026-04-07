@@ -249,3 +249,25 @@ def test_upset_score_no_odds():
     assert 0 <= result["score"] <= 100
     assert result["label"] in ("堅い", "やや堅い", "中間", "やや荒れ", "荒れ")
     assert result["color"].startswith("#")
+
+
+# ── Task 2: calc_hot_bets ─────────────────────────────────────
+
+def test_hot_bets_threshold():
+    """confidence 0.74 → 激熱なし / 0.75 → 激熱あり（境界値）"""
+    bet_below = [{"bet_type": "tansho", "confidence": 0.74, "expected_value": None}]
+    bet_at    = [{"bet_type": "tansho", "confidence": 0.75, "expected_value": None}]
+    assert dl.calc_hot_bets(bet_below) == []
+    assert len(dl.calc_hot_bets(bet_at)) == 1
+
+
+def test_hot_bets_ev_filter():
+    """confidence >= 0.75 でも expected_value <= 1.1 なら除外"""
+    bets = [{"bet_type": "tansho", "confidence": 0.80, "expected_value": 1.05}]
+    assert dl.calc_hot_bets(bets) == []
+
+
+def test_hot_bets_ev_none_passes():
+    """expected_value が None なら EV 条件をスキップして通過"""
+    bets = [{"bet_type": "tansho", "confidence": 0.80, "expected_value": None}]
+    assert len(dl.calc_hot_bets(bets)) == 1
