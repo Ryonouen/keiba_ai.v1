@@ -45,29 +45,64 @@ def _render_bet_type_table(races: List[Dict]) -> None:
 
 
 def _render_race_cards(races: List[Dict]) -> None:
+    from confidence_scorer import compute_race_confidence
     for race in races:
         venue      = race["venue"]
         r_num      = race["race_number"]
         start_time = race["start_time"] or "??:??"
         status_lbl = STATUS_LABEL.get(race["status"], race["status"])
-        label      = f"🏇 {venue}{r_num}  {start_time}発走  {status_lbl}"
+        if race["status"] == "result" and race["outcomes"]:
+            any_hit   = any(o.get("hit") for o in race["outcomes"])
+            hit_lbl   = "  ✅ 的中" if any_hit else "  ❌ 外れ"
+        else:
+            hit_lbl = ""
+        conf = compute_race_confidence(race.get("horses") or [])
+        if conf >= 0.7:
+            conf_lbl = f"  🔥{conf:.2f}"
+        elif conf >= 0.55:
+            conf_lbl = f"  ⭐{conf:.2f}"
+        else:
+            conf_lbl = ""
+        label = f"🏇 {venue}{r_num}  {start_time}発走  {status_lbl}{hit_lbl}{conf_lbl}"
 
         with st.expander(label, expanded=False):
-            # 買い目
+            # 買い目 + 結果を統合テーブルで表示
             bets = race["bets"]
+            outcomes = race["outcomes"]
+            outcome_map = {
+                (o.get("bet_type", ""), "・".join(o.get("bet_combination") or [])): o
+                for o in outcomes
+            } if outcomes else {}
+
             if bets:
                 st.markdown("**買い目**")
-                parts = []
+                rows = []
                 for b in bets:
-                    combo = "・".join(b.get("bet_combination") or [])
-                    stake = b.get("stake_amount", 100)
-                    parts.append(f"{b.get('bet_type_label', '')} {combo} ¥{stake}")
-                st.caption("  |  ".join(parts))
+                    combo_list = b.get("bet_combination") or []
+                    combo_str  = "・".join(combo_list)
+                    label      = b.get("bet_type_label", "")
+                    stake      = b.get("stake_amount", 100)
+                    o = outcome_map.get((b.get("bet_type", ""), combo_str))
+                    if o is not None:
+                        hit     = o.get("hit", False)
+                        payout  = o.get("payout", 0)
+                        hit_str    = "✅" if hit else "❌"
+                        payout_str = f"¥{payout:,}" if hit else "-"
+                    else:
+                        hit_str    = "-"
+                        payout_str = "-"
+                    rows.append({
+                        "券種":   label,
+                        "組み合わせ": combo_str,
+                        "投資":   f"¥{stake}",
+                        "的中":   hit_str,
+                        "払戻":   payout_str,
+                    })
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
             else:
                 st.caption("買い目なし")
 
-            # 結果
-            outcomes = race["outcomes"]
+            # 結果サマリー
             if race["status"] == "result" and outcomes:
                 total_stake  = sum(o.get("stake", 100) for o in outcomes)
                 total_payout = sum(o.get("payout", 0) for o in outcomes)
