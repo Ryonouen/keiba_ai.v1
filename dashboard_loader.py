@@ -48,7 +48,22 @@ def _parse_venue_race_number(race_name: str) -> Tuple[str, str]:
     return "", ""
 
 
-_GRADE_PATTERN = re.compile(r"^(.+?)\s*出馬表")
+_TITLE_PATTERN = re.compile(r"^(.+?)\s*出馬表")
+
+
+def _extract_race_title(race_name: str) -> str:
+    """
+    race_name からレースカテゴリ名を抽出する。
+    例: "天満橋S・3勝 出馬表 | ..." → "天満橋S・3勝"
+         "大阪杯(G1) 出馬表 | ..."  → "大阪杯(G1)"
+    """
+    if not race_name:
+        return ""
+    m = _TITLE_PATTERN.match(race_name)
+    return m.group(1).strip() if m else ""
+
+
+_GRADE_PATTERN = _TITLE_PATTERN  # 同じパターンを共有
 
 
 def _extract_grade_title(race_name: str) -> Optional[str]:
@@ -111,20 +126,17 @@ def _build_horse_row(horse: Dict) -> Dict:
     }
 
 
-def _enrich_horses_from_result(race_id: str, horses: List[Dict]) -> None:
+def _enrich_horses_from_result_dict(race_result: Dict, horses: List[Dict]) -> None:
     """
-    pipeline_race_results.json から騎手・馬番・枠番・実際の着順を horses に付与する（in-place）。
-    データが存在しない場合は何もしない。
+    race_result dict（pipeline_race_results.json の 1 レース分）から
+    騎手・馬番・枠番・実際の着順を horses に付与する（in-place）。
+    race_result が空 dict の場合は何もしない。
     """
-    results = _load_json(_RACE_RESULTS_FILE)
-    race_result = results.get(str(race_id))
     if not race_result:
         return
-
     runner_map = {r["horse_name"]: r for r in (race_result.get("runners") or [])}
     finish_order = race_result.get("finish_order") or []
     finish_rank_map = {name: i + 1 for i, name in enumerate(finish_order)}
-
     for h in horses:
         name = h.get("horse_name", "")
         runner = runner_map.get(name, {})
@@ -132,6 +144,12 @@ def _enrich_horses_from_result(race_id: str, horses: List[Dict]) -> None:
         h["gate"]        = runner.get("gate")
         h["jockey"]      = runner.get("jockey")
         h["actual_rank"] = finish_rank_map.get(name)
+
+
+def _enrich_horses_from_result(race_id: str, horses: List[Dict]) -> None:
+    """後方互換ラッパー。テスト等から直接呼ばれる場合向け。"""
+    results = _load_json(_RACE_RESULTS_FILE)
+    _enrich_horses_from_result_dict(results.get(str(race_id), {}), horses)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -243,6 +261,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
     preds    = _load_json(_PREDICTIONS_FILE)
     bets_all = _load_json(_BET_SUGGESTIONS_FILE)
     outs_all = _load_json(_BET_OUTCOMES_FILE)
+    rr_all   = _load_json(_RACE_RESULTS_FILE)   # 1回だけ読む
 
     races: List[Dict] = []
     for race_id, pred in preds.items():
@@ -257,7 +276,9 @@ def load_races_for_date(date_str: str) -> List[Dict]:
         bets          = bets_all.get(race_id) or []
         horses        = [_build_horse_row(h) for h in (pred.get("horses") or [])]
         horses.sort(key=lambda h: -(h["ai_win_prob"] or 0))
-        _enrich_horses_from_result(race_id, horses)
+
+        race_result = rr_all.get(str(race_id), {})
+        _enrich_horses_from_result_dict(race_result, horses)
 
         upset = calc_upset_score(horses)
         hot   = calc_hot_bets(bets)
@@ -266,6 +287,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
             {
                 "race_id":        race_id,
                 "race_name":      race_name,
+                "race_title":     _extract_race_title(race_name),
                 "grade_title":    _extract_grade_title(race_name),
                 "venue":          venue,
                 "race_number":    r_num,
@@ -279,6 +301,9 @@ def load_races_for_date(date_str: str) -> List[Dict]:
                 "upset_label":    upset["label"],
                 "upset_color":    upset["color"],
                 "hot_bets":       hot,
+                "distance":       race_result.get("distance"),
+                "surface":        race_result.get("surface"),
+                "n_runners":      len(race_result.get("runners") or []) or None,
             }
         )
 

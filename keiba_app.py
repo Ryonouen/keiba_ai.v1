@@ -22,111 +22,163 @@ STATUS_LABEL: Dict[str, str] = {
     "result":   "✅ 結果済み",
 }
 
-# 印と色
-_MARKS = ["◎", "○", "▲"]
-_MARK_COLORS = {"◎": "#e74c3c", "○": "#e67e22", "▲": "#27ae60"}
-
 
 # ──────────────────────────────────────────────────────────────
 # 共通ウィジェット
 # ──────────────────────────────────────────────────────────────
 def _render_race_summary(race: Dict) -> None:
-    """レースカードの常時表示サマリー行を HTML で描画する。"""
+    """レースカードを競合他社スタイルで描画: ヘッダー＋トップ3馬インライン行。"""
     venue      = race.get("venue") or ""
     r_num      = race.get("race_number") or ""
     start_time = race.get("start_time") or "??:??"
     status     = race.get("status", "prerace")
+    race_title = race.get("race_title") or ""
+    distance   = race.get("distance")
+    surface    = race.get("surface") or ""
+    n_runners  = race.get("n_runners")
 
     # ── ステータスバッジ ──
     if status == "result" and race.get("outcomes"):
         any_hit = any(o.get("hit") for o in race["outcomes"])
         if any_hit:
             status_html = (
-                '<span style="background:#1d6a27;color:#6fcf97;font-size:11px;'
-                'padding:2px 8px;border-radius:10px">✅ 的中</span>'
+                '<span style="background:#1d6a27;color:#6fcf97;font-size:10px;'
+                'padding:2px 7px;border-radius:8px">✅ 的中</span>'
             )
         else:
             status_html = (
-                '<span style="background:#4a1a1a;color:#e57373;font-size:11px;'
-                'padding:2px 8px;border-radius:10px">❌ 外れ</span>'
+                '<span style="background:#4a1a1a;color:#e57373;font-size:10px;'
+                'padding:2px 7px;border-radius:8px">❌ 外れ</span>'
             )
     elif status == "awaiting":
         status_html = (
-            '<span style="background:#4a3f00;color:#f1c40f;font-size:11px;'
-            'padding:2px 8px;border-radius:10px">⏳ 集計待ち</span>'
+            '<span style="background:#4a3f00;color:#f1c40f;font-size:10px;'
+            'padding:2px 7px;border-radius:8px">⏳ 集計待ち</span>'
         )
     else:
         status_html = (
-            '<span style="background:#1a3a5c;color:#7fb3d3;font-size:11px;'
-            'padding:2px 8px;border-radius:10px">🕐 発走前</span>'
+            '<span style="background:#1a3a5c;color:#7fb3d3;font-size:10px;'
+            'padding:2px 7px;border-radius:8px">🕐 発走前</span>'
         )
 
-    # ── 上位3頭の印 ──
-    marks_parts = []
-    for i, h in enumerate(race.get("horses", [])[:3]):
-        mark  = _MARKS[i]
-        color = _MARK_COLORS[mark]
-        prob  = h.get("ai_win_prob")
-        pstr  = f"{prob * 100:.1f}%" if prob is not None else "-"
-        name  = h.get("horse_name", "")
-        marks_parts.append(
-            f'<span style="color:{color};font-size:12px;margin-right:10px">'
-            f'{mark} {name} <b>{pstr}</b></span>'
-        )
-    marks_html = "".join(marks_parts)
-
-    # ── 荒れスコアバッジ ──
+    # ── 荒れスコア・激熱バッジ ──
     upset_label = race.get("upset_label", "")
     upset_color = race.get("upset_color", "#ff9800")
     upset_score = race.get("upset_score", "")
-    upset_html = (
-        f'<span style="background:{upset_color};color:#fff;font-size:11px;'
-        f'padding:2px 8px;border-radius:10px">{upset_label} {upset_score}</span>'
+    upset_html  = (
+        f'<span style="background:{upset_color};color:#fff;font-size:10px;'
+        f'padding:2px 7px;border-radius:8px">{upset_label} {upset_score}</span>'
+    )
+    hot_bets = race.get("hot_bets") or []
+    hot_html = (
+        f'<span style="background:#c0392b;color:#fff;font-size:10px;'
+        f'padding:2px 7px;border-radius:8px">🔥 {len(hot_bets)}件</span>'
+        if hot_bets else ""
     )
 
-    # ── 激熱バッジ ──
-    hot_bets = race.get("hot_bets") or []
-    hot_html = ""
-    if hot_bets:
-        hot_html = (
-            f'<span style="background:#c0392b;color:#fff;font-size:11px;'
-            f'padding:2px 8px;border-radius:10px;margin-left:4px">🔥 {len(hot_bets)}件</span>'
-        )
-
-    # ── 重賞バッジ ──
+    # ── 重賞グレードバッジ ──
     grade_title = race.get("grade_title")
     if grade_title:
-        if "G1" in grade_title or "Ｇ１" in grade_title:
-            grade_color = "#d4af37"   # gold
-        elif "G2" in grade_title or "Ｇ２" in grade_title:
-            grade_color = "#aaa9ad"   # silver
-        else:
-            grade_color = "#cd7f32"   # bronze (G3)
-        grade_html = (
-            f'<span style="background:{grade_color};color:#000;font-size:11px;'
-            f'font-weight:bold;padding:2px 8px;border-radius:10px;margin-right:4px">'
-            f'🏆 {grade_title}</span>'
+        gc = ("#d4af37" if "G1" in grade_title or "Ｇ１" in grade_title
+              else "#aaa9ad" if "G2" in grade_title or "Ｇ２" in grade_title
+              else "#cd7f32")
+        grade_badge = (
+            f'<span style="background:{gc};color:#000;font-size:10px;font-weight:bold;'
+            f'padding:2px 7px;border-radius:8px;margin-right:4px">🏆 {grade_title}</span>'
         )
     else:
-        grade_html = ""
+        grade_badge = ""
+
+    # ── レースメタ情報行 ──
+    meta_parts = [start_time]
+    if distance:
+        surf = "芝" if surface == "芝" else "ダ" if "ダ" in surface else surface
+        meta_parts.append(f"{surf}{distance}m")
+    if n_runners:
+        meta_parts.append(f"{n_runners}頭")
+    meta_html = '<span style="color:#666;font-size:11px">' + " / ".join(meta_parts) + "</span>"
+
+    # ── 表示するタイトル (grade_title があれば grade_title、なければ race_title) ──
+    display_title = grade_title or race_title
+    title_part = (
+        f'<span style="color:#e0e0e0;font-weight:bold;font-size:14px">'
+        f'{venue}{r_num}'
+        f'{"　" + display_title if display_title else ""}'
+        f'</span>'
+    )
+
+    # ── トップ3馬インライン行 ──
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}
+    actual_row_bg = {
+        1: "rgba(231,76,60,0.15)",
+        2: "rgba(52,152,219,0.10)",
+        3: "rgba(149,117,205,0.08)",
+    }
+    ai_rank_color = {1: "#e74c3c", 2: "#e67e22", 3: "#27ae60"}
+
+    horse_rows = []
+    for ai_rank, h in enumerate(race.get("horses", [])[:3], 1):
+        name     = h.get("horse_name", "")
+        horse_no = h.get("horse_no")
+        win_prob = h.get("ai_win_prob")
+        actual   = h.get("actual_rank") if status == "result" else None
+
+        row_bg   = actual_row_bg.get(actual, "transparent") if actual else "transparent"
+        ai_color = ai_rank_color.get(ai_rank, "#555")
+
+        # 馬番バッジ
+        no_badge = (
+            f'<span style="background:#1e2a4a;color:#7fb3d3;padding:1px 5px;'
+            f'border-radius:3px;font-size:11px;font-weight:bold">{horse_no}</span> '
+            if horse_no is not None else ""
+        )
+
+        # 結果セル
+        if actual is not None:
+            if actual <= 3:
+                result_html = f'<span style="font-size:12px">{medal[actual]} {actual}着</span>'
+            else:
+                result_html = f'<span style="color:#666;font-size:11px">{actual}着</span>'
+        else:
+            result_html = ""
+
+        prob_str = f'<span style="color:#7fb3d3;font-size:11px">{win_prob*100:.1f}%</span>' if win_prob else ""
+
+        horse_rows.append(
+            f'<div style="display:flex;align-items:center;gap:6px;padding:4px 0;'
+            f'border-top:1px solid #1e2533;background:{row_bg}">'
+            f'<span style="color:{ai_color};font-size:11px;font-weight:bold;min-width:14px">{ai_rank}.</span>'
+            f'{no_badge}'
+            f'<span style="color:#d0d0d0;font-size:12px;flex:1;overflow:hidden;'
+            f'text-overflow:ellipsis;white-space:nowrap">{name}</span>'
+            f'{prob_str}'
+            f'<span style="min-width:50px;text-align:right">{result_html}</span>'
+            f'</div>'
+        )
+    horse_rows_html = "".join(horse_rows)
 
     html = (
-        f'<div style="background:#16213e;border-radius:6px;padding:10px 14px;'
-        f'margin-bottom:2px;display:flex;align-items:center;gap:10px;font-family:sans-serif;">'
-        f'<div style="background:#293174;color:#fff;font-size:13px;font-weight:bold;'
-        f'width:40px;height:40px;border-radius:6px;display:flex;'
-        f'align-items:center;justify-content:center;flex-shrink:0;">{r_num}</div>'
-        f'<div style="flex:1;min-width:0;">'
-        f'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">'
-        f'{grade_html}'
-        f'<span style="color:#e0e0e0;font-weight:bold;font-size:13px">{venue}</span>'
-        f'<span style="color:#888;font-size:12px">{start_time}発走</span>'
-        f'{status_html}'
+        f'<div style="background:#16213e;border-radius:8px;padding:10px 14px;'
+        f'margin-bottom:3px;font-family:sans-serif">'
+        # ヘッダー行
+        f'<div style="display:flex;align-items:flex-start;gap:10px">'
+        # 左: レース番号バッジ
+        f'<div style="background:#293174;color:#fff;font-size:14px;font-weight:bold;'
+        f'min-width:42px;height:42px;border-radius:6px;display:flex;align-items:center;'
+        f'justify-content:center;flex-shrink:0">{r_num}</div>'
+        # 中央: タイトル＋メタ＋馬列
+        f'<div style="flex:1;min-width:0">'
+        f'<div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-bottom:2px">'
+        f'{grade_badge}{title_part}{status_html}'
         f'</div>'
-        f'<div>{marks_html}</div>'
+        f'<div style="margin-bottom:4px">{meta_html}</div>'
+        f'{horse_rows_html}'
         f'</div>'
-        f'<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;">'
+        # 右: 激熱＋荒れ
+        f'<div style="display:flex;flex-direction:column;align-items:flex-end;'
+        f'gap:4px;flex-shrink:0;padding-top:2px">'
         f'{hot_html}{upset_html}'
+        f'</div>'
         f'</div>'
         f'</div>'
     )
