@@ -18,6 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PREDICTIONS_FILE     = os.path.join(_HERE, "pipeline_predictions.json")
 _BET_SUGGESTIONS_FILE = os.path.join(_HERE, "pipeline_bet_suggestions.json")
 _BET_OUTCOMES_FILE    = os.path.join(_HERE, "pipeline_bet_outcomes.json")
+_RACE_RESULTS_FILE    = os.path.join(_HERE, "pipeline_race_results.json")
 
 # running_style（英語キー）→ 日本語表示
 STYLE_MAP: Dict[str, str] = {
@@ -102,7 +103,35 @@ def _build_horse_row(horse: Dict) -> Dict:
         "win_odds":      win_odds_raw,
         "popularity":    int(popularity_raw) if popularity_raw is not None else None,
         "running_style": STYLE_MAP.get(running_style_raw or "", None),
+        # enriched fields (filled by _enrich_horses_from_result)
+        "horse_no":      None,
+        "gate":          None,
+        "jockey":        None,
+        "actual_rank":   None,
     }
+
+
+def _enrich_horses_from_result(race_id: str, horses: List[Dict]) -> None:
+    """
+    pipeline_race_results.json から騎手・馬番・枠番・実際の着順を horses に付与する（in-place）。
+    データが存在しない場合は何もしない。
+    """
+    results = _load_json(_RACE_RESULTS_FILE)
+    race_result = results.get(str(race_id))
+    if not race_result:
+        return
+
+    runner_map = {r["horse_name"]: r for r in (race_result.get("runners") or [])}
+    finish_order = race_result.get("finish_order") or []
+    finish_rank_map = {name: i + 1 for i, name in enumerate(finish_order)}
+
+    for h in horses:
+        name = h.get("horse_name", "")
+        runner = runner_map.get(name, {})
+        h["horse_no"]    = runner.get("horse_no")
+        h["gate"]        = runner.get("gate")
+        h["jockey"]      = runner.get("jockey")
+        h["actual_rank"] = finish_rank_map.get(name)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -228,6 +257,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
         bets          = bets_all.get(race_id) or []
         horses        = [_build_horse_row(h) for h in (pred.get("horses") or [])]
         horses.sort(key=lambda h: -(h["ai_win_prob"] or 0))
+        _enrich_horses_from_result(race_id, horses)
 
         upset = calc_upset_score(horses)
         hot   = calc_hot_bets(bets)

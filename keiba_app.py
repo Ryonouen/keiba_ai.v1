@@ -151,6 +151,89 @@ def _render_bet_type_table(races: List[Dict]) -> None:
     st.dataframe(df, width="stretch", hide_index=True)
 
 
+def _render_horse_table(horses: List[Dict], status: str) -> None:
+    """
+    AI予測順 vs 実際の着順テーブル。
+    status="result" のとき actual_rank 列を表示しハイライトする。
+    """
+    has_result = status == "result"
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}
+    actual_bg = {
+        1: "rgba(231,76,60,0.20)",
+        2: "rgba(52,152,219,0.14)",
+        3: "rgba(149,117,205,0.12)",
+    }
+    ai_rank_color = {1: "#e74c3c", 2: "#e67e22", 3: "#27ae60"}
+
+    rows_html: list[str] = []
+    for ai_rank, h in enumerate(horses, 1):
+        name      = h.get("horse_name", "")
+        jockey    = h.get("jockey") or ""
+        horse_no  = h.get("horse_no")
+        pop       = h.get("popularity")
+        win_prob  = h.get("ai_win_prob")
+        actual    = h.get("actual_rank") if has_result else None
+
+        # 行背景
+        row_bg = actual_bg.get(actual, "transparent") if actual else "transparent"
+
+        # AI順バッジ
+        ai_bg  = ai_rank_color.get(ai_rank, "#4a4a6a")
+        ai_cell = (
+            f'<span style="background:{ai_bg};color:#fff;padding:2px 8px;'
+            f'border-radius:10px;font-weight:bold;font-size:12px">{ai_rank}</span>'
+        )
+
+        # 着順セル
+        if actual is not None:
+            m = medal.get(actual, "")
+            actual_cell = f'{m} <b>{actual}着</b>'
+        elif has_result:
+            actual_cell = '?'
+        else:
+            actual_cell = '<span style="color:#555">—</span>'
+
+        # 馬番バッジ
+        no_cell = (
+            f'<span style="background:#293174;color:#fff;padding:1px 6px;'
+            f'border-radius:4px;font-size:12px">{horse_no}</span>'
+            if horse_no is not None else '—'
+        )
+
+        prob_str = f'{win_prob * 100:.1f}%' if win_prob is not None else '—'
+        pop_str  = f'{pop}人気' if pop is not None else '—'
+        name_cell = (
+            f'<span style="color:#e0e0e0;font-weight:bold">{name}</span>'
+            + (f'<br><span style="color:#888;font-size:11px">{jockey}</span>' if jockey else '')
+        )
+
+        rows_html.append(
+            f'<tr style="background:{row_bg};border-bottom:1px solid #2a2a3a">'
+            f'<td style="padding:7px 6px;text-align:center">{ai_cell}</td>'
+            f'<td style="padding:7px 6px;text-align:center;white-space:nowrap">{actual_cell}</td>'
+            f'<td style="padding:7px 6px;text-align:center">{no_cell}</td>'
+            f'<td style="padding:7px 6px">{name_cell}</td>'
+            f'<td style="padding:7px 6px;text-align:center;color:#aaa;font-size:12px">{pop_str}</td>'
+            f'<td style="padding:7px 6px;text-align:right;color:#7fb3d3;font-weight:bold">{prob_str}</td>'
+            f'</tr>'
+        )
+
+    table = (
+        '<table style="width:100%;border-collapse:collapse;font-family:sans-serif;font-size:13px">'
+        '<thead><tr style="border-bottom:2px solid #3a3a5a;color:#888;font-size:11px">'
+        '<th style="padding:5px 6px;text-align:center">AI順</th>'
+        '<th style="padding:5px 6px;text-align:center">着順</th>'
+        '<th style="padding:5px 6px;text-align:center">馬番</th>'
+        '<th style="padding:5px 6px;text-align:left">馬名 / 騎手</th>'
+        '<th style="padding:5px 6px;text-align:center">人気</th>'
+        '<th style="padding:5px 6px;text-align:right">AI勝率</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table>'
+    )
+    st.markdown(table, unsafe_allow_html=True)
+
+
 def _render_race_cards(races: List[Dict]) -> None:
     for race in races:
         # ── 常時表示サマリー行 ──
@@ -208,20 +291,11 @@ def _render_race_cards(races: List[Dict]) -> None:
                     f"損益: ¥{profit:+,}  ROI: {roi}%"
                 )
 
-            # 馬別 AI 予測
+            # 馬別 AI 予測 vs 実際の着順
             horses = race["horses"]
             if horses:
-                st.markdown("**馬別AI予測**")
-                rows = []
-                for h in horses:
-                    rows.append({
-                        "馬名":   h["horse_name"],
-                        "AI勝率": f"{h['ai_win_prob'] * 100:.1f}%" if h["ai_win_prob"] is not None else "-",
-                        "オッズ": f"{h['win_odds']:.1f}" if h["win_odds"] is not None else "未取得",
-                        "人気":   str(h["popularity"]) if h["popularity"] is not None else "未取得",
-                        "脚質":   h["running_style"] or "未取得",
-                    })
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                st.markdown("**AI予測 vs 実際の着順**")
+                _render_horse_table(horses, race["status"])
 
 
 # ──────────────────────────────────────────────────────────────
