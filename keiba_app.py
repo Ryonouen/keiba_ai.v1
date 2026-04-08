@@ -321,7 +321,11 @@ def _tab_daily() -> None:
     _render_bet_type_table(races)
 
     st.subheader(f"レース一覧（{len(races)} レース）")
-    _render_race_cards(races)
+    races_by_venue: Dict[str, List[Dict]] = {}
+    for r in races:
+        v = r.get("venue") or "不明"
+        races_by_venue.setdefault(v, []).append(r)
+    _render_races_grouped(races_by_venue)
 
 
 # ──────────────────────────────────────────────────────────────
