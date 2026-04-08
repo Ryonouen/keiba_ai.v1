@@ -10,6 +10,7 @@ import math
 import os
 import re
 from collections import defaultdict
+from datetime import date as _date
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -304,3 +305,47 @@ def calc_kpi_by_bet_type(races: List[Dict]) -> List[Dict]:
         )
     rows.sort(key=lambda r: r["bet_type"])
     return rows
+
+
+def get_races_by_venue(date_str: str) -> Dict[str, List[Dict]]:
+    """
+    load_races_for_date() の結果を競馬場名でグループ化して返す。
+
+    Returns
+    -------
+    {"中山": [...], "阪神": [...]}  発走時刻順を維持。
+    """
+    races = load_races_for_date(date_str)
+    result: Dict[str, List[Dict]] = {}
+    for race in races:
+        venue = race.get("venue") or "不明"
+        result.setdefault(venue, []).append(race)
+    return result
+
+
+def get_weekend_date_strs(_today: Optional[_date] = None) -> Tuple[str, str, str]:
+    """
+    今日・直近土曜・直近日曜の YYYYMMDD 文字列を返す。
+
+    ルール:
+      月〜金 → 次の週末（土/日）
+      土     → 今日（土）+ 明日（日）
+      日     → 昨日（土）+ 今日（日）
+
+    Parameters
+    ----------
+    _today : テスト用の日付注入。省略時は datetime.now().date() を使用。
+    """
+    today = _today if _today is not None else datetime.now().date()
+    wd = today.weekday()  # Mon=0, Tue=1, ..., Sat=5, Sun=6
+    if wd == 5:  # Saturday
+        saturday = today
+        sunday = today + timedelta(days=1)
+    elif wd == 6:  # Sunday
+        saturday = today - timedelta(days=1)
+        sunday = today
+    else:  # Mon–Fri: next weekend
+        saturday = today + timedelta(days=(5 - wd) % 7)
+        sunday = saturday + timedelta(days=1)
+    fmt = lambda d: d.strftime("%Y%m%d")
+    return fmt(today), fmt(saturday), fmt(sunday)

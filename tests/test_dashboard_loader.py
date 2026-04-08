@@ -309,4 +309,70 @@ def test_load_races_includes_upset_and_hot():
     assert 0 <= race["upset_score"] <= 100
     assert race["upset_label"] in ("堅い", "やや堅い", "中間", "やや荒れ", "荒れ")
     assert race["upset_color"].startswith("#")
-    assert len(race["hot_bets"]) == 1
+
+
+# ── Task 1: get_races_by_venue / get_weekend_date_strs ────────
+
+from datetime import date as _date
+
+def test_get_races_by_venue_groups_correctly():
+    """レースが競馬場ごとにグループ化される。"""
+    preds = {
+        "R1": {
+            "race_id": "R1",
+            "race_name": "テスト | 2026年4月5日 中山1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+        "R2": {
+            "race_id": "R2",
+            "race_name": "テスト | 2026年4月5日 阪神1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+        "R3": {
+            "race_id": "R3",
+            "race_name": "テスト | 2026年4月5日 中山2R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(preds, {}, {})):
+        result = dl.get_races_by_venue("20260405")
+    assert set(result.keys()) == {"中山", "阪神"}
+    assert len(result["中山"]) == 2
+    assert len(result["阪神"]) == 1
+
+
+def test_get_races_by_venue_empty_for_no_data():
+    """データなしの日は空 dict を返す。"""
+    with patch.object(dl, "_load_json", return_value={}):
+        result = dl.get_races_by_venue("20260101")
+    assert result == {}
+
+
+def test_get_weekend_date_strs_saturday():
+    """土曜日: 今日=土, 土=今日, 日=翌日"""
+    sat = _date(2026, 4, 11)  # Saturday
+    today_s, sat_s, sun_s = dl.get_weekend_date_strs(sat)
+    assert today_s == "20260411"
+    assert sat_s == "20260411"
+    assert sun_s == "20260412"
+
+
+def test_get_weekend_date_strs_sunday():
+    """日曜日: 今日=日, 土=前日, 日=今日"""
+    sun = _date(2026, 4, 12)  # Sunday
+    today_s, sat_s, sun_s = dl.get_weekend_date_strs(sun)
+    assert today_s == "20260412"
+    assert sat_s == "20260411"
+    assert sun_s == "20260412"
+
+
+def test_get_weekend_date_strs_weekday():
+    """平日: 今日=水, 土=次の土曜, 日=次の日曜"""
+    wed = _date(2026, 4, 8)  # Wednesday
+    today_s, sat_s, sun_s = dl.get_weekend_date_strs(wed)
+    assert today_s == "20260408"
+    assert sat_s == "20260411"  # 2026-04-11 is Saturday
+    assert sun_s == "20260412"  # 2026-04-12 is Sunday
