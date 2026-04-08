@@ -207,33 +207,65 @@ def _render_race_cards(races: List[Dict]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Tab 1「当日」— 60秒自動更新
+# Tab 1「レース分析」— 日付→競馬場の2段サブタブ
 # ──────────────────────────────────────────────────────────────
+def _render_venues_for_date(date_str: str) -> None:
+    """指定日のレースを競馬場ごとのサブタブで表示する。"""
+    races_by_venue = dl.get_races_by_venue(date_str)
+    if not races_by_venue:
+        st.info("この日のデータがありません。")
+        return
+    venue_names = list(races_by_venue.keys())
+    if len(venue_names) == 1:
+        _render_race_cards(races_by_venue[venue_names[0]])
+    else:
+        venue_tabs = st.tabs([f"🏟 {v}" for v in venue_names])
+        for tab, venue in zip(venue_tabs, venue_names):
+            with tab:
+                _render_race_cards(races_by_venue[venue])
+
+
 @st.fragment(run_every=60)
-def _tab_today() -> None:
+def _render_today_live() -> None:
+    """今日タブ: 60秒自動更新。KPI + 券種別 + 競馬場別レース一覧。"""
     today_str = datetime.now().strftime("%Y%m%d")
-    races     = dl.load_races_for_date(today_str)
-
     st.caption(f"最終更新: {datetime.now().strftime('%H:%M:%S')}  （60秒ごとに自動更新）")
-
+    races = dl.load_races_for_date(today_str)
     if not races:
         st.info(
             "本日のレースデータがまだありません。\n"
             "`bash weekend_pipeline.sh` を実行してください。"
         )
         return
-
-    # KPI
     kpi = dl.calc_kpi(races)
     _render_kpi(kpi)
-
-    # 券種別集計
     st.subheader("券種別集計")
     _render_bet_type_table(races)
-
-    # レースカード
     st.subheader(f"レース一覧（{len(races)} レース）")
-    _render_race_cards(races)
+    _render_venues_for_date(today_str)
+
+
+def _tab_race_analysis() -> None:
+    """レース分析タブ: 今日/土/日の日付サブタブ + 競馬場サブタブ。"""
+    today_str, sat_str, sun_str = dl.get_weekend_date_strs()
+    today_dt = datetime.strptime(today_str, "%Y%m%d")
+    sat_dt   = datetime.strptime(sat_str,   "%Y%m%d")
+    sun_dt   = datetime.strptime(sun_str,   "%Y%m%d")
+
+    today_label = f"📅 今日({today_dt.strftime('%-m/%-d')})"
+    sat_label   = f"土({sat_dt.strftime('%-m/%-d')})"
+    sun_label   = f"日({sun_dt.strftime('%-m/%-d')})"
+
+    date_tabs = st.tabs([today_label, sat_label, sun_label])
+
+    with date_tabs[0]:
+        _render_today_live()
+
+    with date_tabs[1]:
+        _render_venues_for_date(sat_str)
+
+    with date_tabs[2]:
+        _render_venues_for_date(sun_str)
 
 
 # ──────────────────────────────────────────────────────────────
