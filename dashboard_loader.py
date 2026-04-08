@@ -349,3 +349,72 @@ def get_weekend_date_strs(_today: Optional[_date] = None) -> Tuple[str, str, str
         sunday = saturday + timedelta(days=1)
     fmt = lambda d: d.strftime("%Y%m%d")
     return fmt(today), fmt(saturday), fmt(sunday)
+
+
+def get_available_months() -> List[str]:
+    """
+    利用可能な年月リストを YYYYMM 形式で降順に返す。
+
+    例: ["202604", "202603", "202512"]
+    """
+    dates = get_available_dates()
+    months = sorted({d[:6] for d in dates if len(d) >= 6}, reverse=True)
+    return months
+
+
+def get_available_years() -> List[str]:
+    """
+    利用可能な年リストを YYYY 形式で降順に返す。
+
+    例: ["2026", "2025"]
+    """
+    dates = get_available_dates()
+    years = sorted({d[:4] for d in dates if len(d) >= 4}, reverse=True)
+    return years
+
+
+def get_daily_kpi_for_month(year: int, month: int) -> List[Dict]:
+    """
+    指定年月の日別KPIリストを返す。total_stake == 0 の日はスキップ。
+
+    Returns
+    -------
+    [{"date": "20260405", "total_stake": int, "total_payout": int,
+      "roi": float, "hit_count": int, "total_bets": int}, ...]
+    昇順（日付順）。
+    """
+    prefix = f"{year:04d}{month:02d}"
+    dates = sorted(d for d in get_available_dates() if d.startswith(prefix))
+    rows: List[Dict] = []
+    for d in dates:
+        races = load_races_for_date(d)
+        kpi = calc_kpi(races)
+        if kpi["total_stake"] > 0:
+            rows.append({"date": d, **kpi})
+    return rows
+
+
+def get_monthly_kpi_for_year(year: int) -> List[Dict]:
+    """
+    指定年の月別KPIリストを返す。total_stake == 0 の月はスキップ。
+
+    Returns
+    -------
+    [{"month": "202604", "total_stake": int, "total_payout": int,
+      "roi": float, "hit_count": int, "total_bets": int}, ...]
+    昇順（月順）。
+    """
+    prefix = f"{year:04d}"
+    months = sorted(m for m in get_available_months() if m.startswith(prefix))
+    rows: List[Dict] = []
+    for m in months:
+        y, mo = int(m[:4]), int(m[4:])
+        date_prefix = f"{y:04d}{mo:02d}"
+        dates = [d for d in get_available_dates() if d.startswith(date_prefix)]
+        all_races: List[Dict] = []
+        for d in dates:
+            all_races.extend(load_races_for_date(d))
+        kpi = calc_kpi(all_races)
+        if kpi["total_stake"] > 0:
+            rows.append({"month": m, **kpi})
+    return rows

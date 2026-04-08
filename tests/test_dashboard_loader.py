@@ -376,3 +376,71 @@ def test_get_weekend_date_strs_weekday():
     assert today_s == "20260408"
     assert sat_s == "20260411"  # 2026-04-11 is Saturday
     assert sun_s == "20260412"  # 2026-04-12 is Sunday
+
+
+# ── Task 2: monthly / yearly aggregations ─────────────────────
+
+def test_get_available_months():
+    """利用可能な月リストが YYYYMM 形式で降順に返る。"""
+    preds = {
+        "A": {"analysis_date": "20260403"},
+        "B": {"analysis_date": "20260405"},
+        "C": {"analysis_date": "20250312"},
+    }
+    with patch.object(dl, "_load_json", return_value=preds):
+        months = dl.get_available_months()
+    assert months == ["202604", "202503"]
+
+
+def test_get_available_years():
+    """利用可能な年リストが YYYY 形式で降順に返る。"""
+    preds = {
+        "A": {"analysis_date": "20260403"},
+        "B": {"analysis_date": "20250405"},
+    }
+    with patch.object(dl, "_load_json", return_value=preds):
+        years = dl.get_available_years()
+    assert years == ["2026", "2025"]
+
+
+def test_get_daily_kpi_for_month():
+    """指定月の日別KPIリストが返る。的中データあり → roi 計算済み。"""
+    preds_month = {
+        "R1": {
+            "race_id": "R1",
+            "race_name": "テスト | 2026年4月5日 中山1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+    }
+    outcomes_month = {
+        "R1": [{"bet_type": "tansho", "stake": 100, "hit": True, "payout": 200}],
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(preds_month, {}, outcomes_month)):
+        rows = dl.get_daily_kpi_for_month(2026, 4)
+    assert len(rows) == 1
+    assert rows[0]["date"] == "20260405"
+    assert rows[0]["total_stake"] == 100
+    assert rows[0]["total_payout"] == 200
+    assert rows[0]["roi"] == 200.0
+
+
+def test_get_monthly_kpi_for_year():
+    """指定年の月別KPIリストが返る。"""
+    preds_month = {
+        "R1": {
+            "race_id": "R1",
+            "race_name": "テスト | 2026年4月5日 中山1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+    }
+    outcomes_month = {
+        "R1": [{"bet_type": "tansho", "stake": 100, "hit": True, "payout": 150}],
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(preds_month, {}, outcomes_month)):
+        rows = dl.get_monthly_kpi_for_year(2026)
+    assert len(rows) == 1
+    assert rows[0]["month"] == "202604"
+    assert rows[0]["total_stake"] == 100
+    assert rows[0]["roi"] == 150.0
