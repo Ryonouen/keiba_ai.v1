@@ -104,8 +104,12 @@ def _race_status(start_datetime: Optional[str], outcomes: List[Dict]) -> str:
 def _build_horse_row(horse: Dict) -> Dict:
     """
     v1 / v2 スキーマ両対応で馬情報を正規化する。
-    v2: horse["feature_dict"] に win_odds / running_style 等が入る。
-    v1: horse["win_odds"] = null
+
+    新形式 (v2): feature_dict に place_prob / win_ev が直接入る。
+    旧形式 (v1/sparse): 以下のフォールバック計算を適用する。
+      - win_ev     = ai_win_prob × win_odds  （exact: EV の定義通り）
+      - place_prob = 1 - (1 - p)^(n/3)  （Harville 独立近似: n=出走頭数）
+      - top2_prob  = win_prob + (place_prob - win_prob) × 2/3  （補間）
     """
     fd = horse.get("feature_dict")
     is_v2 = fd is not None
@@ -114,11 +118,32 @@ def _build_horse_row(horse: Dict) -> Dict:
     popularity_raw    = fd.get("feat_popularity") if is_v2 else horse.get("popularity")
     place_prob_raw    = fd.get("place_prob")       if is_v2 else None
     win_ev_raw        = fd.get("win_ev")           if is_v2 else None
+    n_runners_raw     = fd.get("feat_n_runners")   if is_v2 else None
 
-    win_prob   = horse.get("ai_win_prob")
-    place_prob = float(place_prob_raw) if place_prob_raw is not None else None
+    win_prob  = horse.get("ai_win_prob")
+    win_odds  = float(win_odds_raw) if win_odds_raw is not None else None
+    n_runners = int(float(n_runners_raw)) if n_runners_raw is not None else 16
 
-    # 2着内率: 勝率と複勝率の間を 2:1 で補間（近似値）
+    # ── win_ev ──
+    if win_ev_raw is not None:
+        win_ev: Optional[float] = float(win_ev_raw)
+    elif win_prob is not None and win_odds is not None:
+        win_ev = win_prob * win_odds   # EV の定義: 勝率 × 配当倍率
+    else:
+        win_ev = None
+
+    # ── place_prob (3着内率) ──
+    if place_prob_raw is not None:
+        place_prob: Optional[float] = float(place_prob_raw)
+    elif win_prob is not None:
+        # Harville 独立近似: P(top-3) ≈ 1 - (1-p)^(n/3)
+        # n/3 は「3頭を順に選ぶ試行の有効回数」。n=16 のとき ≈ 5.33
+        k = max(n_runners / 3, 1.0)
+        place_prob = min(1.0 - (1.0 - win_prob) ** k, 0.99)
+    else:
+        place_prob = None
+
+    # ── top2_prob (2着内率) ── 勝率〜3着内率の 2/3 補間
     top2_prob: Optional[float] = None
     if win_prob is not None and place_prob is not None:
         top2_prob = win_prob + (place_prob - win_prob) * 2 / 3
@@ -126,10 +151,10 @@ def _build_horse_row(horse: Dict) -> Dict:
     return {
         "horse_name":    horse.get("horse_name", ""),
         "ai_win_prob":   win_prob,
-        "place_prob":    place_prob,    # ≈ 3着内率
-        "top2_prob":     top2_prob,     # 2着内率 (近似)
-        "win_ev":        float(win_ev_raw) if win_ev_raw is not None else None,
-        "win_odds":      win_odds_raw,
+        "place_prob":    place_prob,
+        "top2_prob":     top2_prob,
+        "win_ev":        win_ev,
+        "win_odds":      win_odds,
         "popularity":    int(popularity_raw) if popularity_raw is not None else None,
         "running_style": STYLE_MAP.get(running_style_raw or "", None),
         # enriched fields (filled by _enrich_horses_from_result)
