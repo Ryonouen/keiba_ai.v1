@@ -159,7 +159,12 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--lang=ja-JP")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    # v146 chromedriver is broken on this machine; use cached v145 if available
+    _v145 = os.path.expanduser(
+        "~/.wdm/drivers/chromedriver/mac64/145.0.7632.117/chromedriver-mac-arm64/chromedriver"
+    )
+    _driver_path = _v145 if os.path.exists(_v145) else ChromeDriverManager().install()
+    driver = webdriver.Chrome(service=Service(_driver_path), options=options)
     driver.implicitly_wait(5)
 
     try:
