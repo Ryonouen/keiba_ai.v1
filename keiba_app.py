@@ -307,7 +307,102 @@ def _tab_daily() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Tab 3「履歴」
+# Tab 3「月次レポート」
+# ──────────────────────────────────────────────────────────────
+def _tab_monthly() -> None:
+    months = dl.get_available_months()
+    if not months:
+        st.info("集計データがありません。")
+        return
+
+    selected = st.selectbox(
+        "年月を選択",
+        months,
+        index=0,
+        format_func=lambda m: f"{m[:4]}年{m[4:]}月",
+    )
+    y, mo = int(selected[:4]), int(selected[4:])
+
+    daily_rows = dl.get_daily_kpi_for_month(y, mo)
+    if not daily_rows:
+        st.info("この月のデータがありません。")
+        return
+
+    # 月合計 KPI
+    total_stake  = sum(r["total_stake"]  for r in daily_rows)
+    total_payout = sum(r["total_payout"] for r in daily_rows)
+    hit_count    = sum(r["hit_count"]    for r in daily_rows)
+    total_bets   = sum(r["total_bets"]   for r in daily_rows)
+    roi          = round(total_payout / total_stake * 100, 1) if total_stake > 0 else 0.0
+
+    st.subheader(f"{y}年{mo}月 合計")
+    _render_kpi({"total_stake": total_stake, "total_payout": total_payout,
+                 "roi": roi, "hit_count": hit_count, "total_bets": total_bets})
+
+    # 日別 ROI 推移
+    st.subheader("日別 ROI 推移")
+    df_roi = pd.DataFrame([{"日付": r["date"], "ROI(%)": r["roi"]} for r in daily_rows])
+    df_roi["日付"] = pd.to_datetime(df_roi["日付"], format="%Y%m%d").dt.strftime("%m/%d")
+    st.line_chart(df_roi.set_index("日付"))
+
+    # 日別明細
+    st.subheader("日別明細")
+    df2 = pd.DataFrame(daily_rows)
+    df2.insert(0, "日付", pd.to_datetime(df2["date"], format="%Y%m%d").dt.strftime("%Y/%m/%d"))
+    df2 = df2[["日付", "total_stake", "total_payout", "roi", "hit_count", "total_bets"]]
+    df2.columns = ["日付", "投資額", "回収額", "ROI(%)", "的中", "買い目数"]
+    st.dataframe(df2, hide_index=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tab 4「年次レポート」
+# ──────────────────────────────────────────────────────────────
+def _tab_yearly() -> None:
+    years = dl.get_available_years()
+    if not years:
+        st.info("集計データがありません。")
+        return
+
+    selected = st.selectbox(
+        "年を選択",
+        years,
+        index=0,
+        format_func=lambda y: f"{y}年",
+    )
+
+    monthly_rows = dl.get_monthly_kpi_for_year(int(selected))
+    if not monthly_rows:
+        st.info("この年のデータがありません。")
+        return
+
+    # 年合計 KPI
+    total_stake  = sum(r["total_stake"]  for r in monthly_rows)
+    total_payout = sum(r["total_payout"] for r in monthly_rows)
+    hit_count    = sum(r["hit_count"]    for r in monthly_rows)
+    total_bets   = sum(r["total_bets"]   for r in monthly_rows)
+    roi          = round(total_payout / total_stake * 100, 1) if total_stake > 0 else 0.0
+
+    st.subheader(f"{selected}年 合計")
+    _render_kpi({"total_stake": total_stake, "total_payout": total_payout,
+                 "roi": roi, "hit_count": hit_count, "total_bets": total_bets})
+
+    # 月別 ROI 推移
+    st.subheader("月別 ROI 推移")
+    df_roi = pd.DataFrame([{"年月": r["month"], "ROI(%)": r["roi"]} for r in monthly_rows])
+    df_roi["年月"] = pd.to_datetime(df_roi["年月"], format="%Y%m").dt.strftime("%Y/%m")
+    st.line_chart(df_roi.set_index("年月"))
+
+    # 月別明細
+    st.subheader("月別明細")
+    df2 = pd.DataFrame(monthly_rows)
+    df2.insert(0, "年月", pd.to_datetime(df2["month"], format="%Y%m").dt.strftime("%Y/%m"))
+    df2 = df2[["年月", "total_stake", "total_payout", "roi", "hit_count", "total_bets"]]
+    df2.columns = ["年月", "投資額", "回収額", "ROI(%)", "的中", "買い目数"]
+    st.dataframe(df2, hide_index=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tab 5「履歴」
 # ──────────────────────────────────────────────────────────────
 def _tab_history() -> None:
     dates = dl.get_available_dates()
