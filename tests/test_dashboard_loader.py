@@ -464,3 +464,34 @@ def test_get_monthly_kpi_for_year():
     assert rows[0]["roi"] == 150.0
     assert rows[0]["hit_count"] == 1
     assert rows[0]["total_bets"] == 1
+
+
+# ── Task: _extract_grade_title ────────────────────────────────
+
+def test_extract_grade_title_g1():
+    """G1 重賞のタイトルを抽出する。"""
+    name = "大阪杯(G1) 出馬表 | 2026年4月5日 阪神11R レース情報(JRA) - netkeiba"
+    assert dl._extract_grade_title(name) == "大阪杯(G1)"
+
+
+def test_extract_grade_title_g2():
+    """G2 重賞のタイトルを抽出する。"""
+    name = "産経大阪杯(G2) 出馬表 | 2026年4月5日 阪神11R レース情報(JRA) - netkeiba"
+    assert dl._extract_grade_title(name) == "産経大阪杯(G2)"
+
+
+def test_extract_grade_title_g3():
+    """G3 重賞のタイトルを抽出する。"""
+    name = "ニュージーランドT(G3) 出馬表 | 2026年4月5日 中山11R レース情報(JRA) - netkeiba"
+    assert dl._extract_grade_title(name) == "ニュージーランドT(G3)"
+
+
+def test_extract_grade_title_normal():
+    """非重賞は None を返す。"""
+    name = "３歳未勝利 出馬表 | 2026年4月5日 中山1R レース情報(JRA) - netkeiba"
+    assert dl._extract_grade_title(name) is None
+
+
+def test_extract_grade_title_empty():
+    """空文字は None を返す。"""
+    assert dl._extract_grade_title("") is None

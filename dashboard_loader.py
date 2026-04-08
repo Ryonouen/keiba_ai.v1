@@ -47,6 +47,25 @@ def _parse_venue_race_number(race_name: str) -> Tuple[str, str]:
     return "", ""
 
 
+_GRADE_PATTERN = re.compile(r"^(.+?)\s*出馬表")
+
+
+def _extract_grade_title(race_name: str) -> Optional[str]:
+    """
+    race_name が重賞（G1/G2/G3）の場合はレースタイトルを返す。
+    例: "大阪杯(G1) 出馬表 | ..." → "大阪杯(G1)"
+    非重賞または空文字は None を返す。
+    """
+    if not race_name:
+        return None
+    if not any(g in race_name for g in ("G1", "G2", "G3", "Ｇ１", "Ｇ２", "Ｇ３")):
+        return None
+    m = _GRADE_PATTERN.match(race_name)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def _race_status(start_datetime: Optional[str], outcomes: List[Dict]) -> str:
     """
     レースの表示ステータスを返す。
@@ -187,7 +206,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
     Returns
     -------
     List[Dict] — 各要素のキー:
-        race_id, race_name, venue, race_number,
+        race_id, race_name, grade_title, venue, race_number,
         start_time, start_datetime, status,
         horses, bets, outcomes,
         upset_score, upset_label, upset_color, hot_bets
@@ -217,6 +236,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
             {
                 "race_id":        race_id,
                 "race_name":      race_name,
+                "grade_title":    _extract_grade_title(race_name),
                 "venue":          venue,
                 "race_number":    r_num,
                 "start_time":     start_time,
