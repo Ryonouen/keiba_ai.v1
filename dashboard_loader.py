@@ -405,12 +405,11 @@ def get_monthly_kpi_for_year(year: int) -> List[Dict]:
     昇順（月順）。
     """
     prefix = f"{year:04d}"
-    months = sorted(m for m in get_available_months() if m.startswith(prefix))
+    all_dates = get_available_dates()  # 1回だけ読む
+    months = sorted({d[:6] for d in all_dates if d.startswith(prefix)})
     rows: List[Dict] = []
     for m in months:
-        y, mo = int(m[:4]), int(m[4:])
-        date_prefix = f"{y:04d}{mo:02d}"
-        dates = [d for d in get_available_dates() if d.startswith(date_prefix)]
+        dates = [d for d in all_dates if d.startswith(m)]
         all_races: List[Dict] = []
         for d in dates:
             all_races.extend(load_races_for_date(d))

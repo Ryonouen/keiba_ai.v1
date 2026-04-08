@@ -423,6 +423,24 @@ def test_get_daily_kpi_for_month():
     assert rows[0]["total_stake"] == 100
     assert rows[0]["total_payout"] == 200
     assert rows[0]["roi"] == 200.0
+    assert rows[0]["hit_count"] == 1
+    assert rows[0]["total_bets"] == 1
+
+
+def test_get_daily_kpi_for_month_skips_zero_stake():
+    """results なし（total_stake == 0）の日はリストに含まれない。"""
+    preds_no_outcome = {
+        "R1": {
+            "race_id": "R1",
+            "race_name": "テスト | 2026年4月5日 中山1R レース情報",
+            "analysis_date": "20260405",
+            "horses": [],
+        },
+    }
+    # outcomes なし → total_stake == 0 → スキップされる
+    with patch.object(dl, "_load_json", side_effect=_mock_load(preds_no_outcome, {}, {})):
+        rows = dl.get_daily_kpi_for_month(2026, 4)
+    assert rows == []
 
 
 def test_get_monthly_kpi_for_year():
@@ -444,3 +462,5 @@ def test_get_monthly_kpi_for_year():
     assert rows[0]["month"] == "202604"
     assert rows[0]["total_stake"] == 100
     assert rows[0]["roi"] == 150.0
+    assert rows[0]["hit_count"] == 1
+    assert rows[0]["total_bets"] == 1
