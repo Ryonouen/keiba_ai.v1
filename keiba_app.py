@@ -209,12 +209,8 @@ def _render_race_cards(races: List[Dict]) -> None:
 # ──────────────────────────────────────────────────────────────
 # Tab 1「レース分析」— 日付→競馬場の2段サブタブ
 # ──────────────────────────────────────────────────────────────
-def _render_venues_for_date(date_str: str) -> None:
-    """指定日のレースを競馬場ごとのサブタブで表示する。"""
-    races_by_venue = dl.get_races_by_venue(date_str)
-    if not races_by_venue:
-        st.info("この日のデータがありません。")
-        return
+def _render_races_grouped(races_by_venue: Dict[str, List[Dict]]) -> None:
+    """競馬場ごとにグループ化されたレース dict からサブタブを描画する。"""
     venue_names = list(races_by_venue.keys())
     if len(venue_names) == 1:
         _render_race_cards(races_by_venue[venue_names[0]])
@@ -225,24 +221,34 @@ def _render_venues_for_date(date_str: str) -> None:
                 _render_race_cards(races_by_venue[venue])
 
 
+def _render_venues_for_date(date_str: str) -> None:
+    """指定日のレースを競馬場ごとのサブタブで表示する（土日タブ用）。"""
+    races_by_venue = dl.get_races_by_venue(date_str)
+    if not races_by_venue:
+        st.info("この日のデータがありません。")
+        return
+    _render_races_grouped(races_by_venue)
+
+
 @st.fragment(run_every=60)
 def _render_today_live() -> None:
     """今日タブ: 60秒自動更新。KPI + 券種別 + 競馬場別レース一覧。"""
     today_str = datetime.now().strftime("%Y%m%d")
     st.caption(f"最終更新: {datetime.now().strftime('%H:%M:%S')}  （60秒ごとに自動更新）")
-    races = dl.load_races_for_date(today_str)
-    if not races:
+    races_by_venue = dl.get_races_by_venue(today_str)
+    if not races_by_venue:
         st.info(
             "本日のレースデータがまだありません。\n"
             "`bash weekend_pipeline.sh` を実行してください。"
         )
         return
-    kpi = dl.calc_kpi(races)
+    all_races: List[Dict] = [r for venue_races in races_by_venue.values() for r in venue_races]
+    kpi = dl.calc_kpi(all_races)
     _render_kpi(kpi)
     st.subheader("券種別集計")
-    _render_bet_type_table(races)
-    st.subheader(f"レース一覧（{len(races)} レース）")
-    _render_venues_for_date(today_str)
+    _render_bet_type_table(all_races)
+    st.subheader(f"レース一覧（{len(all_races)} レース）")
+    _render_races_grouped(races_by_venue)
 
 
 def _tab_race_analysis() -> None:
