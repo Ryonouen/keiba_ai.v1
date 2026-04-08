@@ -104,7 +104,7 @@ def _race_status(start_datetime: Optional[str], outcomes: List[Dict]) -> str:
 def _build_horse_row(horse: Dict) -> Dict:
     """
     v1 / v2 スキーマ両対応で馬情報を正規化する。
-    v2: horse["feature_dict"]["win_odds"] / ["running_style"]
+    v2: horse["feature_dict"] に win_odds / running_style 等が入る。
     v1: horse["win_odds"] = null
     """
     fd = horse.get("feature_dict")
@@ -112,9 +112,23 @@ def _build_horse_row(horse: Dict) -> Dict:
     win_odds_raw      = fd.get("win_odds")        if is_v2 else horse.get("win_odds")
     running_style_raw = fd.get("running_style")   if is_v2 else horse.get("running_style")
     popularity_raw    = fd.get("feat_popularity") if is_v2 else horse.get("popularity")
+    place_prob_raw    = fd.get("place_prob")       if is_v2 else None
+    win_ev_raw        = fd.get("win_ev")           if is_v2 else None
+
+    win_prob   = horse.get("ai_win_prob")
+    place_prob = float(place_prob_raw) if place_prob_raw is not None else None
+
+    # 2着内率: 勝率と複勝率の間を 2:1 で補間（近似値）
+    top2_prob: Optional[float] = None
+    if win_prob is not None and place_prob is not None:
+        top2_prob = win_prob + (place_prob - win_prob) * 2 / 3
+
     return {
         "horse_name":    horse.get("horse_name", ""),
-        "ai_win_prob":   horse.get("ai_win_prob"),
+        "ai_win_prob":   win_prob,
+        "place_prob":    place_prob,    # ≈ 3着内率
+        "top2_prob":     top2_prob,     # 2着内率 (近似)
+        "win_ev":        float(win_ev_raw) if win_ev_raw is not None else None,
         "win_odds":      win_odds_raw,
         "popularity":    int(popularity_raw) if popularity_raw is not None else None,
         "running_style": STYLE_MAP.get(running_style_raw or "", None),

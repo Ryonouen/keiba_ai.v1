@@ -24,6 +24,51 @@ STATUS_LABEL: Dict[str, str] = {
 
 
 # ──────────────────────────────────────────────────────────────
+# ユーティリティ
+# ──────────────────────────────────────────────────────────────
+_GRADE_COLOR = {"A": "#f1c40f", "B": "#27ae60", "C": "#888", "D": "#555"}
+_GRADE_BG    = {"A": "#3d3200", "B": "#0d2e1a", "C": "#222", "D": "#1a1a1a"}
+
+
+def _confidence_grade(win_ev: "float | None") -> "tuple[str, str, str]":
+    """
+    単勝期待値 (win_ev) から信頼度グレード (A/B/C/D)、文字色、背景色を返す。
+    EV>1 = プラス期待値。EV>=1.5 = 高確信、EV>=1.1 = 中確信。
+    """
+    if win_ev is None:
+        return "—", "#555", "transparent"
+    if win_ev >= 1.5:
+        return "A", _GRADE_COLOR["A"], _GRADE_BG["A"]
+    if win_ev >= 1.1:
+        return "B", _GRADE_COLOR["B"], _GRADE_BG["B"]
+    if win_ev >= 0.8:
+        return "C", _GRADE_COLOR["C"], _GRADE_BG["C"]
+    return "D", _GRADE_COLOR["D"], _GRADE_BG["D"]
+
+
+def _ability_bar_html(win_prob: "float | None") -> str:
+    """
+    勝率を能力値スコア＋カラーバーの HTML で返す。
+    バー幅: win_prob / 0.5 で正規化（50%=フル幅）。色: 高→赤, 中→橙, 低→青.
+    """
+    if win_prob is None:
+        return '<span style="color:#555">—</span>'
+    pct  = win_prob * 100
+    bar_w = min(pct / 0.5, 100)  # 50% win_prob = 100% bar
+    color = ("#e74c3c" if pct >= 20 else "#e67e22" if pct >= 10 else
+             "#3498db" if pct >= 5 else "#555")
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:5px">'
+        f'<span style="color:#ccc;font-size:12px;min-width:32px;text-align:right">{pct:.1f}</span>'
+        f'<span style="display:inline-block;background:#2a2a3a;border-radius:2px;'
+        f'height:7px;width:50px;overflow:hidden">'
+        f'<span style="display:block;background:{color};height:7px;'
+        f'border-radius:2px;width:{bar_w:.0f}%"></span>'
+        f'</span></span>'
+    )
+
+
+# ──────────────────────────────────────────────────────────────
 # 共通ウィジェット
 # ──────────────────────────────────────────────────────────────
 def _render_race_summary(race: Dict) -> None:
@@ -205,8 +250,8 @@ def _render_bet_type_table(races: List[Dict]) -> None:
 
 def _render_horse_table(horses: List[Dict], status: str) -> None:
     """
-    AI予測順 vs 実際の着順テーブル（コンパクト表示）。
-    status="result" のとき actual_rank 列を表示しハイライトする。
+    AI予測順 vs 実際の着順テーブル。
+    信頼度(A-D) / 能力値バー / 勝率 / 2着内率 / 3着内率 を含む全カラム表示。
     """
     has_result = status == "result"
     medal = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -217,6 +262,14 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
     }
     ai_rank_color = {1: "#e74c3c", 2: "#e67e22", 3: "#27ae60"}
 
+    def _pct(v: "float | None") -> str:
+        return f"{v * 100:.1f}%" if v is not None else "—"
+
+    def _pct_cell(v: "float | None", highlight: bool = False) -> str:
+        s = _pct(v)
+        color = "#e74c3c" if highlight else "#ccc"
+        return f'<span style="color:{color};font-size:12px">{s}</span>'
+
     rows_html: list[str] = []
     for ai_rank, h in enumerate(horses, 1):
         name      = h.get("horse_name", "")
@@ -224,73 +277,110 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         horse_no  = h.get("horse_no")
         pop       = h.get("popularity")
         win_prob  = h.get("ai_win_prob")
+        place_prob = h.get("place_prob")
+        top2_prob  = h.get("top2_prob")
+        win_ev     = h.get("win_ev")
         actual    = h.get("actual_rank") if has_result else None
 
         row_bg = actual_bg.get(actual, "transparent") if actual else "transparent"
 
-        # AI順: 上位3はカラーバッジ、それ以外はグレーテキスト
-        ai_bg = ai_rank_color.get(ai_rank, "")
-        if ai_bg:
+        # AI順バッジ
+        ai_color = ai_rank_color.get(ai_rank, "")
+        if ai_color:
             ai_cell = (
-                f'<span style="display:inline-block;background:{ai_bg};color:#fff;'
+                f'<span style="display:inline-block;background:{ai_color};color:#fff;'
                 f'width:22px;height:22px;border-radius:50%;text-align:center;'
                 f'line-height:22px;font-weight:bold;font-size:12px">{ai_rank}</span>'
             )
         else:
-            ai_cell = f'<span style="color:#666;font-size:12px">{ai_rank}</span>'
+            ai_cell = f'<span style="color:#555;font-size:12px">{ai_rank}</span>'
 
-        # 着順: メダル+着 or グレー数字
+        # 着順
         if actual is not None:
             if actual <= 3:
-                actual_cell = f'<span style="font-size:13px">{medal[actual]}</span><span style="font-weight:bold;font-size:12px;margin-left:2px">{actual}着</span>'
+                actual_cell = (
+                    f'<span style="font-size:12px">{medal[actual]}</span>'
+                    f'<span style="font-weight:bold;font-size:11px;margin-left:1px">{actual}着</span>'
+                )
             else:
-                actual_cell = f'<span style="color:#888;font-size:12px">{actual}着</span>'
+                actual_cell = f'<span style="color:#777;font-size:11px">{actual}着</span>'
         elif has_result:
-            actual_cell = '<span style="color:#555;font-size:12px">?</span>'
+            actual_cell = '<span style="color:#444;font-size:11px">?</span>'
         else:
-            actual_cell = '<span style="color:#444;font-size:11px">—</span>'
+            actual_cell = '<span style="color:#333;font-size:10px">—</span>'
 
-        # 馬番: 小さい角丸バッジ
+        # 馬番
         no_cell = (
             f'<span style="background:#1e2a4a;color:#7fb3d3;padding:1px 5px;'
             f'border-radius:3px;font-size:12px;font-weight:bold">{horse_no}</span>'
-            if horse_no is not None else '<span style="color:#444">—</span>'
+            if horse_no is not None else '<span style="color:#333">—</span>'
         )
 
-        prob_str = f'{win_prob * 100:.1f}%' if win_prob is not None else '—'
-        pop_str  = f'{pop}人気' if pop is not None else '—'
+        # 馬名/騎手
         name_cell = (
-            f'<span style="color:#e0e0e0;font-size:13px;font-weight:bold">{name}</span>'
-            + (f' <span style="color:#666;font-size:11px">{jockey}</span>' if jockey else '')
+            f'<span style="color:#e0e0e0;font-size:12px;font-weight:bold">{name}</span>'
+            + (f'<br><span style="color:#666;font-size:10px">{jockey}</span>' if jockey else '')
         )
+
+        # 人気
+        pop_str = f'<span style="color:#888;font-size:11px">{pop}人気</span>' if pop is not None else '<span style="color:#333">—</span>'
+
+        # 信頼度グレード
+        grade, g_color, g_bg = _confidence_grade(win_ev)
+        grade_cell = (
+            f'<span style="background:{g_bg};color:{g_color};font-size:12px;'
+            f'font-weight:bold;padding:1px 6px;border-radius:3px">{grade}</span>'
+        )
+
+        # 能力値バー
+        ability_cell = _ability_bar_html(win_prob)
+
+        # 勝率 / 2着内率 / 3着内率 (top-3ハイライト)
+        is_top = actual is not None and actual <= 3
+        win_cell   = _pct_cell(win_prob,   is_top)
+        top2_cell  = _pct_cell(top2_prob,  is_top)
+        top3_cell  = _pct_cell(place_prob, is_top)
 
         rows_html.append(
-            f'<tr style="background:{row_bg};border-bottom:1px solid #1e1e2e">'
-            f'<td style="padding:5px 4px;text-align:center;width:46px">{ai_cell}</td>'
-            f'<td style="padding:5px 4px;text-align:center;width:68px;white-space:nowrap">{actual_cell}</td>'
-            f'<td style="padding:5px 4px;text-align:center;width:44px">{no_cell}</td>'
-            f'<td style="padding:5px 8px">{name_cell}</td>'
-            f'<td style="padding:5px 4px;text-align:center;width:54px;color:#888;font-size:11px">{pop_str}</td>'
-            f'<td style="padding:5px 6px;text-align:right;width:54px;color:#7fb3d3;font-size:12px;font-weight:bold">{prob_str}</td>'
+            f'<tr style="background:{row_bg};border-bottom:1px solid #1a1a2a">'
+            f'<td style="padding:5px 3px;text-align:center">{ai_cell}</td>'
+            f'<td style="padding:5px 3px;text-align:center;white-space:nowrap">{actual_cell}</td>'
+            f'<td style="padding:5px 3px;text-align:center">{no_cell}</td>'
+            f'<td style="padding:5px 7px">{name_cell}</td>'
+            f'<td style="padding:5px 3px;text-align:center">{pop_str}</td>'
+            f'<td style="padding:5px 3px;text-align:center">{grade_cell}</td>'
+            f'<td style="padding:5px 4px">{ability_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right">{win_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right">{top2_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right">{top3_cell}</td>'
             f'</tr>'
         )
 
+    def _th(label: str, align: str = "center", w: str = "") -> str:
+        ws = f'width:{w};' if w else ''
+        return (
+            f'<th style="padding:4px 4px;text-align:{align};color:#555;'
+            f'font-size:10px;font-weight:normal;{ws}">{label}</th>'
+        )
+
     table = (
-        '<table style="width:100%;border-collapse:collapse;font-family:sans-serif;table-layout:fixed">'
-        '<colgroup>'
-        '<col style="width:46px"><col style="width:68px"><col style="width:44px">'
-        '<col><col style="width:54px"><col style="width:54px">'
-        '</colgroup>'
-        '<thead><tr style="border-bottom:1px solid #3a3a5a">'
-        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">AI順</th>'
-        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">着順</th>'
-        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">馬番</th>'
-        '<th style="padding:4px 8px;text-align:left;color:#666;font-size:10px;font-weight:normal">馬名 / 騎手</th>'
-        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">人気</th>'
-        '<th style="padding:4px 6px;text-align:right;color:#666;font-size:10px;font-weight:normal">AI勝率</th>'
-        '</tr></thead>'
+        '<div style="overflow-x:auto">'
+        '<table style="width:100%;min-width:640px;border-collapse:collapse;'
+        'font-family:sans-serif;font-size:12px">'
+        '<thead><tr style="border-bottom:1px solid #2a2a3a">'
+        + _th("AI順", w="36px")
+        + _th("着順", w="60px")
+        + _th("馬番", w="40px")
+        + _th("馬名 / 騎手", "left")
+        + _th("人気", w="50px")
+        + _th("信頼度", w="48px")
+        + _th("能力値", "left", "110px")
+        + _th("勝率", "right", "52px")
+        + _th("2着内率", "right", "58px")
+        + _th("3着内率", "right", "58px")
+        + '</tr></thead>'
         f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table>'
+        '</table></div>'
     )
     st.markdown(table, unsafe_allow_html=True)
 
