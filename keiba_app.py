@@ -93,6 +93,23 @@ def _render_race_summary(race: Dict) -> None:
             f'padding:2px 8px;border-radius:10px;margin-left:4px">🔥 {len(hot_bets)}件</span>'
         )
 
+    # ── 重賞バッジ ──
+    grade_title = race.get("grade_title")
+    if grade_title:
+        if "G1" in grade_title or "Ｇ１" in grade_title:
+            grade_color = "#d4af37"   # gold
+        elif "G2" in grade_title or "Ｇ２" in grade_title:
+            grade_color = "#aaa9ad"   # silver
+        else:
+            grade_color = "#cd7f32"   # bronze (G3)
+        grade_html = (
+            f'<span style="background:{grade_color};color:#000;font-size:11px;'
+            f'font-weight:bold;padding:2px 8px;border-radius:10px;margin-right:4px">'
+            f'🏆 {grade_title}</span>'
+        )
+    else:
+        grade_html = ""
+
     html = (
         f'<div style="background:#16213e;border-radius:6px;padding:10px 14px;'
         f'margin-bottom:2px;display:flex;align-items:center;gap:10px;font-family:sans-serif;">'
@@ -101,6 +118,7 @@ def _render_race_summary(race: Dict) -> None:
         f'align-items:center;justify-content:center;flex-shrink:0;">{r_num}</div>'
         f'<div style="flex:1;min-width:0;">'
         f'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:5px;">'
+        f'{grade_html}'
         f'<span style="color:#e0e0e0;font-weight:bold;font-size:13px">{venue}</span>'
         f'<span style="color:#888;font-size:12px">{start_time}発走</span>'
         f'{status_html}'
