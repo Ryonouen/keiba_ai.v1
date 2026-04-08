@@ -275,7 +275,39 @@ def _tab_race_analysis() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Tab 2「履歴」
+# Tab 2「日次レポート」
+# ──────────────────────────────────────────────────────────────
+def _tab_daily() -> None:
+    dates = dl.get_available_dates()
+    if not dates:
+        st.info("結果データがありません。`--evaluate` を実行してください。")
+        return
+
+    selected = st.selectbox(
+        "日付を選択",
+        dates,
+        index=0,
+        format_func=lambda d: f"{d[:4]}/{d[4:6]}/{d[6:]}",
+    )
+
+    races = dl.load_races_for_date(selected)
+    if not races:
+        st.info("この日のデータがありません。")
+        return
+
+    kpi = dl.calc_kpi(races)
+    st.subheader(f"{selected[:4]}/{selected[4:6]}/{selected[6:]} の集計")
+    _render_kpi(kpi)
+
+    st.subheader("券種別集計")
+    _render_bet_type_table(races)
+
+    st.subheader(f"レース一覧（{len(races)} レース）")
+    _render_race_cards(races)
+
+
+# ──────────────────────────────────────────────────────────────
+# Tab 3「履歴」
 # ──────────────────────────────────────────────────────────────
 def _tab_history() -> None:
     dates = dl.get_available_dates()
