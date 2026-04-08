@@ -402,57 +402,6 @@ def _tab_yearly() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# Tab 5「履歴」
-# ──────────────────────────────────────────────────────────────
-def _tab_history() -> None:
-    dates = dl.get_available_dates()
-
-    if not dates:
-        st.info("結果データがありません。`--evaluate` を実行してください。")
-        return
-
-    selected = st.selectbox("日付を選択", dates, index=0)
-
-    # 全日付を一度だけロード
-    races_by_date = {d: dl.load_races_for_date(d) for d in dates}
-
-    # 全期間累計 KPI
-    all_races: List[Dict] = []
-    for day_races in races_by_date.values():
-        all_races.extend(day_races)
-
-    kpi_all = dl.calc_kpi(all_races)
-    st.subheader("全期間累計")
-    _render_kpi(kpi_all)
-
-    # 券種別累計
-    st.subheader("券種別累計")
-    _render_bet_type_table(all_races)
-
-    # ROI 推移グラフ
-    roi_rows = []
-    for d in sorted(dates):
-        k = dl.calc_kpi(races_by_date[d])
-        if k["total_stake"] > 0:
-            roi_rows.append({"日付": d, "ROI(%)": k["roi"]})
-
-    if roi_rows:
-        st.subheader("ROI 推移")
-        df_roi = pd.DataFrame(roi_rows).set_index("日付")
-        st.line_chart(df_roi)
-
-    # 選択日のレース
-    st.subheader(f"{selected} のレース")
-    day_races = races_by_date.get(selected, [])
-    if day_races:
-        kpi_day = dl.calc_kpi(day_races)
-        _render_kpi(kpi_day)
-        _render_race_cards(day_races)
-    else:
-        st.info("この日のデータがありません。")
-
-
-# ──────────────────────────────────────────────────────────────
 # エントリポイント
 # ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="競馬AI ダッシュボード", layout="wide")
@@ -491,10 +440,18 @@ with st.sidebar:
 
 st.title("🏇 競馬AI パイプライン ダッシュボード")
 
-tab_today, tab_history = st.tabs(["📅 当日", "📊 履歴"])
+tab_analysis, tab_daily, tab_monthly, tab_yearly = st.tabs([
+    "🏇 レース分析", "📊 日次レポート", "📅 月次レポート", "📆 年次レポート"
+])
 
-with tab_today:
-    _tab_today()
+with tab_analysis:
+    _tab_race_analysis()
 
-with tab_history:
-    _tab_history()
+with tab_daily:
+    _tab_daily()
+
+with tab_monthly:
+    _tab_monthly()
+
+with tab_yearly:
+    _tab_yearly()
