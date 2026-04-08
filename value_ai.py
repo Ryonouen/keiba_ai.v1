@@ -37,8 +37,8 @@ BANKROLL_RATIO_BASE: float = 0.05   # 軍資金基本配分率
 BANKROLL_UNIT: int = 100            # 掛け金単位（100円）
 
 # 妙味候補の最低条件（「妙味だけで飛びやすい馬」の過大評価抑制）
-VALUE_MIN_WIN_PROB: float = 0.05    # AI勝率がこれ未満の馬は value_gap があっても妙味候補に入れない
-VALUE_MIN_STABLE_SCORE: float = 0.35  # (consistency_index + trend_index)/2 がこれ未満の馬も除外
+VALUE_MIN_WIN_PROB: float = 0.07    # AI勝率がこれ未満の馬は value_gap があっても妙味候補に入れない
+VALUE_MIN_STABLE_SCORE: float = 0.42  # (consistency_index + trend_index)/2 がこれ未満の馬も除外
 
 # 主推奨昇格のための安定性下限（妙味候補に残りつつも主推奨に上がりにくくする 3 段階設計）
 # stable < 0.35 → 妙味候補に入れない（VALUE_MIN_STABLE_SCORE）
@@ -143,14 +143,21 @@ MIXED_ODDS_BONUS:      float = 1.04   # 中穴馬（7<odds≤20）含む: 優遇
 WIN_PROB_HEAD_MIN: float   = 0.15    # 頭候補: AI勝率の最低値
 AXIS_SCORE_HEAD_MIN: float = 0.50    # 頭候補: axis_score の最低値
 AXIS_SCORE_AXIS_MIN: float = 0.38    # 軸候補: axis_score の最低値
-STABLE_SCORE_AXIS_MIN: float = 0.48  # 軸候補: stable_score の最低値
-TOP2_AXIS_MIN: float       = 0.22    # 軸候補: top2_prob の最低値
+STABLE_SCORE_AXIS_MIN: float = 0.52  # 軸候補: stable_score の最低値
+TOP2_AXIS_MIN: float       = 0.28    # 軸候補: top2_prob の最低値
 TOP3_HIMO_MIN: float       = 0.28    # ヒモ候補: top3_prob の最低値
 TOP3_RESCUE_MIN: float     = 0.30    # 取りこぼし注意馬: top3_prob の最低値
 UPSIDE_SCORE_HIGH: float   = 0.55    # 上振れ余地が高い閾値
 RESCUE_AI_RANK_MAX: int    = 3       # 取りこぼし注意馬: AI上位N頭を除外
 DANGER_V3_AXIS_MAX: float  = 0.35    # 「真に危険」判定: axis_score 上限
 DANGER_V3_TOP3_MAX: float  = 0.25    # 「真に危険」判定: top3_prob 上限
+
+# 人気帯別 危険判定乖離閾値（実力馬を過剰排除しないよう人気馬は閾値を大きくする）
+# AI win_prob は絶対値推定なので人気馬ほど market_win_prob との乖離が構造的に拡大する
+DANGER_GAP_POP1: float = 0.15   # 1番人気: 15pt以上の乖離がないと危険判定しない
+DANGER_GAP_POP3: float = 0.10   # 2〜3番人気: 10pt以上
+DANGER_GAP_POP6: float = 0.05   # 4〜6番人気: 5pt以上
+# 7番人気以下: DANGER_GAP_MIN (0.03) をそのまま使用
 
 
 # =========================================================
@@ -340,8 +347,16 @@ def detect_danger_favorites_v2(
             continue
         if float(win_odds) > danger_odds_max:
             continue  # 人気馬のみ対象
-        if vg >= -danger_gap_min:
-            continue  # 乖離が小さければ対象外
+        # 人気帯別乖離閾値: 実力馬ほど AI と市場の差が構造的に大きくなるため閾値を引き上げる
+        _pop = int(row.get("popularity_rank") or 99)
+        _gap_thresh = (
+            -DANGER_GAP_POP1 if _pop == 1 else
+            -DANGER_GAP_POP3 if _pop <= 3 else
+            -DANGER_GAP_POP6 if _pop <= 6 else
+            -danger_gap_min
+        )
+        if vg >= _gap_thresh:
+            continue
 
         horse_name = row["horse_name"]
         f = features_by_name.get(horse_name, {})
@@ -1792,14 +1807,22 @@ def _recommend_by_structure(
 
     structure_type = race_structure.get("structure_type", "標準型")
 
+    # 妙味馬を事前計算（himo層内での優先ソートに使用）
+    value_horses = detect_value_horses(ev_table, features, race_pace)
+    _value_names_set: Set[str] = {str(v.get("horse_name") or "") for v in value_horses}
+
     # horse_roles が渡された場合: 消し馬を除外し、head/axis を優先順位上位に
+    # himo 層の妙味馬は通常 himo より優先（1.5）して相手候補の上位に来るようにする
     if horse_roles:
         _role_map = {r["horse_name"]: r.get("role", "himo") for r in horse_roles}
         _ROLE_ORDER = {"head": 0, "axis": 1, "himo": 2, "fade": 3}
         sorted_features = sorted(
             features,
             key=lambda x: (
-                _ROLE_ORDER.get(_role_map.get(str(x.get("horse_name") or ""), "himo"), 2),
+                (1.5 if (
+                    _role_map.get(str(x.get("horse_name") or ""), "himo") == "himo"
+                    and str(x.get("horse_name") or "") in _value_names_set
+                ) else _ROLE_ORDER.get(_role_map.get(str(x.get("horse_name") or ""), "himo"), 2)),
                 -float(x.get("win_prob") or 0.0),
             ),
         )
@@ -1828,9 +1851,6 @@ def _recommend_by_structure(
         axis_candidates = [f for f in sorted_features if f.get("horse_name") not in _danger_n]
         if not axis_candidates:
             axis_candidates = sorted_features
-
-    # value_horses は参考計算のみ（馬選定には使わない）
-    value_horses = detect_value_horses(ev_table, features, race_pace)  # noqa: unused-in-selection
 
     if not axis_candidates:
         return {**EMPTY, "skip": True, "skip_reason": "推奨できる馬がいません。見送り推奨。"}
@@ -2184,14 +2204,24 @@ def assign_roles(
         {row["horse_name"]: row for row in ev_table} if ev_table else {}
     )
 
-    # 危険人気馬名セット（v2 と同基準）
+    # 危険人気馬名セット（人気帯別乖離閾値を使用）
     danger_names: Set[str] = set()
     for row in ev_table:
-        vg = row.get("value_gap")
-        wo = row.get("win_odds")
-        if vg is not None and wo is not None:
-            if float(wo) <= DANGER_ODDS_MAX and vg <= -DANGER_GAP_MIN:
-                danger_names.add(row["horse_name"])
+        vg  = row.get("value_gap")
+        wo  = row.get("win_odds")
+        if vg is None or wo is None:
+            continue
+        if float(wo) > DANGER_ODDS_MAX:
+            continue
+        _pop = int(row.get("popularity_rank") or 99)
+        _gap_thresh = (
+            -DANGER_GAP_POP1 if _pop == 1 else
+            -DANGER_GAP_POP3 if _pop <= 3 else
+            -DANGER_GAP_POP6 if _pop <= 6 else
+            -DANGER_GAP_MIN
+        )
+        if vg <= _gap_thresh:
+            danger_names.add(row["horse_name"])
 
     # is_truly_dangerous マップ
     # danger_horses 未提供時は False（能力チェックなしで fade にしない）。
@@ -2465,7 +2495,15 @@ def detect_danger_favorites_v3(
             continue
         if float(win_odds) > danger_odds_max:
             continue
-        if vg >= -danger_gap_min:
+        # 人気帯別乖離閾値: 実力馬ほど AI と市場の差が構造的に大きくなるため閾値を引き上げる
+        _pop = int(row.get("popularity_rank") or 99)
+        _gap_thresh = (
+            -DANGER_GAP_POP1 if _pop == 1 else
+            -DANGER_GAP_POP3 if _pop <= 3 else
+            -DANGER_GAP_POP6 if _pop <= 6 else
+            -danger_gap_min
+        )
+        if vg >= _gap_thresh:
             continue
 
         horse_name = row["horse_name"]
@@ -2663,8 +2701,10 @@ def recommend_betmaster_plans(
     pp = estimate_placement_probs(head, race_structure)
     head_top3_prob = pp["p_top3"]
 
-    axis_names = [str(f.get("horse_name") or "") for f in axis_horses[:3]]
-    himo_names = [str(f.get("horse_name") or "") for f in himo_horses]
+    axis_names = [str(f.get("horse_name") or "") for f in axis_horses[:3]
+                  if str(f.get("horse_name") or "") != head_name]
+    himo_names = [str(f.get("horse_name") or "") for f in himo_horses
+                  if str(f.get("horse_name") or "") != head_name]
     all_names = [str(f.get("horse_name") or "") for f in non_fade]
 
     plans: List[Dict[str, Any]] = []
@@ -2696,7 +2736,7 @@ def recommend_betmaster_plans(
     ))
 
     # ── 3. ワイド ────────────────────────────────────────────────────────
-    wide_legs = [head_name] + axis_names[:2]
+    wide_legs = list(dict.fromkeys([head_name] + axis_names[:2]))  # 重複除去・順序保持
     wide_combos = list(combinations(wide_legs, 2))
     wide_tickets = [{"combination": list(c), "stake": BETMASTER_TICKET_UNIT} for c in wide_combos]
     plans.append(_bm_plan(

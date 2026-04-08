@@ -15,9 +15,11 @@ import pandas as pd
 
 # ── 定数 ──────────────────────────────────────────────────────────────
 TRAINING_CSV = "keiba_training_data.csv"
+DIVIDEND_CACHE_FILE = "dividend_cache.json"
 TARGET_YEARS = [2021, 2022, 2023, 2024]
 BANKROLL = 10_000        # 1レース当たり仮想軍資金（円）
 STAKE_UNIT = 100         # 最小掛け金単位
+EXCLUDED_BET_TYPES = {"3連複BOX"}   # ROI低下の主因となる券種をバックテストから除外
 
 ML_FEATURE_COLUMNS = [
     "feat_gate", "feat_age", "feat_popularity", "feat_win_odds_log",
@@ -124,6 +126,10 @@ def build_feature_dict(row: Dict[str, Any], win_prob: float) -> Dict[str, Any]:
     val_target_win = row.get("target_win")
     target_win = int(float(val_target_win)) if val_target_win is not None else 0
 
+    val_target_top2 = row.get("target_top2")
+    # target_top2 が CSV に存在しない場合は None（後で 0.5補正フォールバック）
+    target_top2 = int(float(val_target_top2)) if val_target_top2 not in (None, "", "nan") else None
+
     val_target_top3 = row.get("target_top3")
     target_top3 = int(float(val_target_top3)) if val_target_top3 is not None else 0
 
@@ -143,6 +149,7 @@ def build_feature_dict(row: Dict[str, Any], win_prob: float) -> Dict[str, Any]:
         "jockey_reason_codes": [],
         # 正解ラベル（払戻計算用、value_ai には渡さない）
         "_target_win":      target_win,
+        "_target_top2":     target_top2,   # None = CSV未収録（0.5補正フォールバック）
         "_target_top3":     target_top3,
         "_win_odds_log":    raw_odds_log,
     }
@@ -271,20 +278,21 @@ def run_value_ai_pipeline(
 def simulate_payout(
     plan: Dict[str, Any],
     features: List[Dict[str, Any]],
+    dividends: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     推奨買い目と実際の結果から払戻を計算する。
 
     Args:
-        plan: run_value_ai_pipeline の戻り値
-        features: build_feature_dict で作成した馬リスト
+        plan:      run_value_ai_pipeline の戻り値
+        features:  build_feature_dict で作成した馬リスト
+        dividends: dividend_cache.json から引いた当該レースの払戻辞書
+                   例: {"単勝": 1270, "複勝": [350,120,170], "馬連": 1960, ...}
+                   None の場合は理論近似値にフォールバック
 
     Returns:
-        {"hit": bool, "payout": float, "invest": int} または
-        None（見送りの場合）
-
-    Note:
-        馬連・ワイド・3連複の払戻は理論近似値（実際の JRA 払戻とは乖離する場合あり）
+        {"hit": bool, "payout": float, "invest": int, "real_dividend": bool}
+        または None（見送りの場合）
     """
     if plan.get("skip"):
         return None
@@ -292,99 +300,138 @@ def simulate_payout(
     bet_type = plan.get("bet_type", "-")
     horses = plan.get("horses", [])
     invest = int(plan.get("total_stake") or STAKE_UNIT)
-
     fmap = {f["horse_name"]: f for f in features}
+    top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
+    winner_name = next((f["horse_name"] for f in features if f["_target_win"] == 1), None)
+    # target_top2 が利用可能かチェック（None = CSV未収録）
+    _has_top2 = any(f.get("_target_top2") is not None for f in features)
+    top2_names = (
+        {f["horse_name"] for f in features if f.get("_target_top2") == 1}
+        if _has_top2 else None
+    )
+
+    def _payout_from_dividend(key: str, idx: int = 0) -> Optional[float]:
+        """dividends から払戻を取得。リスト形式は idx 番目（最小値）を返す。"""
+        if dividends is None:
+            return None
+        val = dividends.get(key)
+        if val is None:
+            return None
+        if isinstance(val, list):
+            positives = [v for v in val if isinstance(v, (int, float)) and v > 0]
+            if not positives:
+                return None
+            return min(positives)   # 保守的に最小値
+        return float(val)
 
     # ── 単勝 ──
     if bet_type == "単勝" and len(horses) >= 1:
         h = fmap.get(horses[0])
         if h is None:
-            return {"hit": False, "payout": 0, "invest": invest}
+            return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
         if h["_target_win"] == 1:
+            real = _payout_from_dividend("単勝")
+            if real is not None:
+                payout = real / 100 * invest
+                return {"hit": True, "payout": payout, "invest": invest, "real_dividend": True}
             payout = math.exp(h["_win_odds_log"]) * invest
-            return {"hit": True, "payout": payout, "invest": invest}
-        return {"hit": False, "payout": 0, "invest": invest}
+            return {"hit": True, "payout": payout, "invest": invest, "real_dividend": False}
+        return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
     # ── 複勝 ──
-    # factor は複勝オッズそのもの（例: 1番人気=1.55倍）
     if bet_type == "複勝" and len(horses) >= 1:
         h = fmap.get(horses[0])
         if h is None:
-            return {"hit": False, "payout": 0, "invest": invest}
+            return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
         if h["_target_top3"] == 1:
+            real = _payout_from_dividend("複勝")
+            if real is not None:
+                payout = real / 100 * invest
+                return {"hit": True, "payout": payout, "invest": invest, "real_dividend": True}
             pop = h.get("popularity_rank", 99)
             factor = _PLACE_FACTORS.get(pop, _PLACE_FACTOR_DEFAULT)
             payout = factor * invest
-            return {"hit": True, "payout": payout, "invest": invest}
-        return {"hit": False, "payout": 0, "invest": invest}
+            return {"hit": True, "payout": payout, "invest": invest, "real_dividend": False}
+        return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
     # ── 馬連 ──
-    # 的中: 推奨2頭が上位2頭（_target_win=1 の馬 + もう1頭の top3）
-    # 払戻近似: oa * ob * 0.75 * invest（理論値）
+    # 馬連は1着+2着の組み合わせ。
+    # target_top2 が利用可能な場合: 正確に判定
+    # 利用不可の場合: 「1着馬を選択 AND パートナーがtop3（非1着）」で暫定判定し
+    #                 0.5補正を乗じる（パートナーが2位である確率 ≈ 50%）
     if bet_type in ("馬連", "馬連流し") and len(horses) >= 2:
-        winner_name = next(
-            (f["horse_name"] for f in features if f["_target_win"] == 1), None
-        )
-        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
-        # 軸 = horses[0]、相手 = horses[1:]
-        axis = horses[0]
-        partners = horses[1:]
-        # 的中: 軸が top3 かつ 相手のいずれかが top3、かつ両馬が 1着・2着
-        hit = False
-        payout_horse_a = payout_horse_b = None
-        if axis in top3_names:
-            for partner in partners:
-                if partner in top3_names:
-                    # 両馬が top3 に含まれる（馬連の近似的中）
-                    ha = fmap.get(axis)
-                    hb = fmap.get(partner)
-                    if ha is not None and hb is not None:
-                        hit = True
-                        payout_horse_a, payout_horse_b = ha, hb
-                        break
-        if hit and payout_horse_a and payout_horse_b:
-            oa = math.exp(payout_horse_a["_win_odds_log"])
-            ob = math.exp(payout_horse_b["_win_odds_log"])
-            ticket_count = max(len(partners), 1)
-            payout = oa * ob * 0.75 * (invest / ticket_count)
-            return {"hit": True, "payout": payout, "invest": invest}
-        return {"hit": False, "payout": 0, "invest": invest}
+        all_picks = set(horses)
+        ticket_count = max(len(horses) - 1, 1)
+        if top2_names is not None:
+            # target_top2 利用可能 → 正確判定（補正不要）
+            hit = bool(top2_names & all_picks) and bool(
+                {winner_name} & all_picks if winner_name else set()
+            )
+            correction = 1.0
+        else:
+            # target_top2 未収録 → 0.5補正フォールバック
+            winner_in_picks = winner_name is not None and winner_name in all_picks
+            non_winner_top3_in_picks = any(
+                h in top3_names and h != winner_name for h in all_picks
+            )
+            hit = winner_in_picks and non_winner_top3_in_picks
+            correction = 0.5
+        if hit:
+            real = _payout_from_dividend("馬連")
+            if real is not None:
+                payout = real / 100 * (invest / ticket_count) * correction
+                return {"hit": True, "payout": payout, "invest": invest, "real_dividend": True}
+            ref_name = winner_name
+            partner = next(
+                (h for h in all_picks if h in top3_names and h != winner_name), None
+            )
+            ha, hb = fmap.get(ref_name), fmap.get(partner) if partner else None
+            if ha and hb:
+                oa = math.exp(ha["_win_odds_log"])
+                ob = math.exp(hb["_win_odds_log"])
+                payout = oa * ob * 0.75 * (invest / ticket_count) * correction
+                return {"hit": True, "payout": payout, "invest": invest, "real_dividend": False}
+        return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
     # ── ワイド / ワイドBOX ──
-    # 払戻近似: oa * ob * 0.25 * invest（理論値）
     if bet_type in ("ワイド", "ワイドBOX") and len(horses) >= 2:
-        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
         from itertools import combinations
         ticket_count = max(len(list(combinations(horses, 2))), 1)
         for ha_name, hb_name in combinations(horses, 2):
             if ha_name in top3_names and hb_name in top3_names:
+                real = _payout_from_dividend("ワイド")
+                if real is not None:
+                    payout = real / 100 * (invest / ticket_count)
+                    return {"hit": True, "payout": payout, "invest": invest, "real_dividend": True}
                 ha = fmap.get(ha_name)
                 hb = fmap.get(hb_name)
                 if ha and hb:
                     oa = math.exp(ha["_win_odds_log"])
                     ob = math.exp(hb["_win_odds_log"])
                     payout = oa * ob * 0.25 * (invest / ticket_count)
-                    return {"hit": True, "payout": payout, "invest": invest}
-        return {"hit": False, "payout": 0, "invest": invest}
+                    return {"hit": True, "payout": payout, "invest": invest, "real_dividend": False}
+        return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
     # ── 3連複 / 3連複BOX ──
-    # 払戻近似: 的中3頭のオッズ積 * 0.70 * (invest / ticket_count)（理論値）
     if bet_type in ("3連複", "三連複", "3連複BOX") and len(horses) >= 3:
-        top3_names = {f["horse_name"] for f in features if f["_target_top3"] == 1}
         from itertools import combinations
         combos = list(combinations(horses, 3))
         ticket_count = max(len(combos), 1)
         for trio in combos:
             if all(h in top3_names for h in trio):
+                real = _payout_from_dividend("3連複")
+                if real is not None:
+                    payout = real / 100 * (invest / ticket_count)
+                    return {"hit": True, "payout": payout, "invest": invest, "real_dividend": True}
                 hs = [fmap.get(h) for h in trio]
                 if all(h is not None for h in hs):
                     odds_product = math.prod(math.exp(h["_win_odds_log"]) for h in hs)
                     payout = odds_product * 0.70 * (invest / ticket_count)
-                    return {"hit": True, "payout": payout, "invest": invest}
-        return {"hit": False, "payout": 0, "invest": invest}
+                    return {"hit": True, "payout": payout, "invest": invest, "real_dividend": False}
+        return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
     # ── 対応外 ──
-    return {"hit": False, "payout": 0, "invest": invest}
+    return {"hit": False, "payout": 0, "invest": invest, "real_dividend": False}
 
 
 def run_backtest(
@@ -408,6 +455,16 @@ def run_backtest(
             "records": [{"race_id", "year", "bet_type", "horses", "hit", "invest", "payout"}],
         }
     """
+    # 払戻キャッシュ読み込み
+    import json as _json
+    _dividend_cache: Dict[str, Any] = {}
+    if os.path.exists(DIVIDEND_CACHE_FILE):
+        with open(DIVIDEND_CACHE_FILE, encoding="utf-8") as _f:
+            _dividend_cache = _json.load(_f)
+        print(f"払戻キャッシュ: {len(_dividend_cache):,} 件読み込み済み")
+    else:
+        print(f"[警告] {DIVIDEND_CACHE_FILE} が見つかりません。理論近似値を使用します。")
+
     print(f"CSVを読み込み中: {csv_path}")
     df_full = pd.read_csv(csv_path, low_memory=False)
     df_full["year"] = pd.to_datetime(df_full["race_date"], errors="coerce").dt.year
@@ -459,7 +516,11 @@ def run_backtest(
             plan = run_value_ai_pipeline(features, pace_balance, bankroll=bankroll)
             y_total += 1
 
-            result = simulate_payout(plan, features)
+            if plan.get("bet_type") in EXCLUDED_BET_TYPES:
+                continue  # 除外券種は見送り
+
+            dividends = _dividend_cache.get(str(race_id))
+            result = simulate_payout(plan, features, dividends=dividends)
             if result is None:
                 continue
 
@@ -568,8 +629,7 @@ def print_summary(result: Dict[str, Any]) -> None:
             continue
         b_hit = v["hits"] / v["races"] * 100
         b_roi = v["payout"] / v["invest"] * 100 if v["invest"] > 0 else 0.0
-        note  = "  ※近似" if bet_type not in ("単勝", "複勝") else ""
-        print(f"  {bet_type:6s}: 的中率 {b_hit:5.1f}%  ROI {b_roi:6.1f}%  ({v['races']}件){note}")
+        print(f"  {bet_type:6s}: 的中率 {b_hit:5.1f}%  ROI {b_roi:6.1f}%  ({v['races']}件)")
 
     print("\n" + "=" * 60)
 

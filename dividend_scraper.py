@@ -25,8 +25,33 @@ from race_history_ai import infer_style
 # 定数
 # =========================================================
 
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; keiba-ai/1.0)"}
+# ブラウザに偽装したヘッダー（botと判定されにくくする）
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 _RESULT_URL = "https://race.netkeiba.com/race/result.html?race_id={race_id}"
+
+# セッション（Cookie を自動保持し、コネクションを再利用する）
+_session = requests.Session()
+_session.headers.update(_HEADERS)
 
 
 # =========================================================
@@ -37,47 +62,70 @@ def _fetch_html(url: str, retries: int = 3) -> Optional[str]:
     """汎用 HTML 取得（レース一覧など正常な400が起こりうるページ用）"""
     for i in range(retries):
         try:
-            r = requests.get(url, headers=_HEADERS, timeout=12)
+            r = _session.get(url, timeout=15)
             r.encoding = "euc-jp"
             if r.status_code == 400 and len(r.content) == 0:
                 return None  # 非開催日など正常な空レスポンス
             return r.text
         except Exception:
             if i < retries - 1:
-                time.sleep(1.5)
+                time.sleep(random.uniform(1.5, 3.0))
     return None
 
 
 _consecutive_blocks = 0
 _BLOCK_THRESHOLD    = 3
-_BLOCK_SLEEP_SEC    = 600  # 10分
+# 指数バックオフ: 1回目30秒 → 2回目2分 → 3回目10分 → 4回目以降20分
+_BACKOFF_SCHEDULE   = [30, 120, 600, 1200]
+
+# 短い HTML でも「存在する」と判断するための最小バイト数
+# netkeiba の「レースなし」ページは ~400 bytes、正常ページは数十KB
+_MIN_VALID_CONTENT_BYTES = 2000
 
 
 def _fetch_result_html(url: str, retries: int = 3) -> Optional[str]:
-    """レース結果・馬情報ページ用（IP制限を検出して自動回復）"""
+    """レース結果・馬情報ページ用（IP制限を指数バックオフで自動回復）
+
+    400 empty → IPブロック or レース不存在の2パターンがある。
+    区別方法:
+      - 連続して起きている → IPブロックの可能性が高い → バックオフ
+      - 初回から発生 & 中身が小さい → レース不存在 → 即 None 返し
+    """
     global _consecutive_blocks
     for i in range(retries):
         try:
-            r = requests.get(url, headers=_HEADERS, timeout=12)
+            r = _session.get(url, timeout=15)
             r.encoding = "euc-jp"
-            if r.status_code == 400 and len(r.content) == 0:
+            is_empty_response = (
+                r.status_code in (400, 404)
+                or (r.status_code == 200 and len(r.content) < _MIN_VALID_CONTENT_BYTES)
+            )
+            if is_empty_response:
                 _consecutive_blocks += 1
+                # 連続ブロックがしきい値未満 & 初回失敗 → レース不存在とみなし即 None
+                if _consecutive_blocks < _BLOCK_THRESHOLD and i == 0:
+                    _consecutive_blocks = max(0, _consecutive_blocks - 1)
+                    return None
                 if _consecutive_blocks >= _BLOCK_THRESHOLD:
+                    wait = _BACKOFF_SCHEDULE[
+                        min(_consecutive_blocks - _BLOCK_THRESHOLD,
+                            len(_BACKOFF_SCHEDULE) - 1)
+                    ]
                     print(
                         f"\n  [警告] IP制限を検出 ({_consecutive_blocks}回連続)。"
-                        f"{_BLOCK_SLEEP_SEC // 60}分待機後に再開します...",
+                        f"{wait}秒待機後に再開します...",
                         flush=True,
                     )
-                    time.sleep(_BLOCK_SLEEP_SEC)
+                    time.sleep(wait)
                     _consecutive_blocks = 0
                 elif i < retries - 1:
-                    time.sleep(3.0)
+                    time.sleep(random.uniform(3.0, 6.0))
                 continue
             _consecutive_blocks = 0
             return r.text
         except Exception:
             if i < retries - 1:
-                time.sleep(1.5)
+                time.sleep(random.uniform(1.5, 3.0))
     return None
 
 
@@ -179,13 +227,25 @@ def scrape_race_result(race_id: str) -> Optional[Dict[str, Any]]:
             race_name = elem.get_text(strip=True)
             break
 
-    # 馬場状態
+    # 馬場状態 / 距離 / 馬場種別
     track_condition: Optional[str] = None
+    surface: Optional[str] = None      # "芝" or "ダート"
+    distance: Optional[int] = None     # metres e.g. 1600
     _rd01 = soup.select_one(".RaceData01")
     if _rd01:
-        _tc_m = re.search(r"[／/]\s*(良|稍重|重|不良)", _rd01.get_text())
+        _rd01_text = _rd01.get_text()
+        _tc_m = re.search(r"[／/]\s*(良|稍重|重|不良)", _rd01_text)
         if _tc_m:
             track_condition = _tc_m.group(1)
+        # 馬場種別（芝 / ダート）
+        if "芝" in _rd01_text:
+            surface = "芝"
+        elif re.search(r"ダ[ー・]?[トレ]?", _rd01_text):
+            surface = "ダート"
+        # 距離
+        _dist_m = re.search(r"(\d{3,4})m", _rd01_text)
+        if _dist_m:
+            distance = int(_dist_m.group(1))
 
     # ── 走者データ ──────────────────────────────────────────
     runners: List[Dict[str, Any]] = []
@@ -284,6 +344,8 @@ def scrape_race_result(race_id: str) -> Optional[Dict[str, Any]]:
         "race_date":       race_date,
         "race_name":       race_name,
         "track_condition": track_condition,
+        "surface":         surface,
+        "distance":        distance,
         "runners":         runners,
         "dividends":       dividends,
         "finish_order":    finish_order,

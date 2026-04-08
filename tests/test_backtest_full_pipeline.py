@@ -227,3 +227,34 @@ def test_simulate_payout_skip():
     plan = {"skip": True, "total_stake": 0}
     result = simulate_payout(plan, features)
     assert result is None
+
+
+def test_simulate_payout_real_dividend_tansho():
+    """dividends 辞書を渡すと real_dividend=True で払戻が計算される。"""
+    features = _make_features(8)  # H0 が勝ち馬
+    plan = {"bet_type": "単勝", "horses": ["H0"], "total_stake": 100, "skip": False}
+    dividends = {"単勝": 1270}  # 12.7倍
+    result = simulate_payout(plan, features, dividends=dividends)
+    assert result["hit"] is True
+    assert result["real_dividend"] is True
+    assert abs(result["payout"] - 1270 / 100 * 100) < 0.01
+
+
+def test_simulate_payout_real_dividend_miss_ignores_dividends():
+    """外れ時は dividends があっても payout=0 で real_dividend=False。"""
+    features = _make_features(8)
+    plan = {"bet_type": "単勝", "horses": ["H1"], "total_stake": 100, "skip": False}
+    dividends = {"単勝": 1270}
+    result = simulate_payout(plan, features, dividends=dividends)
+    assert result["hit"] is False
+    assert result["payout"] == 0
+    assert result["real_dividend"] is False
+
+
+def test_simulate_payout_no_real_dividend_flag_without_dividends():
+    """dividends=None のときは real_dividend=False（理論近似値）。"""
+    features = _make_features(8)
+    plan = {"bet_type": "単勝", "horses": ["H0"], "total_stake": 100, "skip": False}
+    result = simulate_payout(plan, features, dividends=None)
+    assert result["hit"] is True
+    assert result["real_dividend"] is False
