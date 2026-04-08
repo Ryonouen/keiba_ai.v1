@@ -153,15 +153,15 @@ def _render_bet_type_table(races: List[Dict]) -> None:
 
 def _render_horse_table(horses: List[Dict], status: str) -> None:
     """
-    AI予測順 vs 実際の着順テーブル。
+    AI予測順 vs 実際の着順テーブル（コンパクト表示）。
     status="result" のとき actual_rank 列を表示しハイライトする。
     """
     has_result = status == "result"
     medal = {1: "🥇", 2: "🥈", 3: "🥉"}
     actual_bg = {
-        1: "rgba(231,76,60,0.20)",
-        2: "rgba(52,152,219,0.14)",
-        3: "rgba(149,117,205,0.12)",
+        1: "rgba(231,76,60,0.22)",
+        2: "rgba(52,152,219,0.16)",
+        3: "rgba(149,117,205,0.13)",
     }
     ai_rank_color = {1: "#e74c3c", 2: "#e67e22", 3: "#27ae60"}
 
@@ -174,59 +174,68 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         win_prob  = h.get("ai_win_prob")
         actual    = h.get("actual_rank") if has_result else None
 
-        # 行背景
         row_bg = actual_bg.get(actual, "transparent") if actual else "transparent"
 
-        # AI順バッジ
-        ai_bg  = ai_rank_color.get(ai_rank, "#4a4a6a")
-        ai_cell = (
-            f'<span style="background:{ai_bg};color:#fff;padding:2px 8px;'
-            f'border-radius:10px;font-weight:bold;font-size:12px">{ai_rank}</span>'
-        )
-
-        # 着順セル
-        if actual is not None:
-            m = medal.get(actual, "")
-            actual_cell = f'{m} <b>{actual}着</b>'
-        elif has_result:
-            actual_cell = '?'
+        # AI順: 上位3はカラーバッジ、それ以外はグレーテキスト
+        ai_bg = ai_rank_color.get(ai_rank, "")
+        if ai_bg:
+            ai_cell = (
+                f'<span style="display:inline-block;background:{ai_bg};color:#fff;'
+                f'width:22px;height:22px;border-radius:50%;text-align:center;'
+                f'line-height:22px;font-weight:bold;font-size:12px">{ai_rank}</span>'
+            )
         else:
-            actual_cell = '<span style="color:#555">—</span>'
+            ai_cell = f'<span style="color:#666;font-size:12px">{ai_rank}</span>'
 
-        # 馬番バッジ
+        # 着順: メダル+着 or グレー数字
+        if actual is not None:
+            if actual <= 3:
+                actual_cell = f'<span style="font-size:13px">{medal[actual]}</span><span style="font-weight:bold;font-size:12px;margin-left:2px">{actual}着</span>'
+            else:
+                actual_cell = f'<span style="color:#888;font-size:12px">{actual}着</span>'
+        elif has_result:
+            actual_cell = '<span style="color:#555;font-size:12px">?</span>'
+        else:
+            actual_cell = '<span style="color:#444;font-size:11px">—</span>'
+
+        # 馬番: 小さい角丸バッジ
         no_cell = (
-            f'<span style="background:#293174;color:#fff;padding:1px 6px;'
-            f'border-radius:4px;font-size:12px">{horse_no}</span>'
-            if horse_no is not None else '—'
+            f'<span style="background:#1e2a4a;color:#7fb3d3;padding:1px 5px;'
+            f'border-radius:3px;font-size:12px;font-weight:bold">{horse_no}</span>'
+            if horse_no is not None else '<span style="color:#444">—</span>'
         )
 
         prob_str = f'{win_prob * 100:.1f}%' if win_prob is not None else '—'
         pop_str  = f'{pop}人気' if pop is not None else '—'
         name_cell = (
-            f'<span style="color:#e0e0e0;font-weight:bold">{name}</span>'
-            + (f'<br><span style="color:#888;font-size:11px">{jockey}</span>' if jockey else '')
+            f'<span style="color:#e0e0e0;font-size:13px;font-weight:bold">{name}</span>'
+            + (f' <span style="color:#666;font-size:11px">{jockey}</span>' if jockey else '')
         )
 
         rows_html.append(
-            f'<tr style="background:{row_bg};border-bottom:1px solid #2a2a3a">'
-            f'<td style="padding:7px 6px;text-align:center">{ai_cell}</td>'
-            f'<td style="padding:7px 6px;text-align:center;white-space:nowrap">{actual_cell}</td>'
-            f'<td style="padding:7px 6px;text-align:center">{no_cell}</td>'
-            f'<td style="padding:7px 6px">{name_cell}</td>'
-            f'<td style="padding:7px 6px;text-align:center;color:#aaa;font-size:12px">{pop_str}</td>'
-            f'<td style="padding:7px 6px;text-align:right;color:#7fb3d3;font-weight:bold">{prob_str}</td>'
+            f'<tr style="background:{row_bg};border-bottom:1px solid #1e1e2e">'
+            f'<td style="padding:5px 4px;text-align:center;width:46px">{ai_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:center;width:68px;white-space:nowrap">{actual_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:center;width:44px">{no_cell}</td>'
+            f'<td style="padding:5px 8px">{name_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:center;width:54px;color:#888;font-size:11px">{pop_str}</td>'
+            f'<td style="padding:5px 6px;text-align:right;width:54px;color:#7fb3d3;font-size:12px;font-weight:bold">{prob_str}</td>'
             f'</tr>'
         )
 
     table = (
-        '<table style="width:100%;border-collapse:collapse;font-family:sans-serif;font-size:13px">'
-        '<thead><tr style="border-bottom:2px solid #3a3a5a;color:#888;font-size:11px">'
-        '<th style="padding:5px 6px;text-align:center">AI順</th>'
-        '<th style="padding:5px 6px;text-align:center">着順</th>'
-        '<th style="padding:5px 6px;text-align:center">馬番</th>'
-        '<th style="padding:5px 6px;text-align:left">馬名 / 騎手</th>'
-        '<th style="padding:5px 6px;text-align:center">人気</th>'
-        '<th style="padding:5px 6px;text-align:right">AI勝率</th>'
+        '<table style="width:100%;border-collapse:collapse;font-family:sans-serif;table-layout:fixed">'
+        '<colgroup>'
+        '<col style="width:46px"><col style="width:68px"><col style="width:44px">'
+        '<col><col style="width:54px"><col style="width:54px">'
+        '</colgroup>'
+        '<thead><tr style="border-bottom:1px solid #3a3a5a">'
+        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">AI順</th>'
+        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">着順</th>'
+        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">馬番</th>'
+        '<th style="padding:4px 8px;text-align:left;color:#666;font-size:10px;font-weight:normal">馬名 / 騎手</th>'
+        '<th style="padding:4px;text-align:center;color:#666;font-size:10px;font-weight:normal">人気</th>'
+        '<th style="padding:4px 6px;text-align:right;color:#666;font-size:10px;font-weight:normal">AI勝率</th>'
         '</tr></thead>'
         f'<tbody>{"".join(rows_html)}</tbody>'
         '</table>'
