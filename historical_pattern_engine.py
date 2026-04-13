@@ -10,16 +10,18 @@ TOKEN_SCORE_CAP = 0.45
 FEATURE_SCORE_CAP = 0.40
 
 TOKEN_WEIGHT_PREFIXES: Tuple[Tuple[str, float], ...] = (
-    ("race_top3:", 1.00),
-    ("race_any:", 0.75),
-    ("distance_top3:", 0.65),
-    ("distance_any:", 0.45),
-    ("grade_top3:", 0.55),
-    ("grade_any:", 0.35),
-    ("month_top3:", 0.30),
-    ("month_any:", 0.20),
-    ("age:", 0.45),
-    ("gate:", 0.40),
+    ("race_top3:",     0.70),
+    ("race_any:",      0.50),
+    ("distance_top3:", 0.60),
+    ("distance_any:",  0.40),
+    ("grade_top3:",    0.55),
+    ("grade_any:",     0.35),
+    ("month_top3:",    0.30),
+    ("month_any:",     0.20),
+    ("age:",           0.40),
+    ("gate:",          0.35),
+    ("body_weight:",   0.45),
+    ("trial_group:",   0.55),
 )
 
 
