@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 from statistics import mean, pstdev
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,10 +10,15 @@ from openai import OpenAI
 from openai_cost_guard import safe_chat_create
 from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
+from netkeiba_scrape_helpers import (
+    extract_expected_starter_count_from_html,
+    should_reuse_race_analysis_cache,
+)
 from value_ai import (
     build_ev_table,
     detect_value_horses,
     detect_danger_favorites_v2,
+    detect_underrated_by_ability,
     apply_trend_adjustments,
     classify_race_structure,
     recommend_bet_plan,
@@ -27,7 +33,9 @@ import os
 import random
 import re
 import time
+import requests
 from bs4 import BeautifulSoup
+from dividend_scraper import scrape_race_result
 
 from race_history_ai import (
     fetch_race_history as history_fetch_race_history,
@@ -39,8 +47,20 @@ from race_history_ai import (
     analyze_10y_race_trend,
     match_current_runners_with_10y_trend,
     fetch_race_history_enriched,
+    race_names_match,
 )
 from trend_stats import build_condition_stats, build_combo_condition_stats
+from route_profile_engine import (
+    apply_route_profile_bias,
+    build_route_context,
+    build_route_profile,
+    score_route_context,
+)
+from historical_pattern_engine import (
+    apply_historical_pattern_bias,
+    build_historical_pattern_profile as build_historical_pattern_profile_stats,
+    score_feature_patterns,
+)
 
 from selenium import webdriver
 from selenium.webdriver import ActionChains
@@ -74,6 +94,12 @@ COOKIE_FILE: str = "netkeiba_cookies.json"
 USE_UNDETECTED_CHROMEDRIVER: bool = False
 CACHE_DIR: str = ".keiba_cache"
 CACHE_TTL_SECONDS: int = 60 * 60 * 6
+ROUTE_PROFILE_YEARS: int = 8
+ROUTE_PROFILE_PROB_WEIGHT: float = 0.35
+ROUTE_PROFILE_CACHE_VERSION: str = "v3"
+HISTORICAL_PATTERN_YEARS: int = 8
+HISTORICAL_PATTERN_PROB_WEIGHT: float = 0.30
+HISTORICAL_PATTERN_CACHE_VERSION: str = "v1"
 def random_sleep(min_sec: float = 0.8, max_sec: float = 1.8) -> None:
     time.sleep(random.uniform(min_sec, max_sec))
 
@@ -144,6 +170,11 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
         options.add_argument("--lang=ja-JP")
         driver = uc.Chrome(options=options, use_subprocess=True)
         driver.implicitly_wait(5)
+        try:
+            driver.set_page_load_timeout(12)
+            driver.set_script_timeout(15)
+        except Exception:
+            pass
         return driver
 
     options = webdriver.ChromeOptions()
@@ -166,6 +197,11 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
     _driver_path = _v145 if os.path.exists(_v145) else ChromeDriverManager().install()
     driver = webdriver.Chrome(service=Service(_driver_path), options=options)
     driver.implicitly_wait(5)
+    try:
+        driver.set_page_load_timeout(12)
+        driver.set_script_timeout(15)
+    except Exception:
+        pass
 
     try:
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -396,6 +432,7 @@ class RaceMeta:
     target_course: str
     target_ground: str
     predicted_pace: str = ""
+    starter_count: Optional[int] = None
 
 
 # =========================================================
@@ -494,6 +531,22 @@ def parse_first_corner_position(passing_text: str) -> Optional[int]:
 
 def parse_last3f(text: str) -> Optional[float]:
     return parse_float(text)
+
+
+def parse_body_weight(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse '456(-2)' → (456, -2). Returns (None, None) on failure."""
+    if not text:
+        return None, None
+    m = re.match(r"(\d+)\s*\(([+-]?\d+)\)", text.strip())
+    if not m:
+        try:
+            return int(text.strip()), None
+        except Exception:
+            return None, None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except Exception:
+        return None, None
 
 
 def safe_float_mean(values: List[float]) -> Optional[float]:
@@ -636,6 +689,180 @@ def calc_ai_power_index(feature: Dict[str, Any]) -> float:
         ai_power = model_score * 100
 
     return round(ai_power, 2)
+
+
+# =========================================================
+# AbilityScore — ベース能力指標
+# =========================================================
+# 設計方針:
+#   win_prob (LightGBM binary) はレース全馬の相対確率で、3〜9%に圧縮されるため
+#   「能力の大小」を表現しにくい。AbilityScore は馬自身の歴史的実績に基づく
+#   絶対能力指標として win_prob とは独立して計算する。
+#
+#   含む指標: 過去成績ベースのもの（距離適性、近走、クラス実績、上昇度、安定性、上がり3F）
+#   除外する指標: 枠順・展開予測・ペース想定・斤量・オッズ変化（race-context依存）
+#
+# 重みチューニング方針:
+#   ABILITY_WEIGHTS を回収率検証後に最適化できるよう dict として独立保持。
+#   各値の合計 = 1.0 を維持すること。
+ABILITY_WEIGHTS: Dict[str, float] = {
+    "recent_form_index":                 0.28,  # 近走成績（主軸：直近パフォーマンスが最重要）
+    "race_level_index":                  0.22,  # 過去出走クラス（G1=1.0, 条件戦=0.4〜0.5）
+    "distance_course_suitability_index": 0.18,  # この距離×コースでの過去実績
+    "trend_index":                       0.12,  # 上昇/下降フォーム
+    "consistency_index":                 0.10,  # 安定性（成績のバラツキ小＝高スコア）
+    "last3f_index":                      0.06,  # 上がり3F速度（スピード能力の代理指標）
+    "style_suitability_index":           0.04,  # 脚質適性（展開依存60%含むため低め）
+}
+# 合計: 1.00
+
+
+def calc_base_ability_score(feature: Dict[str, Any]) -> float:
+    """
+    馬のベース能力を 0〜1 の連続値で返す（raw_ability_score）。
+
+    - 欠損フィールドは 0.5（中立）でフォールバック
+    - race-context 指標（枠・ペース・展開）は含まない
+    - 0.0 は有効値（成績が極めて悪い馬）なので `or 0.5` は使わない
+
+    Returns
+    -------
+    float : raw_ability_score in [0, 1]
+    """
+    total = 0.0
+    for key, weight in ABILITY_WEIGHTS.items():
+        val = feature.get(key)
+        val = float(val) if val is not None else 0.5  # データなし → 中立値
+        total += val * weight
+    return round(total, 6)
+
+
+def attach_ability_scores(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    feature list 全馬に以下のフィールドを in-place で付与して返す。
+
+    raw_ability_score : calc_base_ability_score の生値 (0〜1)
+    ability_score     : 表示用スコア (0〜100, raw * 100)
+                        min-max 正規化しない → 混戦レースで差が誇張されない
+    ability_rank      : レース内能力ランク (1 = 最高能力)
+    winprob_rank      : 勝率ランク (1 = 最高 win_prob)
+
+    将来の改善:
+      - ABILITY_WEIGHTS を回収率ベースで最適化
+      - raw_ability_score を win_prob 再計算の起点として使用可能
+    """
+    if not features:
+        return features
+
+    for f in features:
+        raw = calc_base_ability_score(f)
+        f["raw_ability_score"] = raw
+        f["ability_score"] = round(raw * 100, 1)
+        # race_context_adj / win_score: 将来の win_prob 再計算の土台
+        # 現時点では診断・UI表示用。win_prob の計算には使用しない。
+        ctx = calc_race_context_adjustment(f)
+        f["race_context_adj"] = ctx
+        f["win_score"] = calc_win_score_from_ability(raw, ctx)
+
+    # ability_rank: raw_ability_score 降順
+    for rank, f in enumerate(
+        sorted(features, key=lambda x: x["raw_ability_score"], reverse=True), start=1
+    ):
+        f["ability_rank"] = rank
+
+    # winprob_rank: win_prob 降順
+    for rank, f in enumerate(
+        sorted(features, key=lambda x: float(x.get("win_prob") or 0.0), reverse=True), start=1
+    ):
+        f["winprob_rank"] = rank
+
+    return features
+
+
+# =========================================================
+# win_prob 再計算アーキテクチャの土台（将来拡張用 scaffold）
+# =========================================================
+# 設計思想:
+#   現状: win_prob = LightGBM binary → softmax（3〜9%に圧縮されがち）
+#   将来:
+#     win_score = raw_ability_score * ABILITY_WEIGHT
+#                 + calc_race_context_adjustment(f) * CONTEXT_WEIGHT
+#     win_prob  = softmax(win_scores, temperature=low)
+#
+#   この構造により:
+#     1. 能力差が大きいレース → win_score の分散が大きい → 確率に差がつく
+#     2. 展開有利 / 不利が明確な馬 → context_adj で加減
+#     3. LightGBM を残しつつ blend 比率を調整可能
+#
+# 現在のステータス:
+#   - calc_race_context_adjustment: 実装済み（compute のみ、win_prob には未接続）
+#   - calc_win_score_from_ability:  実装済み（compute のみ、win_prob には未接続）
+#   - attach_ability_scores で race_context_adj / win_score を feature dict に保存済み
+#   → UI で「能力 vs 勝率の乖離理由」の表示に活用できる状態
+
+# race_context_adjustment に使う指標と重み
+# 能力指標とは異なり、これらは「今日のレース固有」の要因
+# 全指標を 0〜1 範囲に揃えること（マルチプライヤー型は除外）
+RACE_CONTEXT_WEIGHTS: Dict[str, float] = {
+    "pace_bias_index":       0.40,  # 脚質×予想ペースの相性（0-1、高いほど有利）
+    "lap_suitability_index": 0.25,  # ラップパターン適性（0-1、高いほど有利）
+    "rotation_index":        0.20,  # 前走間隔適性（0-1、短すぎ/長すぎは低め）
+    "training_index":        0.15,  # 調教状態（0-1、0.5=中立、>0.5=好調）
+}
+# 合計: 1.00
+# 除外した理由:
+#   gate_index: マルチプライヤー型（~0.85-1.15）→ 0-1スケールに合わない
+#   pace_advantage: 同上（~0.85-1.15）→ lap_suitability_index でカバー済み
+
+
+def calc_race_context_adjustment(feature: Dict[str, Any]) -> float:
+    """
+    レース固有の文脈補正値を 0〜1 の連続値で返す。
+
+    この値は raw_ability_score とは独立した「今日のレースで有利かどうか」を示す。
+    能力があっても展開不利の馬は race_context_adj が低くなり、
+    能力がなくても展開有利の馬は高くなる。
+
+    用途:
+      - 現在: feature dict に `race_context_adj` として保存（UI診断用）
+      - 将来: calc_win_score_from_ability() の入力として win_prob 再計算に使用
+
+    デフォルト値について:
+      - 全指標が 0.5 なら context_adj = 0.5（中立）
+      - 欠損フィールドは 0.5 でフォールバック
+    """
+    total = 0.0
+    for key, weight in RACE_CONTEXT_WEIGHTS.items():
+        val = feature.get(key)
+        val = float(val) if val is not None else 0.5
+        total += val * weight
+    return round(total, 6)
+
+
+def calc_win_score_from_ability(
+    raw_ability: float,
+    race_context_adj: float,
+    ability_weight: float = 0.65,
+) -> float:
+    """
+    raw_ability と race_context_adj を合成した「勝つための総合スコア」を返す。
+
+    win_score = raw_ability * ability_weight
+                + race_context_adj * (1 - ability_weight)
+
+    将来の win_prob 再計算の入口:
+      win_probs = softmax([calc_win_score_from_ability(f) for f in features])
+
+    ability_weight のデフォルト 0.65:
+      - 馬の能力が勝敗の65%を決める（残り35%が展開・枠等）
+      - 回収率検証後に調整することを想定
+
+    Returns
+    -------
+    float : win_score in [0, 1] range
+    """
+    score = raw_ability * ability_weight + race_context_adj * (1.0 - ability_weight)
+    return round(float(score), 6)
 
 
 def build_radar_payload(feature: Dict[str, Any]) -> Dict[str, Any]:
@@ -1596,6 +1823,10 @@ ML_FEATURE_COLUMNS: List[str] = [
     "feat_cond_diff_weight",
     "feat_cond_diff_jockey",
     "feat_cond_diff_track",
+    # 旧21列モデルが期待するベース指標
+    "feat_recent_form",
+    "feat_trend_index",
+    "feat_consistency_index",
 ]
 
 
@@ -1661,6 +1892,9 @@ def _inject_ml_features(
             "feat_cond_diff_weight":     cond_diffs.get("feat_cond_diff_weight", 0.0),
             "feat_cond_diff_jockey":     cond_diffs.get("feat_cond_diff_jockey", 0.0),
             "feat_cond_diff_track":      cond_diffs.get("feat_cond_diff_track", 0.0),
+            "feat_recent_form":          round(float(f.get("recent_form_index", 0.0) or 0.0), 5),
+            "feat_trend_index":          round(float(f.get("trend_index", 0.0) or 0.0), 5),
+            "feat_consistency_index":    round(float(f.get("consistency_index", 0.0) or 0.0), 5),
         })
 
 
@@ -1717,10 +1951,9 @@ def predict_win_probability_with_model(
         X = pd.DataFrame([{col: f.get(col, 0.0) for col in ML_FEATURE_COLUMNS} for f in features])
         preds = model.predict(X)
         preds = [float(p) for p in preds]
-        total = sum(preds)
-        if total <= 0:
-            return None
-        return [p / total for p in preds]
+        # softmax で差を増幅してから正規化（単純合計割りだと分散が潰れる）
+        temp = calc_softmax_temperature(preds)
+        return softmax(preds, temperature=temp)
     except Exception as e:
         print(f"LightGBM予測に失敗したためルールベースにフォールバックします: {e}")
         return None
@@ -2175,6 +2408,9 @@ def refresh_feature_outputs(features: List[Dict[str, Any]]) -> List[Dict[str, An
         f["expected_value_score"] = calc_expected_value_score(f)
         f["bet_suitability"] = classify_bet_suitability(f)
 
+    # AbilityScore: ベース能力を win_prob と独立して算出（表示・EV分析の両方に使用）
+    features = attach_ability_scores(features)
+
     features.sort(key=lambda x: (x.get("win_prob", 0.0), x.get("ai_power_index", 0.0)), reverse=True)
     return features
 
@@ -2204,6 +2440,8 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         result["winner_conditions"] = result.get("winner_conditions") or []
         result["condition_match_horses"] = result.get("condition_match_horses") or []
         result["winner_pattern_ai"] = result.get("winner_pattern_ai") or {}
+        result["route_profile"] = result.get("route_profile") or {}
+        result["historical_pattern_profile"] = result.get("historical_pattern_profile") or {}
         return result
 
     features = refresh_feature_outputs(features)
@@ -2224,6 +2462,8 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     result["winner_conditions"] = result.get("winner_conditions") or []
     result["condition_match_horses"] = result.get("condition_match_horses") or []
     result["winner_pattern_ai"] = result.get("winner_pattern_ai") or {}
+    result["route_profile"] = result.get("route_profile") or {}
+    result["historical_pattern_profile"] = result.get("historical_pattern_profile") or {}
     result["ai_comment"] = generate_ai_comment(result)
 
     # =========================================================
@@ -2237,12 +2477,14 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         danger_v2      = detect_danger_favorites_v2(ev_table, features, race_pace)
         value_v2       = detect_value_horses(ev_table, features, race_pace)
         horse_marks    = assign_marks(features, ev_table, danger_v2)
+        underrated     = detect_underrated_by_ability(ev_table)
 
-        result["ev_table"]            = ev_table
-        result["race_structure"]      = race_structure
-        result["value_horses_v2"]     = value_v2
-        result["danger_favorites_v2"] = danger_v2
-        result["horse_marks"]         = horse_marks
+        result["ev_table"]               = ev_table
+        result["race_structure"]         = race_structure
+        result["value_horses_v2"]        = value_v2
+        result["danger_favorites_v2"]    = danger_v2
+        result["horse_marks"]            = horse_marks
+        result["underrated_by_ability"]  = underrated   # 能力>市場評価の馬リスト
         # bet_plan は bankroll が必要なのでここでは空。keiba_app.py 側で生成する。
         result.setdefault("bet_plan", {})
     except Exception:
@@ -2251,6 +2493,7 @@ def refresh_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         result.setdefault("value_horses_v2", [])
         result.setdefault("danger_favorites_v2", [])
         result.setdefault("horse_marks", [])
+        result.setdefault("underrated_by_ability", [])
         result.setdefault("bet_plan", {})
 
     return result
@@ -2541,13 +2784,54 @@ def analyze_winner_patterns_with_chatgpt(
 # Scraping helpers
 # =========================================================
 
-def extract_race_meta(driver: webdriver.Chrome) -> RaceMeta:
+def _extract_start_time_from_text(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(\d{1,2})[:時](\d{2})\s*分?\s*発走", text)
+    if not m:
+        return ""
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _extract_first_int(text: str) -> Optional[int]:
+    if text is None:
+        return None
+    m = re.search(r"(?<!\d)(\d{1,2})(?!\d)", str(text).replace(",", ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def extract_race_meta(driver: webdriver.Chrome, html_text: str = "") -> RaceMeta:
     title = safe_driver_title(driver)
     race_info_text = ""
 
     race_info_elements = driver.find_elements(By.CSS_SELECTOR, ".RaceData01, .RaceData02")
     if race_info_elements:
         race_info_text = " ".join([e.text for e in race_info_elements if e.text])
+
+    if not race_info_text and html_text:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for selector in [
+            ".RaceData01",
+            ".RaceData02",
+            "[class*='RaceData']",
+            "[class*='RaceInfo']",
+        ]:
+            nodes = soup.select(selector)
+            texts = [node.get_text(" ", strip=True) for node in nodes if node.get_text(" ", strip=True)]
+            if texts:
+                race_info_text = " ".join(texts)
+                break
+
+        if not race_info_text:
+            flat_text = soup.get_text(" ", strip=True)
+            m = re.search(r"(\d{1,2}[:時]\d{2}\s*分?\s*発走.{0,120}?\d{3,4}m.{0,80}?(?:良|稍重|重|不良)?)", flat_text)
+            if m:
+                race_info_text = m.group(1)
 
     target_surface, target_distance = parse_distance(race_info_text)
 
@@ -2571,8 +2855,184 @@ def extract_race_meta(driver: webdriver.Chrome) -> RaceMeta:
     )
 
 
-def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
+def _extract_horse_rows_from_html(html_text: str) -> List[Dict[str, Any]]:
+    if not html_text:
+        return []
+
+    def _dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: Dict[str, Dict[str, Any]] = {}
+        ordered_keys: List[str] = []
+
+        def _row_key(row: Dict[str, Any]) -> str:
+            name = str(row.get("name") or "").strip()
+            if name:
+                return f"name:{name}"
+            number = row.get("number")
+            return f"no:{number}"
+
+        def _row_score(row: Dict[str, Any]) -> int:
+            score = 0
+            for key in [
+                "link", "gate", "number", "jockey", "trainer", "jockey_weight",
+                "win_odds_scraped", "place_odds_scraped", "popularity", "age",
+            ]:
+                value = row.get(key)
+                if value not in (None, "", 0):
+                    score += 1
+            return score
+
+        for row in rows:
+            key = _row_key(row)
+            prev = deduped.get(key)
+            if prev is None:
+                deduped[key] = row
+                ordered_keys.append(key)
+                continue
+            if _row_score(row) > _row_score(prev):
+                deduped[key] = row
+
+        return [deduped[key] for key in ordered_keys]
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    extracted_dom: List[Dict[str, Any]] = []
+    for tr in soup.select("table.Shutuba_Table tbody tr"):
+        name_node = (
+            tr.select_one(".HorseName a")
+            or tr.select_one("[class*='HorseName'] a")
+            or tr.select_one("a[href*='/horse/']")
+        )
+        name = name_node.get_text(strip=True) if name_node else ""
+        if not name:
+            continue
+
+        def _cell_text(*selectors: str) -> str:
+            for selector in selectors:
+                node = tr.select_one(selector)
+                if node:
+                    text = node.get_text(" ", strip=True)
+                    if text:
+                        return text
+            return ""
+
+        gate_text = _cell_text(".Waku", "[class*='Waku']")
+        number_text = _cell_text(".Umaban", "[class*='Umaban']", "[class*='Horse_Num']")
+        jockey_text = _cell_text(".Jockey", "[class*='Jockey']", "a[href*='/jockey/']")
+        trainer_text = _cell_text(".Trainer", "[class*='Trainer']", "a[href*='/trainer/']")
+        weight_text = _cell_text(".Kinryo", "[class*='Kinryo']")
+        odds_text = _cell_text(".Odds", "[class*='Odds']")
+        popularity_text = _cell_text(".Ninki", "[class*='Ninki']", "[class*='Popular']")
+        age_text = _cell_text(".Barei", "[class*='Barei']")
+        place_odds_text = _cell_text(".Place_Odds", "[class*='Place_Odds']")
+
+        extracted_dom.append({
+            "name": name,
+            "link": str(name_node.get("href") or "").strip() if name_node else "",
+            "gate": _extract_first_int(gate_text),
+            "number": _extract_first_int(number_text),
+            "jockey": jockey_text,
+            "trainer": trainer_text,
+            "jockey_weight": parse_float(weight_text),
+            "win_odds_scraped": parse_float(odds_text),
+            "place_odds_scraped": parse_odds_range_text(place_odds_text),
+            "popularity": _extract_first_int(popularity_text),
+            "age": _extract_first_int(age_text),
+        })
+
+    if extracted_dom:
+        return _dedupe_rows(extracted_dom)
+
+    try:
+        tables = pd.read_html(StringIO(html_text))
+    except Exception:
+        return []
+
+    extracted: List[Dict[str, Any]] = []
+    for tbl in tables:
+        df_tbl = tbl.copy()
+        df_tbl.columns = [str(c) for c in df_tbl.columns]
+
+        horse_col = None
+        gate_col = None
+        number_col = None
+        jockey_col = None
+        trainer_col = None
+        weight_col = None
+        odds_col = None
+        popularity_col = None
+        age_col = None
+
+        for c in df_tbl.columns:
+            c_str = str(c)
+            c_lower = c_str.lower()
+            if horse_col is None and any(k in c_str for k in ["馬名", "Horse"]):
+                horse_col = c
+            if gate_col is None and "枠" in c_str:
+                gate_col = c
+            if number_col is None and any(k in c_str for k in ["馬番", "馬 番", "Umaban"]):
+                number_col = c
+            if jockey_col is None and "騎手" in c_str:
+                jockey_col = c
+            if trainer_col is None and any(k in c_str for k in ["厩舎", "調教師", "Trainer"]):
+                trainer_col = c
+            if weight_col is None and "斤量" in c_str:
+                weight_col = c
+            if odds_col is None and any(k in c_lower for k in ["odds", "単勝", "予想オッズ"]):
+                odds_col = c
+            if popularity_col is None and "人気" in c_str:
+                popularity_col = c
+            if age_col is None and any(k in c_str for k in ["性齢", "性 齢"]):
+                age_col = c
+
+        if horse_col is None:
+            continue
+
+        for _, row in df_tbl.iterrows():
+            name = str(row.get(horse_col, "")).strip()
+            if not name or name == "nan":
+                continue
+
+            extracted.append({
+                "name": name,
+                "link": "",
+                "gate": _extract_first_int(row.get(gate_col, "")) if gate_col is not None else None,
+                "number": _extract_first_int(row.get(number_col, "")) if number_col is not None else None,
+                "jockey": str(row.get(jockey_col, "")).strip() if jockey_col is not None else "",
+                "trainer": str(row.get(trainer_col, "")).strip() if trainer_col is not None else "",
+                "jockey_weight": parse_float(str(row.get(weight_col, "")).strip()) if weight_col is not None else None,
+                "win_odds_scraped": parse_float(str(row.get(odds_col, "")).strip()) if odds_col is not None else None,
+                "popularity": _extract_first_int(row.get(popularity_col, "")) if popularity_col is not None else None,
+                "age": _extract_first_int(row.get(age_col, "")) if age_col is not None else None,
+            })
+
+        if extracted:
+            return _dedupe_rows(extracted)
+
+    return []
+
+
+def fetch_horses(driver: webdriver.Chrome, html_text: str = "") -> List[Dict[str, Any]]:
     horses: List[Dict[str, Any]] = []
+
+    if html_text:
+        html_rows = _extract_horse_rows_from_html(html_text)
+        if html_rows:
+            return [
+                {
+                    "name": str(row.get("name") or ""),
+                    "link": str(row.get("link") or ""),
+                    "gate": row.get("gate"),
+                    "number": row.get("number"),
+                    "jockey": str(row.get("jockey") or ""),
+                    "trainer": str(row.get("trainer") or ""),
+                    "jockey_weight": row.get("jockey_weight"),
+                    "win_odds_scraped": row.get("win_odds_scraped"),
+                    "place_odds_scraped": row.get("place_odds_scraped"),
+                    "popularity": row.get("popularity"),
+                    "age": row.get("age"),
+                }
+                for row in html_rows
+                if str(row.get("name") or "").strip()
+            ]
 
     if driver is None:
         return horses
@@ -2584,35 +3044,83 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
 
     for row in rows:
         try:
-            horse_link_elem = row.find_element(By.CSS_SELECTOR, ".HorseName a")
+            try:
+                horse_link_elem = row.find_element(By.CSS_SELECTOR, ".HorseName a")
+            except Exception:
+                horse_link_elem = row.find_element(By.CSS_SELECTOR, "[class*='HorseName'] a, a[href*='/horse/']")
             horse_name = safe_text(horse_link_elem)
             horse_link = safe_attr(horse_link_elem, "href")
 
-            gate_text = safe_find_text(row, By.CSS_SELECTOR, ".Waku")
-            number_text = safe_find_text(row, By.CSS_SELECTOR, ".Umaban")
-            jockey_text = safe_find_text(row, By.CSS_SELECTOR, ".Jockey")
-            trainer_text = safe_find_text(row, By.CSS_SELECTOR, ".Trainer")
-            weight_text = safe_find_text(row, By.CSS_SELECTOR, ".Kinryo")
-            win_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Odds")
-            place_odds_text = safe_find_text(row, By.CSS_SELECTOR, ".Place_Odds")
-            barei_text = safe_find_text(row, By.CSS_SELECTOR, ".Barei")
+            gate_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Waku")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Waku']")
+            )
+            number_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Umaban")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Umaban']")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Horse_Num']")
+            )
+            jockey_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Jockey")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Jockey']")
+                or safe_find_text(row, By.CSS_SELECTOR, "a[href*='/jockey/']")
+            )
+            trainer_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Trainer")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Trainer']")
+                or safe_find_text(row, By.CSS_SELECTOR, "a[href*='/trainer/']")
+            )
+            weight_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Kinryo")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Kinryo']")
+            )
+            win_odds_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Odds")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Odds']")
+            )
+            place_odds_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Place_Odds")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Place_Odds']")
+            )
+            popularity_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Ninki")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Ninki']")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Popular']")
+            )
+            barei_text = (
+                safe_find_text(row, By.CSS_SELECTOR, ".Barei")
+                or safe_find_text(row, By.CSS_SELECTOR, "[class*='Barei']")
+            )
 
-            if not gate_text:
-                all_tds = row.find_elements(By.TAG_NAME, "td")
-                td_texts = [safe_text(td) for td in all_tds]
-                digit_cells = [t for t in td_texts if t.isdigit()]
-                if len(digit_cells) >= 2:
-                    gate_text = digit_cells[0]
-                    if not number_text:  # .Umaban で取得済みなら上書きしない
-                        number_text = digit_cells[1]
+            all_tds = row.find_elements(By.TAG_NAME, "td")
+            td_texts = [safe_text(td).strip() for td in all_tds]
+            parsed_digits = []
+            for text in td_texts[:4]:
+                val = _extract_first_int(text)
+                if val is not None:
+                    parsed_digits.append(val)
 
-            gate = int(gate_text) if gate_text.isdigit() else None
-            number = int(number_text) if number_text.isdigit() else None
+            if not gate_text and parsed_digits:
+                gate_text = str(parsed_digits[0])
+            if not number_text and len(parsed_digits) >= 2:
+                number_text = str(parsed_digits[1])
+            if not popularity_text:
+                tail_digits = []
+                for text in td_texts[-5:]:
+                    val = _extract_first_int(text)
+                    if val is not None:
+                        tail_digits.append(val)
+                if tail_digits:
+                    popularity_text = str(tail_digits[-1])
+
+            gate = _extract_first_int(gate_text)
+            number = _extract_first_int(number_text)
             win_odds = parse_float(win_odds_text)
             place_odds = parse_odds_range_text(place_odds_text)
             jockey_weight = parse_float(weight_text)
             _age_m = re.search(r"(\d+)", barei_text)
             horse_age = int(_age_m.group(1)) if _age_m else None
+            popularity = _extract_first_int(popularity_text)
 
             horses.append({
                 "name": horse_name,
@@ -2624,10 +3132,25 @@ def fetch_horses(driver: webdriver.Chrome) -> List[Dict[str, Any]]:
                 "jockey_weight": jockey_weight,
                 "win_odds_scraped": win_odds,
                 "place_odds_scraped": place_odds,
+                "popularity": popularity,
                 "age": horse_age,
             })
         except Exception:
             continue
+
+    if html_text and horses:
+        html_rows = _extract_horse_rows_from_html(html_text)
+        html_by_name = {str(row.get("name") or ""): row for row in html_rows}
+        for horse in horses:
+            html_row = html_by_name.get(str(horse.get("name") or ""))
+            if not html_row:
+                continue
+            for key in ["link", "gate", "number", "jockey", "trainer", "jockey_weight", "win_odds_scraped", "place_odds_scraped", "popularity", "age"]:
+                current = horse.get(key)
+                if current in (None, "", 0):
+                    fallback = html_row.get(key)
+                    if fallback not in (None, "", 0):
+                        horse[key] = fallback
 
     return horses
 
@@ -2993,6 +3516,303 @@ def fetch_horse_records(
     except Exception as e:
         print(f"馬ページ取得中エラー: {type(e).__name__}")
         return records, "", None
+
+
+def fetch_horse_records_requests(
+    horse_url: str,
+    history_limit: int = HISTORY_LIMIT_DEFAULT,
+    cutoff_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    requests + BeautifulSoup 版の馬ページ戦績取得。
+    同一レースの過去ローテ傾向分析用に、Selenium なしで前走だけ拾えるようにする。
+    """
+    records: List[Dict[str, Any]] = []
+    if not horse_url:
+        return records
+
+    horse_url = normalize_horse_result_url(horse_url)
+
+    cache_name = cache_key("horse_records_req", horse_url, history_limit, cutoff_date or "")
+    cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
+    if cached and isinstance(cached.get("records"), list):
+        return cached["records"]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://db.netkeiba.com/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    try:
+        res = requests.get(horse_url, headers=headers, timeout=15)
+        res.encoding = res.apparent_encoding or "EUC-JP"
+        if res.status_code != 200:
+            return records
+        soup = BeautifulSoup(res.text, "html.parser")
+        rows = soup.select(".db_h_race_results tbody tr")
+    except Exception:
+        return records
+
+    collected = 0
+    for row in rows:
+        if collected >= history_limit:
+            break
+
+        cols = row.find_all("td")
+        if len(cols) < 21:
+            continue
+
+        date = cols[0].get_text(strip=True)
+        if cutoff_date and date and date >= cutoff_date:
+            continue
+
+        course_text = cols[1].get_text(strip=True)
+        weather = cols[2].get_text(strip=True) if len(cols) > 2 else ""
+        ground = cols[3].get_text(strip=True) if len(cols) > 3 else ""
+        race_name = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+        popularity_text = cols[10].get_text(strip=True) if len(cols) > 10 else ""
+        rank_text = cols[11].get_text(strip=True) if len(cols) > 11 else ""
+        jockey = cols[12].get_text(strip=True) if len(cols) > 12 else ""
+        weight_text_rec = cols[13].get_text(strip=True) if len(cols) > 13 else ""
+        distance_text = cols[14].get_text(strip=True) if len(cols) > 14 else ""
+        body_weight_text = cols[15].get_text(strip=True) if len(cols) > 15 else ""
+        time_text = cols[17].get_text(strip=True) if len(cols) > 17 else ""
+        last3f_text = cols[18].get_text(strip=True) if len(cols) > 18 else ""
+        margin_text = cols[19].get_text(strip=True) if len(cols) > 19 else ""
+        passing_text = cols[20].get_text(strip=True) if len(cols) > 20 else ""
+
+        surface, distance = parse_distance(distance_text)
+        rank = parse_rank(rank_text)
+        time_sec = parse_time_to_seconds(time_text)
+        first_corner_pos = parse_first_corner_position(passing_text)
+        course_name = parse_course_name(course_text)
+        class_index = parse_race_class_index(race_name)
+        last3f = parse_last3f(last3f_text)
+        popularity_rec = int(popularity_text) if popularity_text.isdigit() else None
+        weight_rec = parse_float(weight_text_rec)
+        horse_body_weight, horse_body_weight_change = parse_body_weight(body_weight_text)
+
+        records.append({
+            "date": date,
+            "course_text": course_text,
+            "course_name": course_name,
+            "weather": weather,
+            "ground": ground,
+            "race_name": race_name,
+            "class_index": class_index,
+            "rank_text": rank_text,
+            "rank": rank,
+            "popularity": popularity_rec,
+            "jockey": jockey,
+            "weight": weight_rec,
+            "time_text": time_text,
+            "time_sec": time_sec,
+            "last3f": last3f,
+            "margin_text": margin_text,
+            "passing_text": passing_text,
+            "first_corner_pos": first_corner_pos,
+            "distance_text": distance_text,
+            "surface": surface,
+            "distance": distance,
+            "body_weight": horse_body_weight,
+            "body_weight_change": horse_body_weight_change,
+        })
+        collected += 1
+
+    save_json_cache(cache_name, {"records": records})
+    return records
+
+
+def normalize_horse_result_url(horse_url: str) -> str:
+    text = str(horse_url or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"/horse/(?:result/)?(\d+)/?", text)
+    if not m:
+        return text
+    horse_id = m.group(1)
+    return f"https://db.netkeiba.com/horse/result/{horse_id}/"
+
+
+def _normalize_cutoff_date(date_text: str) -> str:
+    return str(date_text or "").replace("-", "/")
+
+
+def build_historical_route_profile(
+    current_race_id: str,
+    expected_race_name: str = "",
+    years: int = ROUTE_PROFILE_YEARS,
+) -> Dict[str, Any]:
+    """
+    同一レースの過去N年・全出走馬の前走ローテを集計してプロファイル化する。
+    """
+    if not current_race_id or len(current_race_id) < 12:
+        return {"sample_size": 0, "stats": {}}
+
+    cache_name = cache_key(
+        "route_profile",
+        ROUTE_PROFILE_CACHE_VERSION,
+        current_race_id,
+        expected_race_name,
+        years,
+    )
+    cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
+    if cached:
+        return cached
+
+    current_year = int(str(current_race_id)[:4])
+    suffix = str(current_race_id)[4:]
+    samples: List[Dict[str, Any]] = []
+    used_race_ids: List[str] = []
+
+    for year in range(current_year - 1, current_year - years - 1, -1):
+        race_id = f"{year}{suffix}"
+        race_data = scrape_race_result(race_id)
+        if not race_data:
+            continue
+        if expected_race_name and not race_names_match(str(race_data.get("race_name") or ""), expected_race_name):
+            continue
+
+        cutoff_date = _normalize_cutoff_date(str(race_data.get("race_date") or ""))
+        if not cutoff_date:
+            continue
+
+        used_race_ids.append(race_id)
+
+        for runner in race_data.get("runners", []):
+            horse_url = str(runner.get("horse_url") or "")
+            if not horse_url:
+                continue
+
+            prev_records = fetch_horse_records_requests(horse_url, history_limit=3, cutoff_date=cutoff_date)
+            prev = prev_records[0] if prev_records else {}
+            prev_date = str(prev.get("date") or "")
+            prev_month = None
+            if prev_date:
+                try:
+                    prev_month = int(prev_date.split("/")[1])
+                except Exception:
+                    prev_month = None
+
+            samples.append({
+                "target_rank": runner.get("rank"),
+                "target_popularity": runner.get("popularity"),
+                "prev_race_name": prev.get("race_name") or "",
+                "prev_distance": prev.get("distance"),
+                "prev_month": prev_month,
+                "prev_rank": prev.get("rank"),
+            })
+
+    profile = build_route_profile(samples)
+    profile["source_race_ids"] = used_race_ids
+    profile["source_years"] = len(used_race_ids)
+    save_json_cache(cache_name, profile)
+    return profile
+
+
+def attach_route_profile_scores(
+    features: List[Dict[str, Any]],
+    route_profile: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not features:
+        return features
+
+    sample_size = int((route_profile or {}).get("sample_size") or 0)
+    for feature in features:
+        context = build_route_context(feature)
+        route_score, reasons = score_route_context(context, route_profile or {})
+        feature["route_profile_score"] = route_score if sample_size > 0 else 0.0
+        feature["route_profile_reasons"] = reasons[:3]
+        if "model_score" in feature:
+            feature["model_score"] = round(float(feature.get("model_score") or 0.0) + route_score * 0.12, 6)
+
+    return features
+
+
+def collect_historical_pattern_profile(
+    current_race_id: str,
+    expected_race_name: str = "",
+    years: int = HISTORICAL_PATTERN_YEARS,
+) -> Dict[str, Any]:
+    """
+    同一レースの過去N年・全出走馬の近5走をトークン化し、
+    好走馬に共通する履歴パターンをプロファイル化する。
+    """
+    if not current_race_id or len(current_race_id) < 12:
+        return {"sample_size": 0, "token_stats": {}}
+
+    cache_name = cache_key(
+        "historical_pattern",
+        HISTORICAL_PATTERN_CACHE_VERSION,
+        current_race_id,
+        expected_race_name,
+        years,
+    )
+    cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
+    if cached:
+        return cached
+
+    current_year = int(str(current_race_id)[:4])
+    suffix = str(current_race_id)[4:]
+    samples: List[Dict[str, Any]] = []
+    used_race_ids: List[str] = []
+
+    for year in range(current_year - 1, current_year - years - 1, -1):
+        race_id = f"{year}{suffix}"
+        race_data = scrape_race_result(race_id)
+        if not race_data:
+            continue
+        if expected_race_name and not race_names_match(str(race_data.get("race_name") or ""), expected_race_name):
+            continue
+
+        cutoff_date = _normalize_cutoff_date(str(race_data.get("race_date") or ""))
+        if not cutoff_date:
+            continue
+
+        used_race_ids.append(race_id)
+
+        for runner in race_data.get("runners", []):
+            horse_url = str(runner.get("horse_url") or "")
+            if not horse_url:
+                continue
+
+            past_records = fetch_horse_records_requests(horse_url, history_limit=5, cutoff_date=cutoff_date)
+            samples.append({
+                "target_rank": runner.get("rank"),
+                "age": runner.get("age"),
+                "gate": runner.get("gate"),
+                "past_races": past_records,
+            })
+
+    profile = build_historical_pattern_profile_stats(samples)
+    profile["source_race_ids"] = used_race_ids
+    profile["source_years"] = len(used_race_ids)
+    save_json_cache(cache_name, profile)
+    return profile
+
+
+def attach_historical_pattern_scores(
+    features: List[Dict[str, Any]],
+    historical_pattern_profile: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not features:
+        return features
+
+    sample_size = int((historical_pattern_profile or {}).get("sample_size") or 0)
+    for feature in features:
+        pattern_score, reasons = score_feature_patterns(feature, historical_pattern_profile or {})
+        feature["historical_pattern_score"] = pattern_score if sample_size > 0 else 0.0
+        feature["historical_pattern_reasons"] = reasons[:4]
+        if "model_score" in feature:
+            feature["model_score"] = round(
+                float(feature.get("model_score") or 0.0) + pattern_score * 0.10,
+                6,
+            )
+
+    return features
 
 
 # =========================================================
@@ -3385,6 +4205,7 @@ def analyze_race(
     race_url: str,
     history_limit: int = HISTORY_LIMIT_DEFAULT,
     headless: bool = False,
+    force_refresh_cache: bool = False,
 ) -> Dict[str, Any]:
     input_url = race_url.strip()
     if "newspaper.html" in input_url:
@@ -3402,6 +4223,8 @@ def analyze_race(
     # netkeibaの結果ページから実日付を取得する。取得失敗時は年のみのフォールバック。
     _rid_m = re.search(r"race_id=(\d{8,})", shutuba_url)
     _cutoff_date: Optional[str] = None
+    _debug_race_id = _rid_m.group(1) if _rid_m else ""
+    print(f"[analyze_race] start race_id={_debug_race_id or 'unknown'}", flush=True)
     if _rid_m:
         _rid = _rid_m.group(1)
         try:
@@ -3420,20 +4243,26 @@ def analyze_race(
     # "cutoff_v2": race_idから正しい実日付を取得するよう修正したバージョン。
     # 旧キャッシュ（cutoff 修正前のリーク済み分析結果）を自動無効化するための固定バージョン文字列。
     race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2")
-    cached_result = load_json_cache(race_cache_name)
-    if cached_result and cached_result.get("race_meta") and cached_result.get("features"):
-        # キャッシュが同一 race_id を指しているか確認（URL 変更漏れや手動上書きによる混入を防ぐ）
-        _cached_rid = cached_result.get("input_race_id", "")
-        _input_rid_m = re.search(r"race_id=(\d+)", shutuba_url)
-        _input_rid = _input_rid_m.group(1) if _input_rid_m else ""
-        if _cached_rid and _input_rid and _cached_rid != _input_rid:
-            cached_result = None  # race_id 不一致 → このキャッシュは別レースのもの、破棄
-        else:
-            return refresh_result_payload(cached_result)
+    if force_refresh_cache:
+        print(f"[analyze_race] cache bypass race_id={_debug_race_id or 'unknown'}", flush=True)
+    else:
+        cached_result = load_json_cache(race_cache_name)
+        if should_reuse_race_analysis_cache(cached_result):
+            # キャッシュが同一 race_id を指しているか確認（URL 変更漏れや手動上書きによる混入を防ぐ）
+            _cached_rid = cached_result.get("input_race_id", "")
+            _input_rid_m = re.search(r"race_id=(\d+)", shutuba_url)
+            _input_rid = _input_rid_m.group(1) if _input_rid_m else ""
+            if _cached_rid and _input_rid and _cached_rid != _input_rid:
+                cached_result = None  # race_id 不一致 → このキャッシュは別レースのもの、破棄
+            else:
+                print(f"[analyze_race] cache hit race_id={_input_rid or 'unknown'}", flush=True)
+                return refresh_result_payload(cached_result)
 
     driver = build_webdriver(headless=headless)
     try:
+        print("[analyze_race] webdriver ready", flush=True)
         driver = warmup_netkeiba_session(driver, headless=headless)
+        print("[analyze_race] warmup done", flush=True)
 
         driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
         random_sleep(5.0, 7.5)
@@ -3441,6 +4270,11 @@ def analyze_race(
 
         page_src = safe_page_source(driver)
         current_title = safe_driver_title(driver)
+        expected_starter_count = extract_expected_starter_count_from_html(page_src)
+        print(
+            f"[analyze_race] shutuba loaded expected_starters={expected_starter_count or 0}",
+            flush=True,
+        )
 
         if is_blocked_page(page_src, current_title):
             return {
@@ -3452,6 +4286,7 @@ def analyze_race(
                     "target_course": "unknown",
                     "target_ground": "",
                     "predicted_pace": "unknown",
+                    "starter_count": expected_starter_count,
                 },
                 "features": [],
                 "error": "HTTP400_BLOCKED",
@@ -3460,21 +4295,53 @@ def analyze_race(
         save_cookies(driver, COOKIE_FILE)
 
         tables: List[Any] = []
-        for _ in range(20):
+        prev_count = 0
+        stable_count = 0
+        print("[analyze_race] waiting shutuba rows stabilize", flush=True)
+        for _ in range(30):
             try:
                 tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
             except Exception:
                 tables = []
 
-            if tables and len(tables) > 3:
-                break
+            current_count = len(tables)
+            target_count = expected_starter_count or 4
+            if current_count >= target_count:
+                if current_count == prev_count:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        break
+                else:
+                    stable_count = 0
+                prev_count = current_count
 
             time.sleep(1)
 
-        time.sleep(1.5)
+        print(
+            f"[analyze_race] shutuba rows stabilized count={len(tables)} stable_count={stable_count}",
+            flush=True,
+        )
+        time.sleep(1.0)
 
-        race_meta = extract_race_meta(driver)
-        horses = fetch_horses(driver)
+        print("[analyze_race] extracting race meta", flush=True)
+        race_meta = extract_race_meta(driver, page_src)
+        race_meta.starter_count = expected_starter_count
+        print("[analyze_race] race meta extracted", flush=True)
+        print("[analyze_race] fetching horses", flush=True)
+        horses = fetch_horses(driver, page_src)
+        print(f"[analyze_race] fetched horses count={len(horses)}", flush=True)
+        if expected_starter_count and len(horses) < expected_starter_count:
+            for _ in range(2):
+                driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
+                time.sleep(2.0)
+                retry_horses = fetch_horses(driver)
+                if len(retry_horses) > len(horses):
+                    horses = retry_horses
+                if len(horses) >= expected_starter_count:
+                    break
+
+        if race_meta.starter_count is None:
+            race_meta.starter_count = len(horses) if horses else None
         newspaper_records: Dict[str, Dict[str, Any]] = {}
 
         try:
@@ -3483,6 +4350,17 @@ def analyze_race(
             newspaper_records = fetch_newspaper_records(driver)
         except Exception:
             newspaper_records = {}
+        print(
+            f"[analyze_race] newspaper loaded records={len(newspaper_records)}",
+            flush=True,
+        )
+        # 新聞データが0件でも、馬リンクが取れていれば個別ページフォールバックを許可する。
+        # これが無いと records_source=none が全頭に波及し、能力値が横並びになる。
+        _allow_horse_page_fallback = any(str(h.get("link") or "").strip() for h in horses)
+        print(
+            f"[analyze_race] horse page fallback={'on' if _allow_horse_page_fallback else 'off'}",
+            flush=True,
+        )
 
         if not horses:
             return {
@@ -3498,9 +4376,13 @@ def analyze_race(
         horse_results: List[Dict[str, Any]] = []
         entry_styles: List[str] = []
 
-        for horse in horses:
+        for idx, horse in enumerate(horses, 1):
             horse_url = str(horse.get("link") or "")
             if not horse_url:
+                print(
+                    f"[analyze_race] skip horse without link idx={idx} name={horse.get('name', '')}",
+                    flush=True,
+                )
                 continue
 
             # 新聞データがあればそれを優先使用（高速化 + 脚質取得の正確化）
@@ -3514,13 +4396,22 @@ def analyze_race(
             _had_newspaper_records = bool(isinstance(newspaper_entry, dict) and newspaper_entry.get("records"))
 
             if not records:
-                records, sire_name, _birthday = fetch_horse_records(
-                    driver,
-                    horse_url,
-                    history_limit=history_limit,
-                    headless=headless,
-                    cutoff_date=_cutoff_date,
-                )
+                if _allow_horse_page_fallback:
+                    print(
+                        f"[analyze_race] horse fallback idx={idx}/{len(horses)} name={horse['name']}",
+                        flush=True,
+                    )
+                    records, sire_name, _birthday = fetch_horse_records(
+                        driver,
+                        horse_url,
+                        history_limit=history_limit,
+                        headless=headless,
+                        cutoff_date=_cutoff_date,
+                    )
+                else:
+                    records = []
+                    sire_name = ""
+                    _birthday = None
             else:
                 # 新聞データ利用時も birthday だけは個別ページキャッシュから取る
                 _bday_cache = load_json_cache(cache_key("horse_records", horse_url, history_limit, _cutoff_date or ""))
@@ -3551,6 +4442,7 @@ def analyze_race(
             horse_results.append({
                 "name": horse["name"],
                 "link": horse.get("link", ""),
+                "number": horse.get("number"),
                 "records": records,
                 "entry_style":style,
                 "gate": horse.get("gate"),
@@ -3561,14 +4453,21 @@ def analyze_race(
                 "jockey_weight": horse.get("jockey_weight"),
                 "win_odds_scraped": horse.get("win_odds_scraped"),
                 "place_odds_scraped": horse.get("place_odds_scraped"),
+                "popularity": horse.get("popularity"),
                 "sire_name": sire_name,
                 "style_char_scraped": horse.get("style_char_scraped", ""),
                 "newspaper_mark": newspaper_mark,
                 "records_source": records_source,
             })
+            if idx == len(horses) or idx % 4 == 0:
+                print(
+                    f"[analyze_race] horse progress {idx}/{len(horses)}",
+                    flush=True,
+                )
 
         predicted_pace = calc_pace_pressure(entry_styles)
         race_meta.predicted_pace = predicted_pace
+        print(f"[analyze_race] horse loop done predicted_pace={predicted_pace}", flush=True)
 
         # =========================================================
         # コース傾向バイアス取得
@@ -3622,6 +4521,7 @@ def analyze_race(
             # 可観測性フィールド（診断用 — ロジックには使用しない）
             feature_dict["sire_name"] = hr.get("sire_name", "")
             feature_dict["records_source"] = hr.get("records_source", "none")
+            feature_dict["horse_url"] = hr.get("link", "")
             # 馬番（出馬表順ソート用）
             feature_dict["horse_number"] = hr.get("number")
             # 馬齢（性齢欄から取得: 7歳以上フィルタ等に使用）
@@ -3633,6 +4533,7 @@ def analyze_race(
             feature_dict["weight_index"] = calc_weight_index(_jw, _field_weights)
             # H2: スクレイプ失敗診断フィールド（ロジック未使用・デバッグ用）
             feature_dict["weight_index_source"] = "scraped" if _jw is not None else "default_no_data"
+            feature_dict["popularity"] = hr.get("popularity")
             # オッズ変化指数
             _h_name = str(hr["name"])
             _prev_o = _prev_odds_snap.get(_h_name) if _prev_odds_snap else None
@@ -3655,6 +4556,7 @@ def analyze_race(
             feature_dict["jockey_combo_top2"]  = sum(1 for r in _combo_recs if r["rank"] <= 2)
             feature_dict["jockey_combo_top3"]  = sum(1 for r in _combo_recs if r["rank"] <= 3)
             features.append(feature_dict)
+        print(f"[analyze_race] features built count={len(features)}", flush=True)
 
         # =========================================================
         # 調教情報取得・注入
@@ -3684,6 +4586,7 @@ def analyze_race(
 
             f["course_bias"] = bias
             f["model_score"] = round(base_score, 6)
+        print("[analyze_race] model scores prepared", flush=True)
         # =========================================================
         # 過去10年レース傾向AI（完全版）
         # =========================================================
@@ -3696,6 +4599,8 @@ def analyze_race(
         winner_pattern_ai: Dict[str, Any] = {}
         condition_stats: Dict[str, Any] = {}
         combo_condition_stats: Dict[str, Any] = {}
+        route_profile: Dict[str, Any] = {}
+        historical_pattern_profile: Dict[str, Any] = {}
 
         try:
             if current_race_id:
@@ -3751,6 +4656,26 @@ def analyze_race(
 
                 deterministic_pattern = history_build_winner_condition_ai(past_10y_results) or {}
                 winner_conditions = deterministic_pattern.get("conditions", []) or []
+
+                try:
+                    route_profile = build_historical_route_profile(
+                        current_race_id,
+                        expected_race_name=_expected_name,
+                        years=ROUTE_PROFILE_YEARS,
+                    )
+                    features = attach_route_profile_scores(features, route_profile)
+                except Exception:
+                    route_profile = {}
+
+                try:
+                    historical_pattern_profile = collect_historical_pattern_profile(
+                        current_race_id,
+                        expected_race_name=_expected_name,
+                        years=HISTORICAL_PATTERN_YEARS,
+                    )
+                    features = attach_historical_pattern_scores(features, historical_pattern_profile)
+                except Exception:
+                    historical_pattern_profile = {}
 
                 condition_match_horses = []
                 condition_scores = deterministic_pattern.get("condition_scores", {}) or {}
@@ -3823,6 +4748,8 @@ def analyze_race(
             winner_pattern_ai = {}
             condition_stats       = {}
             combo_condition_stats = {}
+            historical_pattern_profile = {}
+        print("[analyze_race] trend analysis done", flush=True)
 
         # 過去10年傾向をmodel_scoreに反映してから確率計算する
         # condition_stats が取得できていれば証拠ベースの補正を優先する
@@ -3840,9 +4767,17 @@ def analyze_race(
         ml_probs = predict_win_probability_with_model(features, MODEL_FILE)
 
         if ml_probs is not None:
-            probs = ml_probs
-            for f in features:
-                f["model_type"] = "lightgbm"
+            # Rankerスコアをブレンド（モデルファイルがあれば）
+            try:
+                from ranker_engine import predict_rank_score, blend_scores as _blend
+                rank_scores = predict_rank_score(features, profile="balanced")
+                probs = _blend(ml_probs, rank_scores, weight_ranker=0.35)
+                for f in features:
+                    f["model_type"] = "lightgbm+ranker" if rank_scores else "lightgbm"
+            except Exception:
+                probs = ml_probs
+                for f in features:
+                    f["model_type"] = "lightgbm"
         else:
             _scores = [f["model_score"] for f in features]
             _temp = calc_softmax_temperature(_scores)
@@ -3851,8 +4786,29 @@ def analyze_race(
                 f["model_type"] = "rule_based"
                 f["softmax_temperature"] = _temp
 
+        if route_profile and int(route_profile.get("sample_size") or 0) >= 8:
+            probs = apply_route_profile_bias(probs, features, weight=ROUTE_PROFILE_PROB_WEIGHT)
+            for f in features:
+                f["route_profile_applied"] = True
+
+        if historical_pattern_profile and int(historical_pattern_profile.get("sample_size") or 0) >= 8:
+            probs = apply_historical_pattern_bias(
+                probs, features, weight=HISTORICAL_PATTERN_PROB_WEIGHT
+            )
+            for f in features:
+                f["historical_pattern_applied"] = True
+
         for f, p in zip(features, probs):
             f["win_prob"] = round(p, 4)
+        print("[analyze_race] probabilities assigned", flush=True)
+
+        # 学習データ勝者プロファイル補正（脚質・年齢・人気帯リフト）
+        try:
+            from training_stats import apply_training_stats_bonus
+            _class_hint = parse_race_class_index(race_meta.race_title) if race_meta else 0.65
+            features = apply_training_stats_bonus(features, class_index_hint=_class_hint)
+        except Exception:
+            pass
 
         _sim_pace = (race_meta.predicted_pace if race_meta else "") or "medium"
         pace_probs = race_pace_simulation(features, predicted_pace=_sim_pace)
@@ -3899,43 +4855,6 @@ def analyze_race(
             f["bet_suitability"] = classify_bet_suitability(f)
             f["danger_favorite_score"] = 0.0
             f["is_danger_favorite"] = False
-                    # =========================================================
-        # 過去10年レース傾向AI
-        # =========================================================
-        current_race_id = extract_race_id_from_url(shutuba_url)
-
-        past_10y_results = []
-        race_trend_10y = {}
-        trend_match_horses = []
-
-        try:
-            if current_race_id:
-                # 第1ブロックと同じ race_meta.race_title を渡して別レース混入を防ぐ
-                past_10y_results = fetch_past_10y_results(
-                    driver, current_race_id, race_meta.race_title
-                )
-                race_trend_10y = analyze_10y_race_trend(past_10y_results)
-                trend_match_horses = match_current_runners_with_10y_trend(features, race_trend_10y)
-
-# ==============================
-# 勝ち馬パターンAI（ChatGPT分析）
-# ==============================
-                winner_pattern_ai = analyze_winner_patterns_with_chatgpt(
-                    race_meta.race_title,
-                    past_10y_results,
-                    features
-                )
-
-                result["winner_pattern_ai"] = winner_pattern_ai
-                result["winner_conditions"] = winner_pattern_ai.get("winner_conditions", [])
-                result["condition_match_horses"] = winner_pattern_ai.get("matching_horses", [])
-
-        except Exception:
-            past_10y_results = []
-            race_trend_10y = {}
-            trend_match_horses = []
-        
-
         ai_bets = generate_ai_bets(features)
         result = {
             "race_meta": race_meta.__dict__,
@@ -3950,6 +4869,12 @@ def analyze_race(
             "winner_conditions": winner_conditions,
             "condition_match_horses": condition_match_horses,
             "winner_pattern_ai": winner_pattern_ai,
+            "route_profile": route_profile,
+            "historical_pattern_profile": historical_pattern_profile,
+            "past_results": [],
+            "race_trends": {},
+            "winner_pattern_confidence": float(winner_pattern_ai.get("confidence", 0.0) or 0.0),
+            "winner_pattern_notes": str(winner_pattern_ai.get("notes", "") or ""),
             # 分析対象レースの一意識別情報（混同防止・UI表示・キャッシュ検証用）
             "input_race_id": current_race_id,
             "race_signature": (
@@ -3962,54 +4887,13 @@ def analyze_race(
                 # =========================================================
         # 過去10年レース傾向AI
         # =========================================================
-        try:
-            race_id_match = re.search(r"race_id=(\d+)", shutuba_url)
-            if race_id_match:
-                race_id = race_id_match.group(1)
-
-                past_results = history_fetch_race_history(
-                    driver, race_id, expected_race_name=race_meta.race_title
-                )
-                race_trend = history_analyze_race_trend(past_results)
-                race_summary = history_build_race_trend_summary(past_results)
-                winner_conditions = history_build_winner_condition_ai(past_results)
-                gpt_pattern_result = analyze_winner_patterns_with_chatgpt(
-                    race_title=race_meta.race_title,
-                    past_results=past_results,
-                    features=features,
-                )
-
-                result["past_results"] = past_results
-                result["race_trends"] = race_trend if isinstance(race_trend, dict) else {}
-                result["race_history_summary"] = gpt_pattern_result.get("trend_summary") or race_summary
-                result["winner_conditions"] = gpt_pattern_result.get("winner_conditions") or (
-                    winner_conditions if isinstance(winner_conditions, list) else [winner_conditions]
-                )
-                result["condition_match_horses"] = gpt_pattern_result.get("matching_horses", [])
-                result["winner_pattern_confidence"] = gpt_pattern_result.get("confidence", 0.0)
-                result["winner_pattern_notes"] = gpt_pattern_result.get("notes", "")
-            else:
-                result["past_results"] = []
-                result["race_trends"] = {}
-                result["race_history_summary"] = "race_idを取得できませんでした"
-                result["winner_conditions"] = ["条件データなし"]
-                result["condition_match_horses"] = []
-                result["winner_pattern_confidence"] = 0.0
-                result["winner_pattern_notes"] = "race_idなし"
-
-        except Exception as e:
-            result["past_results"] = []
-            result["race_trends"] = {}
-            result["race_history_summary"] = f"過去10年傾向の取得に失敗: {e}"
-            result["winner_conditions"] = ["条件データなし"]
-            result["condition_match_horses"] = []
-            result["winner_pattern_confidence"] = 0.0
-            result["winner_pattern_notes"] = str(e)
         # 最終AI指標・期待値・危険人気馬などを再計算
         result = refresh_result_payload(result)
-
-        result = refresh_result_payload(result)
-        save_json_cache(race_cache_name, result)
+        print("[analyze_race] payload refreshed", flush=True)
+        cached_starter_count = result.get("race_meta", {}).get("starter_count")
+        if not cached_starter_count or len(result.get("features", [])) >= cached_starter_count:
+            save_json_cache(race_cache_name, result)
+            print("[analyze_race] cache saved", flush=True)
         return result
     
     finally:

@@ -282,7 +282,7 @@ def test_run_daily_saves_v2_fields(tmp_path, monkeypatch):
         "danger_favorites_v2": [],
     }
 
-    def fake_analyze(url, headless=True):
+    def fake_analyze(url, headless=True, **kwargs):
         return fake_result
 
     def fake_get_ids(date_str):

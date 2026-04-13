@@ -77,6 +77,36 @@ def bucket_distance(distance: Any) -> str:
     return "ge_2000"
 
 
+def bucket_body_weight(weight: Any) -> str:
+    try:
+        value = int(float(weight))
+    except Exception:
+        return "unknown"
+    if value < 440:
+        return "under_440"
+    if value < 460:
+        return "440_459"
+    if value < 480:
+        return "460_479"
+    return "480_plus"
+
+
+_GI_PREP_RACES = frozenset({
+    "チューリップ賞", "フィリーズレビュー", "アネモネS", "クイーンC",
+    "弥生賞", "スプリングS", "共同通信杯", "ホープフルS",
+    "アーリントンC", "ニュージーランドT",
+})
+
+
+def classify_trial_group(race_names: List[str]) -> str:
+    """Returns 'gi_prep' if any race name is a known GI prep trial, else 'direct'."""
+    normalized = {normalize_race_name(n) for n in race_names}
+    for name in normalized:
+        if name in _GI_PREP_RACES:
+            return "gi_prep"
+    return "direct"
+
+
 def extract_month(date_text: Any) -> str:
     text = str(date_text or "").strip()
     m = re.match(r"^\d{4}[/-](\d{1,2})[/-]\d{1,2}$", text)
@@ -137,6 +167,25 @@ def build_feature_pattern_tokens(feature: Dict[str, Any], max_races: int = 5) ->
             add(f"distance_top3:{distance_bucket}")
             add(f"month_top3:{month}")
             add(f"grade_top3:{grade}")
+
+        body_weight = rec.get("body_weight")
+        body_weight_change = rec.get("body_weight_change")
+        bw_bucket = bucket_body_weight(body_weight)
+        if bw_bucket != "unknown":
+            add(f"body_weight:{bw_bucket}")
+        if body_weight_change is not None:
+            try:
+                chg = int(body_weight_change)
+                if chg > 2:
+                    add("body_weight:gaining")
+                elif chg < -2:
+                    add("body_weight:losing")
+            except Exception:
+                pass
+
+    all_race_names = [rec.get("race_name", "") for rec in list(feature.get("past_races") or [])[:max_races]]
+    trial_group = classify_trial_group(all_race_names)
+    add(f"trial_group:{trial_group}")
 
     return tokens
 
