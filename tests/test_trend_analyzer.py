@@ -7,6 +7,11 @@ from trend_analyzer import (
     score_prev_rank,
     score_running_style,
     score_gate,
+    score_body_weight,
+    score_distance_change,
+    score_sex,
+    score_age,
+    score_jockey,
     analyze_horse_trend,
     apply_trend_analyzer_bias,
 )
@@ -245,3 +250,68 @@ def test_bias_missing_result_uses_neutral():
     result = apply_trend_analyzer_bias(probs, features)
     assert abs(sum(result) - 1.0) < 1e-9
     assert abs(result[0] - 0.6) < 1e-6  # no adjustment = unchanged ratios
+
+
+# ── Phase 2 scoring functions ─────────────────────────────────────────────
+
+def test_body_weight_large_gain_risk():
+    f = _f(past_races=[{"body_weight_change": 16}])
+    _, match, risk = score_body_weight(f)
+    assert risk is not None
+    assert match is None
+
+
+def test_body_weight_small_gain_match():
+    f = _f(past_races=[{"body_weight_change": 4}])
+    _, match, risk = score_body_weight(f)
+    assert match is not None
+
+
+def test_body_weight_no_data_returns_none():
+    f = _f(past_races=[{}])
+    edge, match, risk = score_body_weight(f)
+    assert edge == 0.0 and match is None and risk is None
+
+
+def test_distance_large_extension_risk():
+    f = _f(past_races=[{"distance": 1600}], target_distance=2200)
+    _, match, risk = score_distance_change(f)
+    assert risk is not None
+
+
+def test_distance_same_match():
+    f = _f(past_races=[{"distance": 2000}], target_distance=2000)
+    _, match, risk = score_distance_change(f)
+    assert match is not None
+
+
+def test_score_sex_female_match():
+    f = _f(sex="牝")
+    _, match, risk = score_sex(f)
+    assert match is not None
+
+
+def test_score_sex_male_neutral():
+    f = _f(sex="牡")
+    _, match, risk = score_sex(f)
+    assert match is None and risk is None
+
+
+def test_score_age_three_match():
+    _, match, risk = score_age(_f(age=3))
+    assert match is not None
+
+
+def test_score_age_old_risk():
+    _, match, risk = score_age(_f(age=8))
+    assert risk is not None
+
+
+def test_score_jockey_top_match():
+    _, match, risk = score_jockey(_f(jockey="川田将雅"))
+    assert match is not None
+
+
+def test_score_jockey_unknown_neutral():
+    _, match, risk = score_jockey(_f(jockey="テスト騎手"))
+    assert match is None and risk is None

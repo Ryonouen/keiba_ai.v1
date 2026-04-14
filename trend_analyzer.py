@@ -215,6 +215,107 @@ def score_gate(
 
 
 # =========================================================
+# Phase 2 要素（display-only）
+# =========================================================
+
+_TOP_JOCKEYS = frozenset({
+    "川田将雅", "福永祐一", "武豊", "ルメール", "デムーロ",
+    "戸崎圭太", "横山武史", "松山弘平", "岩田望来", "坂井瑠星",
+})
+
+
+def score_body_weight(
+    feature: Dict[str, Any],
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """馬体重変化の表示。edge = 0（display-only）。"""
+    past_races = feature.get("past_races") or []
+    if not past_races:
+        return 0.0, None, None
+
+    pr0 = past_races[0]
+    change = pr0.get("body_weight_change")
+    if change is None:
+        return 0.0, None, None
+
+    try:
+        chg = int(change)
+    except (ValueError, TypeError):
+        return 0.0, None, None
+
+    if chg > 12:
+        return 0.0, None, f"馬体重大幅増加(+{chg}kg)"
+    if chg < -10:
+        return 0.0, None, f"馬体重大幅減少({chg}kg)"
+    if 2 <= chg <= 8:
+        return 0.0, f"馬体重微増({chg}kg)で状態良好", None
+    return 0.0, None, None
+
+
+def score_distance_change(
+    feature: Dict[str, Any],
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """距離延長/短縮の表示。edge = 0（display-only）。"""
+    past_races = feature.get("past_races") or []
+    curr_dist  = int(feature.get("target_distance") or 0)
+    if not curr_dist or not past_races:
+        return 0.0, None, None
+
+    pr0       = past_races[0]
+    prev_dist = int(pr0.get("distance") or 0)
+    if not prev_dist:
+        return 0.0, None, None
+
+    diff = curr_dist - prev_dist
+    if diff >= 400:
+        return 0.0, None, f"大幅距離延長(+{diff}m)"
+    if diff <= -400:
+        return 0.0, None, f"大幅距離短縮({diff}m)"
+    if diff >= 200:
+        return 0.0, None, f"距離延長({diff}m)"
+    if diff <= -200:
+        return 0.0, None, f"距離短縮({diff}m)"
+    return 0.0, f"前走と同距離圏", None
+
+
+def score_sex(
+    feature: Dict[str, Any],
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """性別表示（牝馬の混合戦など）。edge = 0（display-only）。"""
+    sex = str(feature.get("sex") or "").strip()
+    if sex in ("牝", "F"):
+        return 0.0, "牝馬（混合戦）", None
+    return 0.0, None, None
+
+
+def score_age(
+    feature: Dict[str, Any],
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """年齢傾向表示。edge = 0（display-only）。"""
+    try:
+        age = int(feature.get("age") or 0)
+    except (ValueError, TypeError):
+        return 0.0, None, None
+
+    if age == 3:
+        return 0.0, "3歳馬（成長力あり）", None
+    if age >= 7:
+        return 0.0, None, f"{age}歳（高齢）"
+    return 0.0, None, None
+
+
+def score_jockey(
+    feature: Dict[str, Any],
+) -> Tuple[float, Optional[str], Optional[str]]:
+    """騎手表示。edge = 0（display-only）。"""
+    jockey = str(feature.get("jockey") or "").strip()
+    if not jockey:
+        return 0.0, None, None
+    if jockey in _TOP_JOCKEYS:
+        return 0.0, f"主要騎手({jockey})", None
+    return 0.0, None, None
+
+
+# =========================================================
 # メイン分析関数
 # =========================================================
 
@@ -286,6 +387,41 @@ def analyze_horse_trend(
         match_items.append(gate_match)
     if gate_risk:
         risk_items.append(gate_risk)
+
+    # ── 馬体重変化（display-only）──────────────────────────────────
+    _, bw_match, bw_risk = score_body_weight(feature)
+    if bw_match:
+        match_items.append(bw_match)
+    if bw_risk:
+        risk_items.append(bw_risk)
+
+    # ── 距離延長/短縮（display-only）───────────────────────────────
+    _, dc_match, dc_risk = score_distance_change(feature)
+    if dc_match:
+        match_items.append(dc_match)
+    if dc_risk:
+        risk_items.append(dc_risk)
+
+    # ── 性別（display-only）────────────────────────────────────────
+    _, sx_match, sx_risk = score_sex(feature)
+    if sx_match:
+        match_items.append(sx_match)
+    if sx_risk:
+        risk_items.append(sx_risk)
+
+    # ── 年齢（display-only）────────────────────────────────────────
+    _, ag_match, ag_risk = score_age(feature)
+    if ag_match:
+        match_items.append(ag_match)
+    if ag_risk:
+        risk_items.append(ag_risk)
+
+    # ── 騎手（display-only）────────────────────────────────────────
+    _, jk_match, jk_risk = score_jockey(feature)
+    if jk_match:
+        match_items.append(jk_match)
+    if jk_risk:
+        risk_items.append(jk_risk)
 
     # ── 乗数計算 ──────────────────────────────────────────────
     adjustment = max(TREND_ADJ_MIN, min(TREND_ADJ_MAX, 1.0 + total_adj_edge))
