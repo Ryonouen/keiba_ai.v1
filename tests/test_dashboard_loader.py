@@ -24,6 +24,8 @@ PRED_V2 = {
                     "win_odds": 5.6,
                     "feat_popularity": 1,
                     "running_style": "front",
+                    "ability_score": 71.2,
+                    "raw_ability_score": 0.712,
                 },
             },
             {
@@ -155,6 +157,209 @@ def test_horse_running_style_mapped_v2():
         races = dl.load_races_for_date("20260405")
     horse_a = next(h for h in races[0]["horses"] if h["horse_name"] == "ウマA")
     assert horse_a["running_style"] == "逃げ"
+
+
+def test_ability_score_is_exposed_from_feature_dict():
+    with patch.object(dl, "_load_json", side_effect=_mock_load(PRED_V2, {}, {})):
+        races = dl.load_races_for_date("20260405")
+    horse_a = next(h for h in races[0]["horses"] if h["horse_name"] == "ウマA")
+    assert horse_a["ability_score"] == 71.2
+    assert horse_a["raw_ability_score"] == 0.712
+
+
+def test_load_races_falls_back_to_schedule_for_start_time_and_status():
+    broken_pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "start_time": "",
+            "start_datetime": "",
+        }
+    }
+    schedule_map = {
+        "202606030401": {
+            "start_time": "10:05",
+            "start_datetime": (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds"),
+            "head_count": 16,
+        }
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(broken_pred, {}, {})):
+        with patch.object(dl, "_fetch_schedule_map_for_date", return_value=schedule_map):
+            races = dl.load_races_for_date("20260405")
+    assert races[0]["start_time"] == "10:05"
+    assert races[0]["status"] == "awaiting"
+    assert races[0]["n_runners"] == 16
+
+
+def test_popularity_is_derived_from_odds_when_missing():
+    pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "horses": [
+                {
+                    "horse_name": "ウマA",
+                    "ai_win_prob": 0.15,
+                    "feature_dict": {"win_odds": 8.0, "feat_popularity": 0, "running_style": "front"},
+                },
+                {
+                    "horse_name": "ウマB",
+                    "ai_win_prob": 0.20,
+                    "feature_dict": {"win_odds": 3.2, "feat_popularity": 0, "running_style": "stalker"},
+                },
+            ],
+        }
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(pred, {}, {})):
+        with patch.object(dl, "_fetch_schedule_map_for_date", return_value={}):
+            races = dl.load_races_for_date("20260405")
+    horses = {h["horse_name"]: h for h in races[0]["horses"]}
+    assert horses["ウマB"]["popularity"] == 1
+    assert horses["ウマA"]["popularity"] == 2
+
+
+def test_entry_fallback_enriches_missing_horse_fields():
+    broken_pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "start_time": "",
+            "start_datetime": "",
+            "horse_number_map": {},
+            "horses": [
+                {
+                    "horse_name": "ウマA",
+                    "ai_win_prob": 0.15,
+                    "feature_dict": {"win_odds": None, "feat_popularity": 0, "running_style": "front"},
+                },
+                {
+                    "horse_name": "ウマB",
+                    "ai_win_prob": 0.10,
+                    "feature_dict": None,
+                },
+            ],
+        }
+    }
+    fallback = {
+        "start_time": "10:05",
+        "start_datetime": "2026-04-05T10:05:00",
+        "head_count": 16,
+        "horses_by_name": {
+            "ウマA": {"horse_no": 1, "gate": 1, "win_odds": 3.2, "popularity": 1},
+            "ウマB": {"horse_no": 2, "gate": 1, "win_odds": 8.4, "popularity": 2},
+        },
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(broken_pred, {}, {})):
+        with patch.object(dl, "_fetch_schedule_map_for_date", return_value={}):
+            with patch.object(dl, "_fetch_entry_fallback_for_race", return_value=fallback):
+                races = dl.load_races_for_date("20260405")
+    horses = {h["horse_name"]: h for h in races[0]["horses"]}
+    assert races[0]["start_time"] == "10:05"
+    assert races[0]["n_runners"] == 16
+    assert horses["ウマA"]["horse_no"] == 1
+    assert horses["ウマA"]["win_odds"] == 3.2
+    assert horses["ウマA"]["popularity"] == 1
+
+
+def test_load_races_includes_score_debug_rows():
+    pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "horses": [
+                {
+                    "horse_name": "ウマA",
+                    "ai_win_prob": 0.15,
+                    "feature_dict": {
+                        "win_odds": 5.6,
+                        "feat_popularity": 1,
+                        "running_style": "front",
+                        "ability_score": 71.2345,
+                        "raw_ability_score": 0.712345,
+                        "model_score": 0.8123,
+                        "model_score_before_trend": 0.7444,
+                        "gate_index": 1.02,
+                        "style_suitability_index": 0.70,
+                        "pace_bias_index": 0.68,
+                        "pace_advantage": 0.66,
+                        "lap_suitability_index": 0.64,
+                        "distance_course_suitability_index": 0.72,
+                        "distance_fit_index": 0.74,
+                        "distance_change_index": 0.62,
+                        "jockey_index": 1.08,
+                        "trainer_jockey_synergy_index": 0.61,
+                        "recent_form_index": 0.80,
+                        "last_margin_index": 0.58,
+                        "last3f_index": 0.67,
+                        "trend_index": 0.69,
+                        "consistency_index": 0.63,
+                        "expectation_deviation_index": 0.56,
+                        "race_level_index": 0.78,
+                        "class_change_index": 0.57,
+                        "rotation_index": 0.59,
+                        "weight_change_index": 0.54,
+                        "training_index": 0.60,
+                        "ground_match_index": 0.55,
+                        "ground_fit_index": 0.58,
+                    },
+                },
+                {
+                    "horse_name": "ウマB",
+                    "ai_win_prob": 0.08,
+                    "feature_dict": {
+                        "win_odds": 12.4,
+                        "feat_popularity": 5,
+                        "running_style": "closer",
+                        "ability_score": 62.1234,
+                        "raw_ability_score": 0.621234,
+                        "model_score": 0.655,
+                        "model_score_before_trend": 0.601,
+                        "gate_index": 0.98,
+                        "style_suitability_index": 0.52,
+                        "pace_bias_index": 0.51,
+                        "pace_advantage": 0.49,
+                        "lap_suitability_index": 0.50,
+                        "distance_course_suitability_index": 0.55,
+                        "distance_fit_index": 0.56,
+                        "distance_change_index": 0.47,
+                        "jockey_index": 1.00,
+                        "trainer_jockey_synergy_index": 0.50,
+                        "recent_form_index": 0.45,
+                        "last_margin_index": 0.42,
+                        "last3f_index": 0.48,
+                        "trend_index": 0.47,
+                        "consistency_index": 0.46,
+                        "expectation_deviation_index": 0.44,
+                        "race_level_index": 0.52,
+                        "class_change_index": 0.48,
+                        "rotation_index": 0.50,
+                        "weight_change_index": 0.49,
+                        "training_index": 0.51,
+                        "ground_match_index": 0.50,
+                        "ground_fit_index": 0.50,
+                    },
+                },
+            ],
+        }
+    }
+    with patch.object(dl, "_load_json", side_effect=_mock_load(pred, {}, {})):
+        races = dl.load_races_for_date("20260405")
+
+    race = races[0]
+    assert "score_debug_rows" in race
+    assert len(race["score_debug_rows"]) == 2
+    debug_a = next(row for row in race["score_debug_rows"] if row["horse_name"] == "ウマA")
+    assert debug_a["ability_score_display"] == 71.2345
+    assert debug_a["softmax_input_score"] == 0.8123
+    assert debug_a["rating_rank"] == "A"
+
+
+def test_load_races_includes_top_vs_bottom_debug():
+    with patch.object(dl, "_load_json", side_effect=_mock_load(PRED_V2, {}, {})):
+        races = dl.load_races_for_date("20260405")
+
+    race = races[0]
+    assert "top_vs_bottom_debug" in race
+    compare = race["top_vs_bottom_debug"]
+    assert compare["top_horse_name"] == "ウマA"
+    assert compare["bottom_horse_name"] == "ウマB"
+    assert "diff" in compare
 
 
 def test_race_status_prerace():

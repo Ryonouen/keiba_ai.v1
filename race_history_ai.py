@@ -553,6 +553,64 @@ def fetch_past_10y_results(
 
     return results
 
+
+def fetch_past_10y_results_requests(
+    current_race_id: str,
+    expected_race_name: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    NetkeibaSession (curl_cffi Chrome偽装) 版の fetch_past_10y_results。
+    Selenium なしで result.html から過去10年の上位3着を取得する。
+    """
+    from bs4 import BeautifulSoup as _BS
+    from netkeiba_session import NetkeibaSession
+    _session = NetkeibaSession()
+
+    past_ids = build_past_race_ids(current_race_id, years=10)
+    results: List[Dict[str, Any]] = []
+
+    for rid in past_ids:
+        url = f"https://race.netkeiba.com/race/result.html?race_id={rid}"
+        try:
+            html = _session.fetch_html(url)
+            if not html:
+                continue
+
+            soup = _BS(html, "html.parser")
+
+            # レース名照合
+            if expected_race_name:
+                title_tag = soup.select_one("title")
+                page_title = title_tag.get_text(strip=True) if title_tag else ""
+                if page_title and not race_names_match(page_title, expected_race_name):
+                    continue
+
+            rows = soup.select("table.RaceTable01 tbody tr")
+            for row in rows[:3]:
+                cols = row.find_all("td")
+                if len(cols) < 13:
+                    continue
+                rank_text = cols[0].get_text(strip=True)
+                horse_name = cols[3].get_text(strip=True)
+                odds_text = cols[12].get_text(strip=True)
+                rank = int(rank_text) if rank_text.isdigit() else None
+                try:
+                    odds = float(odds_text.replace(",", ""))
+                except Exception:
+                    odds = None
+                results.append({
+                    "race_id": rid,
+                    "year": rid[:4],
+                    "rank": rank,
+                    "horse_name": horse_name,
+                    "odds": odds,
+                })
+        except Exception:
+            continue
+
+    return results
+
+
 def analyze_10y_race_trend(past_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     winners = [r for r in past_results if r.get("rank") == 1]
 

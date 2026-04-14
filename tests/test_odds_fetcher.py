@@ -163,6 +163,29 @@ def test_unknown_schema_triggers_warning(monkeypatch, caplog):
     assert any("未知" in r.message for r in caplog.records)
 
 
+def test_middle_status_empty_data_is_not_open(monkeypatch):
+    """netkeiba の未発売レスポンスは api_failed ではなく not_open 扱いにする"""
+
+    class FakeResp:
+        status_code = 200
+        ok = True
+
+        def json(self):
+            return {
+                "status": "middle",
+                "data": "",
+                "update_count": "0",
+                "reason": "result odds empty",
+            }
+
+    monkeypatch.setattr(odds_fetcher, "_request_get", lambda *a, **kw: FakeResp())
+
+    status, result = odds_fetcher._fetch_win_odds_by_requests("202606030601", HORSE_MAP)
+
+    assert status == "not_open"
+    assert result is None
+
+
 def test_fetch_newspaper_styles_from_html(monkeypatch):
     """新聞ページの HTML から脚質を取得できる"""
     fake_html = """

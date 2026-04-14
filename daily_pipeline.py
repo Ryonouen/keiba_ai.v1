@@ -11,6 +11,7 @@ daily_pipeline.py
 
 使い方:
   python3 daily_pipeline.py --analyze 20250406
+  python3 daily_pipeline.py --analyze-missing 20250406 --analyze-timeout 420
   python3 daily_pipeline.py --evaluate 20250406
   python3 daily_pipeline.py --summarize 20250405,20250406
 """
@@ -21,6 +22,7 @@ import math as _math
 import logging as _logging
 import random
 import signal as _signal
+import subprocess as _subprocess
 import sys as _sys
 import time
 from datetime import datetime as _dt, timedelta as _td
@@ -101,6 +103,9 @@ def _race_url(race_id: str) -> str:
 # Phase 2: 全レース分析 + 買い目生成・保存
 # =========================================================
 
+MAX_RECOMMENDED_BET_TYPES = 2  # 1レースで推奨する券種の最大数
+
+
 def generate_all_bets(
     race_id: str,
     plans: List[Dict[str, Any]],
@@ -108,6 +113,7 @@ def generate_all_bets(
 ) -> List[Dict[str, Any]]:
     """
     recommend_betmaster_plans() の出力を保存用スキーマに変換する。
+    confidence_ok=True の券種を confidence_score 降順で最大 MAX_RECOMMENDED_BET_TYPES 種に絞る。
 
     Parameters
     ----------
@@ -118,8 +124,13 @@ def generate_all_bets(
     -------
     List[Dict] — bet_typeごと・チケットごとに分解されたフラットなリスト
     """
+    # confidence_ok=True のプランのみ、confidence_score 降順で上位2種に絞る
+    valid_plans = [p for p in plans if (p.get("tickets") or [])]
+    valid_plans.sort(key=lambda p: float(p.get("confidence_score") or 0.0), reverse=True)
+    selected_plans = valid_plans[:MAX_RECOMMENDED_BET_TYPES]
+
     result: List[Dict[str, Any]] = []
-    for plan in plans:
+    for plan in selected_plans:
         bet_type_raw = str(plan.get("bet_type") or "")
         bet_key = BET_TYPE_KEY_MAP.get(bet_type_raw, bet_type_raw)
         tickets = plan.get("tickets") or []
@@ -166,13 +177,49 @@ def generate_all_bets(
     return apply_kelly_to_bets(deduped, kelly_config)
 
 
-def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
+def _inject_estimated_odds_recalc(features: List[Dict[str, Any]]) -> None:
+    """
+    推定オッズを features に注入した後に odds-dependent フィールドを再計算する。
+    win_prob はそのまま保持し、win_ev / win_market_edge / value_flag 等だけ更新する。
+    """
+    try:
+        from race_ai_engine import (
+            calc_expected_value, calc_market_edge,
+            calc_odds_distortion, calc_expected_value_score,
+            classify_bet_suitability, classify_value_label,
+        )
+    except ImportError:
+        return
+
+    for f in features:
+        p = float(f.get("win_prob") or 0.0)
+        f["win_ev"]                = calc_expected_value(p, f.get("win_odds"))
+        f["win_market_edge"]       = calc_market_edge(p, f.get("win_odds"))
+        f["odds_distortion_index"] = calc_odds_distortion(f)
+        odi = f["odds_distortion_index"]
+        f["value_flag"] = (
+            "SUPER_VALUE" if odi >= 1.4 else
+            "VALUE"       if odi >= 1.15 else
+            "NORMAL"
+        )
+        f["win_value_label"]       = classify_value_label(f["win_market_edge"], f["win_ev"])
+        f["expected_value_score"]  = calc_expected_value_score(f)
+        f["bet_suitability"]       = classify_bet_suitability(f)
+
+
+def run_daily_race_analysis(
+    date_str: str,
+    force_refresh_cache: bool = False,
+    use_requests: bool = False,
+) -> Dict[str, Any]:
     """
     指定日の全JRAレースを分析し、予測と買い目をストアに保存する。
 
     Parameters
     ----------
     date_str : "20250406" 形式
+    force_refresh_cache : True の場合、既存キャッシュを無視して再分析する
+    use_requests : True の場合、Selenium を使わず requests + BeautifulSoup で取得する（高速・要確認）
 
     Returns
     -------
@@ -184,12 +231,29 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
         "errors":  List[{"race_id": str, "error": str}],
     }
     """
+    race_ids = get_race_ids_by_date(date_str)
+    return _run_daily_race_analysis_for_ids(
+        date_str,
+        race_ids,
+        analyze_timeout_sec=0,
+        force_refresh_cache=force_refresh_cache,
+        use_requests=use_requests,
+    )
+
+
+def _run_daily_race_analysis_for_ids(
+    date_str: str,
+    race_ids: List[str],
+    analyze_timeout_sec: int = 0,
+    force_refresh_cache: bool = False,
+    use_requests: bool = False,
+) -> Dict[str, Any]:
+    """指定された race_id 群のみ分析して保存する（既存 analyze ロジック共通化）。"""
     from race_ai_engine import analyze_race
     from value_ai import recommend_betmaster_plans, assign_roles
     from kelly_staking import load_kelly_config
     kelly_config = load_kelly_config()
 
-    race_ids = get_race_ids_by_date(date_str)
     summary: Dict[str, Any] = {
         "date": date_str, "total": len(race_ids),
         "success": 0, "skipped": 0, "errors": [],
@@ -201,7 +265,38 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
         print(f"  [{i}/{len(race_ids)}] {race_id} 分析中...", flush=True)
         try:
             url    = _race_url(race_id)
-            result = analyze_race(url, headless=True)
+            _alarm_supported = (
+                analyze_timeout_sec > 0
+                and hasattr(_signal, "SIGALRM")
+                and hasattr(_signal, "alarm")
+            )
+            if _alarm_supported:
+                class _AnalyzeTimeoutError(Exception):
+                    pass
+
+                def _on_alarm(_sig, _frame):
+                    raise _AnalyzeTimeoutError(f"analyze timeout ({analyze_timeout_sec}s)")
+
+                _prev_handler = _signal.getsignal(_signal.SIGALRM)
+                _signal.signal(_signal.SIGALRM, _on_alarm)
+                _signal.alarm(int(analyze_timeout_sec))
+                try:
+                    result = analyze_race(
+                        url,
+                        headless=True,
+                        force_refresh_cache=force_refresh_cache,
+                        use_requests=use_requests,
+                    )
+                finally:
+                    _signal.alarm(0)
+                    _signal.signal(_signal.SIGALRM, _prev_handler)
+            else:
+                result = analyze_race(
+                    url,
+                    headless=True,
+                    force_refresh_cache=force_refresh_cache,
+                    use_requests=use_requests,
+                )
 
             features       = result.get("features") or []
             race_meta      = result.get("race_meta") or {}
@@ -214,6 +309,65 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
                 summary["errors"].append({"race_id": race_id, "error": "features empty"})
                 print(f"    → features 空。スキップ", flush=True)
                 continue
+
+            # オッズ・人気が欠損している場合の補完（確定オッズ優先、未開催なら予想オッズ）
+            _odds_missing = sum(1 for f in features if not f.get("win_odds"))
+            _pop_missing  = sum(1 for f in features if not f.get("popularity"))
+            _odds_coverage = 1.0 - (_odds_missing / len(features)) if features else 0.0
+            if _odds_coverage < 0.70 or _pop_missing > len(features) * 0.3:
+                from dividend_scraper import scrape_race_result as _srl
+                _result = None
+                try:
+                    _result = _srl(race_id)
+                except Exception as _srl_err:
+                    print(f"    → scrape_race_result 失敗: {_srl_err}", flush=True)
+
+                if _result and _result.get("runners"):
+                    # レース終了後：結果ページから確定オッズ・人気を注入
+                    _runner_map = {r["horse_name"]: r for r in _result["runners"]}
+                    injected_odds = 0
+                    injected_pop  = 0
+                    for f in features:
+                        name   = f.get("horse_name")
+                        runner = _runner_map.get(name, {})
+                        if not f.get("win_odds") and runner.get("win_odds"):
+                            f["win_odds"]          = runner["win_odds"]
+                            f["odds_is_estimated"] = False
+                            injected_odds += 1
+                        if not f.get("popularity") and runner.get("popularity"):
+                            f["popularity"] = runner["popularity"]
+                            injected_pop   += 1
+                    if injected_odds:
+                        _inject_estimated_odds_recalc(features)
+                    print(
+                        f"    → 確定オッズ注入 {injected_odds}頭・人気注入 {injected_pop}頭（レース結果より）",
+                        flush=True,
+                    )
+                else:
+                    # レース前：予想オッズを補完
+                    import odds_fetcher as _of
+                    horse_number_map = {
+                        str(int(f.get("horse_number") or (idx + 1))): f["horse_name"]
+                        for idx, f in enumerate(features)
+                        if f.get("horse_name")
+                    }
+                    est_status, est_odds = _of.fetch_estimated_odds(race_id, horse_number_map)
+                    if est_odds:
+                        injected = 0
+                        for f in features:
+                            name = f.get("horse_name")
+                            if name and not f.get("win_odds") and name in est_odds:
+                                f["win_odds"]          = est_odds[name]
+                                f["odds_is_estimated"] = True
+                                injected += 1
+                        if injected:
+                            _inject_estimated_odds_recalc(features)
+                        print(
+                            f"    → 予想オッズ補完 {injected}頭 (coverage {_odds_coverage:.0%}→補完後, status={est_status})",
+                            flush=True,
+                        )
+                    else:
+                        print(f"    → 予想オッズ取得不可 (status={est_status})。オッズなしで継続", flush=True)
 
             # 役割割当（recommend_betmaster_plans に必要）
             horse_roles = assign_roles(features, ev_table, race_structure, danger_v2)
@@ -246,6 +400,198 @@ def run_daily_race_analysis(date_str: str) -> Dict[str, Any]:
             time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
 
     print(f"[{date_str}] 完了: 成功 {summary['success']}/{summary['total']}", flush=True)
+    return summary
+
+
+def run_daily_race_analysis_missing(
+    date_str: str,
+    analyze_timeout_sec: int = 420,
+) -> Dict[str, Any]:
+    """
+    指定日のうち pipeline_predictions.json に未保存の race_id のみ再分析する。
+    analyze_timeout_sec > 0 の場合、1レースごとにタイムアウトを適用する。
+    """
+    race_ids_all = get_race_ids_by_date(date_str)
+    all_preds = pipeline_store.load_all_predictions()
+    existing_ids = {
+        rid for rid, pred in all_preds.items()
+        if (
+            isinstance(pred, dict)
+            and pred.get("analysis_date") == date_str
+            and not pipeline_store.is_prediction_incomplete(pred)
+        )
+    }
+    missing_ids = [rid for rid in race_ids_all if rid not in existing_ids]
+
+    print(
+        f"[{date_str}] 欠損再分析: 全{len(race_ids_all)} / 既存{len(existing_ids)} / 対象{len(missing_ids)}",
+        flush=True,
+    )
+    if not missing_ids:
+        return {"date": date_str, "total": 0, "success": 0, "skipped": 0, "errors": []}
+
+    return _run_daily_race_analysis_for_ids(
+        date_str,
+        missing_ids,
+        analyze_timeout_sec=analyze_timeout_sec,
+        force_refresh_cache=False,
+    )
+
+
+def run_daily_race_analysis_one(
+    date_str: str,
+    race_id: str,
+    force_refresh_cache: bool = False,
+) -> Dict[str, Any]:
+    """1レースだけ分析して保存する（safe実行用の内部API）。"""
+    return _run_daily_race_analysis_for_ids(
+        date_str,
+        [race_id],
+        analyze_timeout_sec=0,
+        force_refresh_cache=force_refresh_cache,
+    )
+
+
+def run_daily_race_analysis_one_safe(
+    date_str: str,
+    race_id: str,
+    per_race_timeout_sec: int = 300,
+    force_refresh_cache: bool = False,
+) -> Dict[str, Any]:
+    """
+    1レースだけを別プロセスで安全実行する。
+    ハング時は timeout で強制終了し、親プロセス側で状況を返す。
+    """
+    script_path = _os_dp.path.abspath(__file__)
+    cmd = [_sys.executable, script_path, "--analyze-one", date_str, race_id]
+    if force_refresh_cache:
+        cmd.append("--force-refresh-cache")
+    summary: Dict[str, Any] = {
+        "date": date_str,
+        "total": 1,
+        "success": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    print(
+        f"[{date_str}] 1レース安全再分析: {race_id} (timeout={int(per_race_timeout_sec)}s)",
+        flush=True,
+    )
+    try:
+        proc = _subprocess.Popen(
+            cmd,
+            start_new_session=True,
+        )
+        try:
+            returncode = proc.wait(timeout=max(1, int(per_race_timeout_sec)))
+        except _subprocess.TimeoutExpired:
+            try:
+                _os_dp.killpg(proc.pid, _signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            raise
+
+        if returncode == 0:
+            summary["success"] = 1
+            print("    → 完了", flush=True)
+        else:
+            summary["skipped"] = 1
+            summary["errors"].append({"race_id": race_id, "error": f"exit_code={returncode}"})
+            print(f"    → エラー: exit_code={returncode}", flush=True)
+    except _subprocess.TimeoutExpired:
+        summary["skipped"] = 1
+        summary["errors"].append({"race_id": race_id, "error": f"timeout({per_race_timeout_sec}s)"})
+        print(f"    → タイムアウト: {per_race_timeout_sec}s", flush=True)
+
+    return summary
+
+
+def run_daily_race_analysis_missing_safe(
+    date_str: str,
+    per_race_timeout_sec: int = 300,
+) -> Dict[str, Any]:
+    """
+    未取得レースだけを1レースずつ別プロセスで実行する安全モード。
+    1レースがハングしても timeout で打ち切り、残りを継続する。
+    """
+    race_ids_all = get_race_ids_by_date(date_str)
+    all_preds = pipeline_store.load_all_predictions()
+    existing_ids = {
+        rid for rid, pred in all_preds.items()
+        if (
+            isinstance(pred, dict)
+            and pred.get("analysis_date") == date_str
+            and not pipeline_store.is_prediction_incomplete(pred)
+        )
+    }
+    missing_ids = [rid for rid in race_ids_all if rid not in existing_ids]
+    summary: Dict[str, Any] = {
+        "date": date_str,
+        "total": len(missing_ids),
+        "success": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+
+    print(
+        f"[{date_str}] 欠損再分析(safe): 全{len(race_ids_all)} / 既存{len(existing_ids)} / 対象{len(missing_ids)}",
+        flush=True,
+    )
+    if not missing_ids:
+        return summary
+
+    script_path = _os_dp.path.abspath(__file__)
+    for i, race_id in enumerate(missing_ids, 1):
+        print(f"  [{i}/{len(missing_ids)}] {race_id} 分析中...(safe)", flush=True)
+        cmd = [_sys.executable, script_path, "--analyze-one", date_str, race_id]
+        try:
+            proc = _subprocess.Popen(
+                cmd,
+                start_new_session=True,
+            )
+            try:
+                returncode = proc.wait(timeout=max(1, int(per_race_timeout_sec)))
+            except _subprocess.TimeoutExpired:
+                try:
+                    _os_dp.killpg(proc.pid, _signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                raise
+
+            if returncode == 0:
+                summary["success"] += 1
+                print("    → 完了", flush=True)
+            else:
+                summary["skipped"] += 1
+                summary["errors"].append({"race_id": race_id, "error": f"exit_code={returncode}"})
+                print(f"    → エラー: exit_code={returncode}", flush=True)
+        except _subprocess.TimeoutExpired:
+            summary["skipped"] += 1
+            summary["errors"].append({"race_id": race_id, "error": f"timeout({per_race_timeout_sec}s)"})
+            print(f"    → タイムアウト: {per_race_timeout_sec}s", flush=True)
+
+        if i < len(missing_ids):
+            time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+
+    print(
+        f"[{date_str}] 欠損再分析(safe) 完了: 成功 {summary['success']}/{summary['total']}",
+        flush=True,
+    )
     return summary
 
 
@@ -387,6 +733,113 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
             time.sleep(random.uniform(1.5, 3.0))
 
     return summary
+
+
+# =========================================================
+# Phase 3.5: リアルタイム結果監視
+# =========================================================
+
+def watch_results(
+    date_str: str,
+    poll_interval: int = 300,
+    result_delay_minutes: int = 10,
+) -> None:
+    """
+    指定日のレース結果をリアルタイムで監視し、終了後に自動で取得・保存する。
+
+    Parameters
+    ----------
+    date_str            : "20260412" 形式
+    poll_interval       : チェック間隔（秒）。デフォルト 300 秒 (5分)
+    result_delay_minutes: 発走時刻から何分後に結果スクレイプを試みるか（デフォルト 10分）
+    """
+    from dividend_scraper import scrape_race_result
+    from datetime import datetime as _dt, timedelta as _td
+
+    race_ids = get_race_ids_by_date(date_str)
+    if not race_ids:
+        print(f"[watch_results] {date_str}: レースIDなし。終了。", flush=True)
+        return
+
+    # レースのスケジュール情報を取得（発走時刻）
+    from dashboard_loader import _fetch_schedule_map_for_date
+    schedule = _fetch_schedule_map_for_date(date_str)
+
+    done: set = set()  # 取得済み race_id
+
+    print(
+        f"[watch_results] {date_str}: {len(race_ids)}レース監視開始 "
+        f"(間隔={poll_interval}s, 結果待ち={result_delay_minutes}分)",
+        flush=True,
+    )
+
+    while True:
+        now = _dt.now()
+        pending = [rid for rid in race_ids if rid not in done]
+
+        if not pending:
+            print(f"[watch_results] 全レース完了。終了。", flush=True)
+            break
+
+        newly_fetched = 0
+        for race_id in pending:
+            # 既に結果が保存済みならスキップ
+            existing = pipeline_store.load_pipeline_race_result(race_id)
+            if existing and existing.get("finish_order"):
+                done.add(race_id)
+                continue
+
+            # 発走時刻 + result_delay_minutes を過ぎているか確認
+            meta = schedule.get(race_id, {})
+            start_time_str = meta.get("start_time", "")
+            if start_time_str:
+                try:
+                    start_dt = _dt.strptime(
+                        f"{date_str} {start_time_str}", "%Y%m%d %H:%M"
+                    )
+                    if now < start_dt + _td(minutes=result_delay_minutes):
+                        continue  # まだ早い
+                except (ValueError, TypeError):
+                    pass
+            else:
+                continue  # 時刻不明はスキップ
+
+            # 結果スクレイプ
+            try:
+                result = scrape_race_result(race_id)
+                if result and result.get("finish_order"):
+                    pipeline_store.save_pipeline_race_result(race_id, result)
+                    outcomes = evaluate_single_race(race_id)
+                    pipeline_store.save_bet_outcomes(race_id, outcomes)
+                    hit_count = sum(1 for o in outcomes if o.get("hit"))
+                    print(
+                        f"[watch_results] {race_id} 結果取得 "
+                        f"({len(result['finish_order'])}頭 / {hit_count}的中)",
+                        flush=True,
+                    )
+                    done.add(race_id)
+                    newly_fetched += 1
+                else:
+                    print(f"[watch_results] {race_id} 結果未確定。次回再試行。", flush=True)
+            except Exception as e:
+                print(f"[watch_results] {race_id} エラー: {e}", flush=True)
+
+            time.sleep(random.uniform(1.5, 3.0))
+
+        remaining = len(race_ids) - len(done)
+        print(
+            f"[watch_results] サイクル完了: 今回取得={newly_fetched} / "
+            f"残り={remaining} / 完了={len(done)} "
+            f"({now.strftime('%H:%M:%S')})",
+            flush=True,
+        )
+
+        if remaining == 0:
+            print(f"[watch_results] 全レース完了。終了。", flush=True)
+            break
+
+        print(f"[watch_results] {poll_interval}秒後に再チェック...", flush=True)
+        time.sleep(poll_interval)
 
 
 # =========================================================
@@ -707,10 +1160,24 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
     _logger.info("[update_race_odds] %s | status=%s | v%d",
                  race_id, status, version_before)
 
-    if status in ("not_open", "api_failed", "selenium_failed", "failed"):
+    if status == "not_open":
+        # 実オッズ未開放 → 予想オッズにフォールバック
+        est_status, est_odds = odds_fetcher.fetch_estimated_odds(race_id, horse_number_map)
+        if est_odds:
+            _logger.info("[update_race_odds] %s | 予想オッズ使用 (est_status=%s)", race_id, est_status)
+            new_odds = est_odds
+            status = est_status  # "estimated" / "success" / "partial"
+        else:
+            _logger.info("[update_race_odds] %s | スキップ（not_open、予想オッズも取得不可）", race_id)
+            return {"race_id": race_id, "status": "not_open", "coverage": 0.0,
+                    "version_before": version_before, "version_after": version_before}
+
+    if status in ("api_failed", "selenium_failed", "failed"):
         _logger.info("[update_race_odds] %s | スキップ（%s）", race_id, status)
         return {"race_id": race_id, "status": status, "coverage": 0.0,
                 "version_before": version_before, "version_after": version_before}
+
+    _is_estimated = (status == "estimated")
 
     # feature_dict を horses から復元
     features: List[Dict[str, Any]] = [
@@ -729,6 +1196,16 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
         if odds is not None:
             f["win_odds"] = odds
             f["feat_win_odds_log"] = round(_math.log(max(odds, 1.0)), 4)
+            if _is_estimated:
+                f["odds_is_estimated"] = True
+
+    # 予想オッズから人気順位を推定（実オッズ未開放時のみ）
+    if _is_estimated and new_odds:
+        sorted_by_odds = sorted(new_odds.items(), key=lambda x: x[1])
+        est_pop_map = {name: rank for rank, (name, _) in enumerate(sorted_by_odds, 1)}
+        for f in features:
+            if not f.get("popularity"):
+                f["popularity"] = est_pop_map.get(str(f.get("horse_name") or ""))
 
     # 脚質 missing 馬の再試行
     missing_styles = [
@@ -795,9 +1272,10 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
         old_h = old_horses_by_name.get(name, {})
         updated_horses.append({
             **old_h,
-            "ai_win_prob": round(float(f.get("win_prob", 0)), 4),
-            "win_odds":    f.get("win_odds"),
-            "popularity":  f.get("feat_popularity"),
+            "ai_win_prob":     round(float(f.get("win_prob", 0)), 4),
+            "win_odds":        f.get("win_odds"),
+            "popularity":      f.get("popularity"),
+            "odds_is_estimated": f.get("odds_is_estimated", False),
             "running_style":         f.get("running_style", "unknown"),
             "running_style_missing": f.get("running_style", "unknown") == "unknown",
             "feature_dict": dict(f),
@@ -956,8 +1434,8 @@ def watch_odds(date_str: str, poll_interval: int = 60) -> None:
 
             if status in ("success", "partial"):
                 updated_ids.add(race_id)
-            elif status == "not_open":
-                pass   # 次サイクルで再試行
+            elif status in ("not_open", "estimated"):
+                pass   # 次サイクルで再試行（実オッズ確定を待つ）
             else:
                 failed_ids.add(race_id)
 
@@ -978,6 +1456,20 @@ def watch_odds(date_str: str, poll_interval: int = 60) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="週末全レース自動分析パイプライン")
     parser.add_argument("--analyze",    metavar="DATE",  help="全レース分析（例: 20250406）")
+    parser.add_argument("--analyze-one", nargs=2, metavar=("DATE", "RACE_ID"),
+                        help="1レースのみ分析（内部用）")
+    parser.add_argument("--analyze-one-safe", nargs=2, metavar=("DATE", "RACE_ID"),
+                        help="1レースのみを別プロセスで安全再分析（ハング回避）")
+    parser.add_argument("--analyze-missing", metavar="DATE",
+                        help="未取得レースのみ再分析（例: 20250406）")
+    parser.add_argument("--analyze-missing-safe", metavar="DATE",
+                        help="未取得レースを1件ずつ別プロセスで再分析（ハング回避）")
+    parser.add_argument("--analyze-timeout", type=int, default=420,
+                        help="--analyze-missing 時の1レースあたりタイムアウト秒（0で無効, デフォルト: 420）")
+    parser.add_argument("--force-refresh-cache", action="store_true",
+                        help="レース分析キャッシュを使わず再取得する")
+    parser.add_argument("--use-requests", action="store_true",
+                        help="Selenium の代わりに requests+BeautifulSoup で高速取得する（実験的）")
     parser.add_argument("--evaluate",   metavar="DATE",  help="結果照合（例: 20250406）")
     parser.add_argument("--summarize",  metavar="DATES",
                         help="週末集計（カンマ区切り例: 20250405,20250406）")
@@ -986,12 +1478,43 @@ if __name__ == "__main__":
     parser.add_argument("--list",       metavar="DATE",  help="指定日のレース一覧を表示")
     parser.add_argument("--watch-odds",    metavar="DATE",
                         help="オッズ自動監視（例: 20250406）")
+    parser.add_argument("--watch-results", metavar="DATE",
+                        help="レース結果リアルタイム監視（例: 20260412）")
     parser.add_argument("--poll-interval", type=int, default=60,
                         help="watch-odds のポーリング間隔（秒、デフォルト: 60）")
+    parser.add_argument("--result-interval", type=int, default=300,
+                        help="watch-results のポーリング間隔（秒、デフォルト: 300）")
+    parser.add_argument("--result-delay", type=int, default=10,
+                        help="watch-results の発走後何分で結果取得を試みるか（デフォルト: 10）")
     args = parser.parse_args()
 
     if args.analyze:
-        run_daily_race_analysis(args.analyze)
+        run_daily_race_analysis(
+            args.analyze,
+            force_refresh_cache=args.force_refresh_cache,
+            use_requests=args.use_requests,
+        )
+
+    elif args.analyze_one:
+        run_daily_race_analysis_one(
+            args.analyze_one[0],
+            args.analyze_one[1],
+            force_refresh_cache=args.force_refresh_cache,
+        )
+
+    elif args.analyze_one_safe:
+        run_daily_race_analysis_one_safe(
+            args.analyze_one_safe[0],
+            args.analyze_one_safe[1],
+            per_race_timeout_sec=args.analyze_timeout,
+            force_refresh_cache=args.force_refresh_cache,
+        )
+
+    elif args.analyze_missing_safe:
+        run_daily_race_analysis_missing_safe(args.analyze_missing_safe, per_race_timeout_sec=args.analyze_timeout)
+
+    elif args.analyze_missing:
+        run_daily_race_analysis_missing(args.analyze_missing, analyze_timeout_sec=args.analyze_timeout)
 
     elif args.evaluate:
         evaluate_prediction_for_day(args.evaluate)
@@ -1037,6 +1560,13 @@ if __name__ == "__main__":
 
     elif args.watch_odds:
         watch_odds(args.watch_odds, poll_interval=args.poll_interval)
+
+    elif args.watch_results:
+        watch_results(
+            args.watch_results,
+            poll_interval=args.result_interval,
+            result_delay_minutes=args.result_delay,
+        )
 
     else:
         parser.print_help()

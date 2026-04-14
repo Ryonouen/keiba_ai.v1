@@ -204,6 +204,12 @@ def build_race_record(
             "mark":               marks_by_name.get(name, ""),
             "role":               role_d.get("role", ""),
             "ai_win_prob":        round(float(f.get("win_prob") or 0.0), 4),
+            # --- AbilityScore (win_prob とは独立した「ベース能力」指標) ---
+            "ability_score":      round(float(f.get("ability_score") or 50.0), 1),
+            "raw_ability_score":  round(float(f.get("raw_ability_score") or 0.5), 6),
+            "ability_rank":       f.get("ability_rank"),
+            "winprob_rank":       f.get("winprob_rank"),
+            # ---------------------------------------------------------------
             "top2_prob":          round(float(role_d.get("top2_prob") or 0.0), 4),
             "top3_prob":          round(float(role_d.get("top3_prob") or 0.0), 4),
             "stable_score":       round(float(role_d.get("stable_score") or 0.0), 4),

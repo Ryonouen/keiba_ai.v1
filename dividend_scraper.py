@@ -411,6 +411,15 @@ def fetch_race_ids_by_date(
         if rid not in race_ids:
             race_ids.append(rid)
 
+    # フォールバック:
+    # race_list_sub のHTMLによっては race_id が a[href] ではなく
+    # script 内にのみ含まれる場合があるため、HTML全文からも抽出する。
+    for rid in re.findall(r"(?:/race/|race_id=)(\d{12})", html):
+        if venue_codes and rid[4:6] not in venue_codes:
+            continue
+        if rid not in race_ids:
+            race_ids.append(rid)
+
     return race_ids
 
 

@@ -9,11 +9,16 @@ from openai import OpenAI
 from openai_cost_guard import safe_chat_create
 from bet_generator import generate_ai_bets
 from course_bias import get_course_bias
+from netkeiba_scrape_helpers import (
+    extract_expected_starter_count_from_html,
+    should_reuse_race_analysis_cache,
+)
 import json
 import hashlib
 import logging
 import math
 import os
+import platform
 import random
 import re
 import time
@@ -55,6 +60,41 @@ try:
     UC_AVAILABLE = True
 except Exception:
     UC_AVAILABLE = False
+
+
+def resolve_chrome_binary() -> Optional[str]:
+    candidates = [
+        os.getenv("CHROME_BIN"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def resolve_chromedriver_path() -> Optional[str]:
+    candidates = [
+        os.getenv("CHROMEDRIVER_PATH"),
+        "/usr/bin/chromedriver",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def get_platform_specific_chrome_args() -> List[str]:
+    args: List[str] = []
+    if platform.system() != "Darwin":
+        args.extend([
+            "--single-process",
+            "--no-zygote",
+        ])
+    return args
 
 
 # =========================================================
@@ -129,15 +169,16 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     )
 
-    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
-    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+    chrome_bin = resolve_chrome_binary()
+    chromedriver_path = resolve_chromedriver_path()
 
     # Render / Docker 環境では GUI がないため headless を強制
     if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID") or not os.getenv("DISPLAY"):
         headless = True
 
     options = Options()
-    options.binary_location = chrome_bin
+    if chrome_bin:
+        options.binary_location = chrome_bin
 
     options.add_argument("--window-size=1280,800")
     options.add_argument(f"--user-agent={user_agent}")
@@ -162,9 +203,9 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--password-store=basic")
     options.add_argument("--use-mock-keychain")
     options.add_argument("--lang=ja-JP")
-    # --- メモリ削減フラグ（画像無効化は bot 判定リスクがあるため除外）---
-    options.add_argument("--single-process")        # レンダラーを独立プロセスにしない（Render無料枠OOM対策）
-    options.add_argument("--no-zygote")             # --single-process と併用推奨
+    # --- メモリ削減フラグ（Darwin では renderer 接続失敗の原因になりやすい）---
+    for arg in get_platform_specific_chrome_args():
+        options.add_argument(arg)
     options.add_argument("--js-flags=--max-old-space-size=128")   # V8ヒープ上限128MB
     options.add_argument("--disk-cache-size=1")                   # ディスクキャッシュ最小化
     options.add_argument("--media-cache-size=1")
@@ -173,12 +214,15 @@ def build_webdriver(headless: bool = True) -> webdriver.Chrome:
     if headless:
         options.add_argument("--headless=new")
 
-    service = Service(
-        executable_path=chromedriver_path,
-        log_output="/tmp/chromedriver.log",
-    )
-
-    driver = webdriver.Chrome(service=service, options=options)
+    if chromedriver_path:
+        service = Service(
+            executable_path=chromedriver_path,
+            log_output="/tmp/chromedriver.log",
+        )
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        # Let Selenium Manager resolve the matching driver when no local path is configured.
+        driver = webdriver.Chrome(options=options)
     driver.implicitly_wait(5)
     driver.set_page_load_timeout(25)
 
@@ -392,6 +436,7 @@ class RaceMeta:
     target_course: str
     target_ground: str
     predicted_pace: str = ""
+    starter_count: Optional[int] = None
 
 
 # =========================================================
@@ -2557,7 +2602,7 @@ def analyze_race(
 
     race_cache_name = cache_key("race_analysis", shutuba_url, history_limit)
     cached_result = load_json_cache(race_cache_name)
-    if cached_result and cached_result.get("race_meta") and cached_result.get("features"):
+    if should_reuse_race_analysis_cache(cached_result):
         return refresh_result_payload(cached_result)
 
     driver = build_webdriver(headless=headless)
@@ -2570,6 +2615,7 @@ def analyze_race(
 
         page_src = safe_page_source(driver)
         current_title = safe_driver_title(driver)
+        expected_starter_count = extract_expected_starter_count_from_html(page_src)
 
         if is_blocked_page(page_src, current_title):
             return {
@@ -2581,6 +2627,7 @@ def analyze_race(
                     "target_course": "unknown",
                     "target_ground": "",
                     "predicted_pace": "unknown",
+                    "starter_count": expected_starter_count,
                 },
                 "features": [],
                 "error": "HTTP400_BLOCKED",
@@ -2600,7 +2647,8 @@ def analyze_race(
                 tables = []
 
             current_count = len(tables)
-            if current_count > 3:
+            target_count = expected_starter_count or 4
+            if current_count >= target_count:
                 if current_count == prev_count:
                     stable_count += 1
                     if stable_count >= 2:  # 2回連続で同じ行数なら描画完了と判定
@@ -2614,8 +2662,28 @@ def analyze_race(
         time.sleep(1.0)
 
         race_meta = extract_race_meta(driver)
+        race_meta.starter_count = expected_starter_count
         horses = fetch_horses(driver)
         logger.info("[scrape] fetch_horses: %d頭取得", len(horses))
+
+        if expected_starter_count and len(horses) < expected_starter_count:
+            logger.warning(
+                "[scrape] 出走頭数不足を検知: expected=%s actual=%s 再取得します",
+                expected_starter_count,
+                len(horses),
+            )
+            for _ in range(2):
+                driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
+                time.sleep(2.0)
+                retry_horses = fetch_horses(driver)
+                if len(retry_horses) > len(horses):
+                    horses = retry_horses
+                    logger.info("[scrape] 再取得後 fetch_horses: %d頭", len(horses))
+                if len(horses) >= expected_starter_count:
+                    break
+
+        if race_meta.starter_count is None:
+            race_meta.starter_count = len(horses) if horses else None
         newspaper_records: Dict[str, Dict[str, Any]] = {}
 
         try:
@@ -2698,6 +2766,7 @@ def analyze_race(
             horse_results.append({
                 "name": horse["name"],
                 "link": horse.get("link", ""),
+                "number": horse.get("number"),
                 "records": records,
                 "entry_style":style,
                 "gate": horse.get("gate"),
@@ -3028,7 +3097,15 @@ def analyze_race(
             result["winner_pattern_notes"] = str(e)
         # 最終AI指標・期待値・危険人気馬などを再計算
         result = refresh_result_payload(result)
-        save_json_cache(race_cache_name, result)
+        cached_starter_count = result.get("race_meta", {}).get("starter_count")
+        if not cached_starter_count or len(result.get("features", [])) >= cached_starter_count:
+            save_json_cache(race_cache_name, result)
+        else:
+            logger.warning(
+                "[cache] 不完全なレースキャッシュを保存しません: expected=%s actual=%s",
+                cached_starter_count,
+                len(result.get("features", [])),
+            )
         return result
     
     finally:

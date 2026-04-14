@@ -40,6 +40,10 @@ BANKROLL_UNIT: int = 100            # 掛け金単位（100円）
 VALUE_MIN_WIN_PROB: float = 0.07    # AI勝率がこれ未満の馬は value_gap があっても妙味候補に入れない
 VALUE_MIN_STABLE_SCORE: float = 0.42  # (consistency_index + trend_index)/2 がこれ未満の馬も除外
 
+# 乖離分析: 能力ランクが市場ランクより何位以上良ければ「市場が過小評価」と判断するか
+ABILITY_UNDERRATED_GAP_MIN: int = 3   # 市場10番人気→能力7位以内 でフラグ
+ABILITY_SCORE_MIN: float = 45.0        # 最低限の能力値がある馬のみ対象（雑魚を除外）
+
 # 主推奨昇格のための安定性下限（妙味候補に残りつつも主推奨に上がりにくくする 3 段階設計）
 # stable < 0.35 → 妙味候補に入れない（VALUE_MIN_STABLE_SCORE）
 # 0.35 ≤ stable < 0.38 → 候補入りするが単勝/複勝ともペナルティ
@@ -203,14 +207,38 @@ def build_ev_table(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             else None
         )
 
+        ability_rank  = f.get("ability_rank")    # attach_ability_scores で付与
+        winprob_rank  = f.get("winprob_rank")    # 同上
+        market_rank   = popularity_map.get(i)     # 単勝オッズ昇順の人気順位
+
+        # 市場評価 vs AI評価の乖離指標
+        # 正 = 市場より能力が高い（アンダーレイ候補）/ 負 = 市場より能力が低い（オーバーレイ候補）
+        ability_vs_market_gap = (
+            (market_rank - ability_rank)
+            if ability_rank is not None and market_rank is not None
+            else None
+        )
+        winprob_vs_market_gap = (
+            (market_rank - winprob_rank)
+            if winprob_rank is not None and market_rank is not None
+            else None
+        )
+
         rows.append({
-            "horse_name":      str(f.get("horse_name") or ""),
-            "ai_score":        round(ai_score, 2),
-            "ai_win_prob":     round(ai_win_prob, 4),
-            "win_odds":        win_odds,
-            "market_win_prob": market_win_prob,
-            "value_gap":       value_gap,
-            "popularity_rank": popularity_map.get(i),
+            "horse_name":             str(f.get("horse_name") or ""),
+            "ai_score":               round(ai_score, 2),
+            "ai_win_prob":            round(ai_win_prob, 4),
+            "win_odds":               win_odds,
+            "market_win_prob":        market_win_prob,
+            "value_gap":              value_gap,
+            "popularity_rank":        market_rank,
+            # --- 将来の妙味・危険馬判定強化用 ---
+            "ability_score":          round(float(f.get("ability_score") or 50.0), 1),
+            "ability_rank":           ability_rank,
+            "winprob_rank":           winprob_rank,
+            "market_rank":            market_rank,
+            "ability_vs_market_gap":  ability_vs_market_gap,   # 正=能力>市場評価
+            "winprob_vs_market_gap":  winprob_vs_market_gap,   # 正=AI勝率>市場評価
         })
 
     return rows
@@ -240,7 +268,66 @@ def _value_reason(feature: Dict[str, Any], ev_row: Dict[str, Any], race_pace: st
     if float(feature.get("distance_fit_index") or 0.5) >= 0.65:
         parts.append("距離適性◎")
 
-    return "・".join(parts[:3]) if parts else "AI評価 > 市場評価"
+    # 能力 vs 市場乖離を理由に追記
+    ability_gap = ev_row.get("ability_vs_market_gap")
+    if ability_gap is not None and ability_gap >= ABILITY_UNDERRATED_GAP_MIN:
+        ab_rank = ev_row.get("ability_rank")
+        mk_rank = ev_row.get("market_rank")
+        parts.append(f"能力{ab_rank}位↑市場{mk_rank}位（能力過小評価）")
+
+    return "・".join(parts[:4]) if parts else "AI評価 > 市場評価"
+
+
+def detect_underrated_by_ability(
+    ev_table: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    「市場が能力を過小評価している馬」を返す。
+
+    value_gap（オッズ乖離）がなくても、
+        market_rank - ability_rank >= ABILITY_UNDERRATED_GAP_MIN
+        かつ ability_score >= ABILITY_SCORE_MIN
+    の馬は「能力的に市場より高い評価」として別リストで提示する。
+
+    これにより、以下のケースを捕捉できる:
+        - 実力はあるが展開不利で win_prob が低い → value_gap なし
+        - ただし ability_rank は市場より大幅に上位
+        → 「能力はあるが買いにくい」穴馬候補
+
+    返り値フィールド:
+        horse_name, ability_rank, market_rank, ability_vs_market_gap,
+        ability_score, ai_win_prob, win_odds, underrate_reason
+    """
+    if not ev_table:
+        return []
+
+    result: List[Dict[str, Any]] = []
+    for row in ev_table:
+        gap = row.get("ability_vs_market_gap")
+        if gap is None or gap < ABILITY_UNDERRATED_GAP_MIN:
+            continue
+        score = float(row.get("ability_score") or 0.0)
+        if score < ABILITY_SCORE_MIN:
+            continue
+
+        ab_rank = row.get("ability_rank")
+        mk_rank = row.get("market_rank")
+        result.append({
+            "horse_name":             row.get("horse_name"),
+            "ability_rank":           ab_rank,
+            "market_rank":            mk_rank,
+            "ability_vs_market_gap":  gap,
+            "ability_score":          round(score, 1),
+            "ai_win_prob":            row.get("ai_win_prob"),
+            "win_odds":               row.get("win_odds"),
+            "underrate_reason": (
+                f"能力{ab_rank}位 vs 市場{mk_rank}位人気 "
+                f"（乖離{gap}位分）"
+            ),
+        })
+
+    result.sort(key=lambda x: x.get("ability_vs_market_gap", 0), reverse=True)
+    return result
 
 
 def detect_value_horses(
