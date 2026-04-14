@@ -334,6 +334,7 @@ def save_prediction_v2(
             "horse_name":             name,
             "horse_id":               horse_id_map.get(name, ""),
             "ai_win_prob":            round(float(f.get("win_prob") or 0.0), 4),
+            "ability_win_prob":       round(float(f.get("ability_win_prob") or 0.0), 4),
             "win_odds":               f.get("win_odds"),
             "popularity":             f.get("popularity"),
             "ability_score":          f.get("ability_score"),

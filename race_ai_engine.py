@@ -781,6 +781,17 @@ def attach_ability_scores(features: List[Dict[str, Any]]) -> List[Dict[str, Any]
     ):
         f["winprob_rank"] = rank
 
+    # ability_win_prob: win_score → z-score 正規化 → softmax（市場情報なし）
+    ability_probs = calc_ability_win_probs(features)
+    for f, ap in zip(features, ability_probs):
+        f["ability_win_prob"] = round(ap, 4)
+
+    # ability_win_prob_rank: ability_win_prob 降順
+    for rank, f in enumerate(
+        sorted(features, key=lambda x: float(x.get("ability_win_prob") or 0.0), reverse=True), start=1
+    ):
+        f["ability_win_prob_rank"] = rank
+
     return features
 
 
@@ -868,6 +879,49 @@ def calc_win_score_from_ability(
     """
     score = raw_ability * ability_weight + race_context_adj * (1.0 - ability_weight)
     return round(float(score), 6)
+
+
+def calc_ability_win_probs(
+    features: List[Dict[str, Any]],
+    temperature: float = 1.5,
+) -> List[float]:
+    """
+    win_score（market情報なし）をレース内 z-score 正規化 → softmax で勝率に変換する。
+
+    使用スコア:
+      win_score = raw_ability_score × 0.65 + race_context_adj × 0.35
+        ← 基礎能力（近走・クラス・距離適性等）+ 展開・ローテ・調教補正
+        ← 市場オッズ・人気は一切含まない
+
+    z-score 正規化の目的:
+      - raw score のスケール依存を排除する
+      - 混戦レース（std 小）→ 均等分布に自然に近づく
+      - 実力差レース（std 大）→ 上位に集中する
+
+    Returns
+    -------
+    List[float]: 合計が 1.0 になる ability_win_prob リスト（features と同順）
+    """
+    scores = [float(f.get("win_score") or 0.0) for f in features]
+    n = len(scores)
+    if n == 0:
+        return []
+
+    # レース内 z-score 正規化
+    mean = sum(scores) / n
+    variance = sum((s - mean) ** 2 for s in scores) / n
+    std = math.sqrt(variance)
+
+    # std が極小（≒ 全馬同スコア、5頭以下の混戦等）は均等分布を返す
+    if std < 1e-6:
+        return [round(1.0 / n, 6)] * n
+
+    z_scores = [(s - mean) / std for s in scores]
+
+    # 温度付き softmax（T=1.5: 混戦で過集中しないよう緩め）
+    exps = [math.exp(z / temperature) for z in z_scores]
+    total = sum(exps)
+    return [e / total for e in exps]
 
 
 def build_radar_payload(feature: Dict[str, Any]) -> Dict[str, Any]:
