@@ -102,7 +102,10 @@ def score_prev_rank(
     if prev_rank is None:
         return 0.0, None, None
 
-    r = int(prev_rank)
+    try:
+        r = int(prev_rank)
+    except (ValueError, TypeError):
+        return 0.0, None, None
     if r == 1:
         return shrink_by_sample(0.030, 40), "前走1着", None
     if r <= 3:
@@ -178,6 +181,8 @@ def score_gate(
 ) -> Tuple[float, Optional[str], Optional[str]]:
     """
     枠傾向表示。edge = 0（display-only）。
+    gate_counts のキーは trend_stats.bucket_gate が返す文字列形式を前提とする:
+      "内枠(1〜3)" / "中枠(4〜6)" / "外枠(7〜)"
     """
     if not race_trend_10y:
         return 0.0, None, None
@@ -189,17 +194,17 @@ def score_gate(
 
     g = int(gate)
     if g <= 3:
-        bucket_tokens = ["1", "2", "3", "内"]
+        bucket_key = "内枠(1〜3)"
         label = f"内枠({g}枠)"
     elif g <= 6:
-        bucket_tokens = ["4", "5", "6", "中"]
+        bucket_key = "中枠(4〜6)"
         label = f"中枠({g}枠)"
     else:
-        bucket_tokens = ["7", "8", "外"]
+        bucket_key = "外枠(7〜)"
         label = f"外枠({g}枠)"
 
     total = sum(gate_counts.values()) or 1
-    matching = sum(v for k, v in gate_counts.items() if any(t in str(k) for t in bucket_tokens))
+    matching = gate_counts.get(bucket_key, 0)
     ratio = matching / total
 
     if ratio >= 0.45:
@@ -247,8 +252,9 @@ def analyze_horse_trend(
     if pc_risk:
         risk_items.append(pc_risk)
     total_adj_edge += pc_edge
+    # 信頼度: 実際に補正が効いていれば 1.0（n_eff >= 30 なら shrink なし）
     if pc_edge != 0.0:
-        shrinkage_factors.append(abs(pc_edge) / 0.040)  # normalize by max raw
+        shrinkage_factors.append(1.0)
 
     # ── 前走着順（trend_adjustment に寄与）────────────────────
     pr_edge, pr_match, pr_risk = score_prev_rank(feature)
@@ -258,7 +264,7 @@ def analyze_horse_trend(
         risk_items.append(pr_risk)
     total_adj_edge += pr_edge
     if pr_edge != 0.0:
-        shrinkage_factors.append(abs(pr_edge) / 0.030)
+        shrinkage_factors.append(1.0)
 
     # ── 脚質（display-only）────────────────────────────────────
     _, st_match, st_risk = score_running_style(feature, race_trend_10y)
