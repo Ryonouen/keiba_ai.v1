@@ -218,10 +218,15 @@ def score_gate(
 # Phase 2 要素（display-only）
 # =========================================================
 
-_TOP_JOCKEYS = frozenset({
-    "川田将雅", "福永祐一", "武豊", "ルメール", "デムーロ",
-    "戸崎圭太", "横山武史", "松山弘平", "岩田望来", "坂井瑠星",
+# 主要騎手セット（表示用のみ、補正なし）
+# Note: jockey_ai.py の _JOCKEY_ALIAS でのあだ名表記と合わせること。
+# 「デムーロ」は実際には "C.デムーロ" / "M.デムーロ" で格納されるため
+# 部分一致チェックに変更する（score_jockey 内で処理）。
+_TOP_JOCKEYS_EXACT = frozenset({
+    "川田将雅", "武豊", "戸崎圭太", "横山武史", "松山弘平",
+    "岩田望来", "坂井瑠星", "横山和生", "団野大成", "西村淳也",
 })
+_TOP_JOCKEYS_PARTIAL = ("ルメール", "デムーロ", "モレイラ")  # カタカナ外国人騎手は部分一致
 
 
 def score_body_weight(
@@ -242,6 +247,11 @@ def score_body_weight(
     except (ValueError, TypeError):
         return 0.0, None, None
 
+    # 閾値の設計根拠:
+    # 大幅増: +13kg以上 → 太め残り懸念
+    # 大幅減: -11kg以下 → 絞りすぎ懸念
+    # 微増: +2〜+8kg → 状態良好（成長・充実の証）
+    # ±1kg / +9〜+12kg / -1〜-10kg → 中立（判断材料不足）
     if chg > 12:
         return 0.0, None, f"馬体重大幅増加(+{chg}kg)"
     if chg < -10:
@@ -274,15 +284,19 @@ def score_distance_change(
         return 0.0, None, f"距離延長({diff}m)"
     if diff <= -200:
         return 0.0, None, f"距離短縮({diff}m)"
-    return 0.0, f"前走と同距離圏", None
+    return 0.0, "前走と同距離圏", None
 
 
 def score_sex(
     feature: Dict[str, Any],
 ) -> Tuple[float, Optional[str], Optional[str]]:
-    """性別表示（牝馬の混合戦など）。edge = 0（display-only）。"""
+    """性別表示（牝馬の混合戦など）。edge = 0（display-only）。
+
+    Note: "sex" キーは現行 race_ai_engine の feature dict には未設定。
+    将来的に feature dict に "sex" が追加された際に有効化される。
+    """
     sex = str(feature.get("sex") or "").strip()
-    if sex in ("牝", "F"):
+    if sex in ("牝", "F", "f"):
         return 0.0, "牝馬（混合戦）", None
     return 0.0, None, None
 
@@ -307,10 +321,12 @@ def score_jockey(
     feature: Dict[str, Any],
 ) -> Tuple[float, Optional[str], Optional[str]]:
     """騎手表示。edge = 0（display-only）。"""
-    jockey = str(feature.get("jockey") or "").strip()
+    jockey = str(feature.get("entry_jockey") or feature.get("jockey") or "").strip()
     if not jockey:
         return 0.0, None, None
-    if jockey in _TOP_JOCKEYS:
+    if jockey in _TOP_JOCKEYS_EXACT:
+        return 0.0, f"主要騎手({jockey})", None
+    if any(p in jockey for p in _TOP_JOCKEYS_PARTIAL):
         return 0.0, f"主要騎手({jockey})", None
     return 0.0, None, None
 
