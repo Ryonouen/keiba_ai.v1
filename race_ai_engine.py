@@ -106,6 +106,7 @@ ROUTE_PROFILE_CACHE_VERSION: str = "v3"
 HISTORICAL_PATTERN_YEARS: int = 8
 HISTORICAL_PATTERN_PROB_WEIGHT: float = 0.30
 HISTORICAL_PATTERN_CACHE_VERSION: str = "v1"
+TREND_ANALYZER_PROB_WEIGHT: float = 0.50
 def random_sleep(min_sec: float = 0.8, max_sec: float = 1.8) -> None:
     time.sleep(random.uniform(min_sec, max_sec))
 
@@ -4932,18 +4933,21 @@ def analyze_race(
 
         # 傾向分析（trend_analyzer）: 前走クラス/着順を構造化評価し win_prob に反映
         # signal_judge は model_score に加算、trend_analyzer は win_prob に乗算のため独立
-        try:
-            _trend_ctx = {
-                "condition_stats_available": bool(condition_stats),
-                "race_trend_10y": race_trend_10y,
-            }
-            for f in features:
+        _trend_ctx = {
+            "condition_stats_available": bool(condition_stats),
+            "race_trend_10y": race_trend_10y,
+        }
+        for f in features:
+            try:
                 f["trend_analyzer_result"] = analyze_horse_trend(f, _trend_ctx)
+            except Exception as _he:
+                print(f"[analyze_race] trend_analyzer horse={f.get('horse_name')} skipped: {_he}", flush=True)
+                f["trend_analyzer_result"] = {}
 
-            probs = apply_trend_analyzer_bias(probs, features, weight=0.50)
-            print("[analyze_race] trend_analyzer bias applied", flush=True)
-        except Exception as _e:
-            print(f"[analyze_race] trend_analyzer skipped: {_e}", flush=True)
+        probs = apply_trend_analyzer_bias(probs, features, weight=TREND_ANALYZER_PROB_WEIGHT)
+        for f in features:
+            f["trend_analyzer_applied"] = True
+        print("[analyze_race] trend_analyzer bias applied", flush=True)
 
         for f, p in zip(features, probs):
             f["win_prob"] = round(p, 4)
