@@ -6,6 +6,7 @@ import datetime
 import re
 import requests
 from bs4 import BeautifulSoup
+from netkeiba_scrape_helpers import parse_today_races_from_html
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -296,44 +297,14 @@ def get_today_races():
 
         today = datetime.datetime.now().strftime("%Y%m%d")
 
-        url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={today}"
+        url = "https://race.netkeiba.com/top/race_list_sub.html"
 
         headers = {"User-Agent": "Mozilla/5.0"}
 
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, params={"kaisai_date": today}, headers=headers, timeout=10)
+        res.encoding = res.apparent_encoding or res.encoding
 
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        races = []
-
-        for a in soup.select("a[href*='race_id']"):
-
-            href = a.get("href", "")
-            race_name = a.text.strip()
-
-            if "race_id=" in href:
-
-                race_id = href.split("race_id=")[1][:12]
-
-                # ⭐ 重賞のみ取得
-                if any(g in race_name for g in ["G1","Ｇ１","G2","Ｇ２","G3","Ｇ３"]):
-
-                    races.append({
-                        "race_id": race_id,
-                        "name": race_name,
-                        "url": f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-                    })
-
-        # 重複削除
-        seen = set()
-        unique = []
-
-        for r in races:
-            if r["race_id"] not in seen:
-                unique.append(r)
-                seen.add(r["race_id"])
-
-        return unique
+        return parse_today_races_from_html(res.text)
 
     except Exception:
         return []
@@ -1234,28 +1205,31 @@ if st.session_state.result:
         if "newspaper_mark" not in df.columns:
             df["newspaper_mark"] = ""
 
-        rank = df[[
-            "horse_name",
-            "newspaper_mark",
-            "win_prob",
-            "place_prob",
-            "fair_win_odds",
-            "ai_power_index"
-        ]].copy()
+        _rank_cols = ["horse_name", "newspaper_mark", "win_prob", "place_prob",
+                      "fair_win_odds", "ai_power_index"]
+        # ability_score が存在するとき（新設フィールド）は列に追加
+        if "ability_score" in df.columns:
+            _rank_cols.insert(2, "ability_score")
 
-        rank = rank.rename(columns={
+        rank = df[_rank_cols].copy()
+
+        _rename = {
             "horse_name": "馬名",
             "newspaper_mark": "新聞印",
+            "ability_score": "能力値",      # ベース能力 (0〜100)
             "win_prob": "勝率",
             "place_prob": "複勝圏AI",
             "fair_win_odds": "AIフェア単勝",
             "ai_power_index": "AIパワー",
-        })
+        }
+        rank = rank.rename(columns=_rename)
 
         rank["勝率"] = rank["勝率"].apply(lambda x: round(x * 100, 1))
         rank["複勝圏AI"] = rank["複勝圏AI"].apply(lambda x: round(x * 100, 1))
 
-        st.dataframe(rank.sort_values("勝率", ascending=False), width="stretch")
+        # ability_score は 0〜100 スコアなのでそのまま表示
+        st.dataframe(rank.sort_values("能力値" if "能力値" in rank.columns else "勝率",
+                                      ascending=False), width="stretch")
 
         st.subheader("📰 新聞AI評価")
 
@@ -1580,6 +1554,44 @@ if st.session_state.result:
         )
 
         st.markdown(f'<div class="card">{comment}</div>', unsafe_allow_html=True)
+
+        # -----------------------------
+        # 各馬 傾向分析（trend_analyzer）
+        # -----------------------------
+        st.subheader("📋 各馬傾向分析")
+        _ta_features = result.get("features") or []
+        _ta_has_data = any(f.get("trend_analyzer_result") for f in _ta_features)
+        if _ta_has_data:
+            for f in sorted(_ta_features, key=lambda x: float(x.get("win_prob") or 0), reverse=True):
+                _ta = f.get("trend_analyzer_result") or {}
+                _match = _ta.get("trend_match_items") or []
+                _risk  = _ta.get("trend_risk_items") or []
+                _summary = _ta.get("trend_summary") or ""
+                _adj = float(_ta.get("trend_adjustment") or 1.0)
+                _horse = f.get("horse_name") or "-"
+
+                if not _match and not _risk:
+                    continue
+
+                adj_pct = round((_adj - 1.0) * 100, 1)
+                adj_str = f"+{adj_pct}%" if adj_pct >= 0 else f"{adj_pct}%"
+                adj_color = "#2ecc71" if adj_pct > 0 else ("#e74c3c" if adj_pct < 0 else "#aaaaaa")
+
+                st.markdown(
+                    f'<div class="card" style="margin-bottom:6px; padding:8px 12px;">'
+                    f'<b>{_horse}</b> '
+                    f'<span style="color:{adj_color}; font-weight:bold;">傾向補正 {adj_str}</span>',
+                    unsafe_allow_html=True,
+                )
+                if _summary:
+                    st.caption(_summary)
+                if _match:
+                    st.caption("好材料: " + " ／ ".join(_match))
+                if _risk:
+                    st.caption("⚠ 懸念: " + " ／ ".join(_risk))
+                st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.caption("傾向データなし（分析実行後に表示されます）")
 
         with st.expander("オッズ補正メモ", expanded=False):
             st.caption("上部の『🎯 単勝オッズ入力・取得』内の『手動オッズ入力』から必要時のみ入力してください。")
