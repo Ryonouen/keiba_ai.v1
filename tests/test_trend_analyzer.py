@@ -63,6 +63,12 @@ def test_prev_class_open_gives_zero():
     assert match is None
     assert risk is None
 
+def test_prev_class_boundary_below_60_gives_negative():
+    """0.60未満（条件戦ゾーン境界直下）は減点。"""
+    edge, match, risk = score_prev_class(_f(prev_race_class_index=0.59))
+    assert edge < 0
+    assert risk is not None
+
 def test_prev_class_conditions_gives_negative():
     edge, match, risk = score_prev_class(_f(prev_race_class_index=0.50))
     assert edge < 0
@@ -88,6 +94,12 @@ def test_prev_rank_top3_smaller_than_win():
 
 def test_prev_rank_4th_neutral():
     edge, match, risk = score_prev_rank(_f(prev_rank=4))
+    assert edge == 0.0
+    assert match is None
+    assert risk is None
+
+def test_prev_rank_5th_neutral():
+    edge, match, risk = score_prev_rank(_f(prev_rank=5))
     assert edge == 0.0
     assert match is None
     assert risk is None
@@ -125,7 +137,8 @@ def test_style_match_returns_match_item():
 def test_style_mismatch_returns_risk_item():
     trend = {"style": {"逃げ": 1, "先行": 1, "差し": 8}}
     _, match, risk = score_running_style(_f(running_style="front"), trend)
-    assert risk is not None or match is None  # front has low ratio → risk
+    assert risk is not None
+    assert match is None
 
 def test_style_edge_always_zero():
     trend = {"style": {"逃げ": 10}}
@@ -175,7 +188,10 @@ def test_analyze_bad_conditions_horse_below_1():
     result = analyze_horse_trend(f)
     assert result["trend_adjustment"] < 1.0
 
-def test_analyze_adjustment_within_bounds():
+def test_analyze_adjustment_within_typical_range():
+    # Note: TREND_ADJ_MAX=1.12 / TREND_ADJ_MIN=0.90 clip is not reachable
+    # with Phase 1 max edges (0.04+0.030=0.070 → max 1.07), but we verify
+    # the output stays within the documented range.
     f = _f(
         prev_race_class_index=0.99,
         prev_rank=1,
