@@ -782,15 +782,23 @@ def attach_ability_scores(features: List[Dict[str, Any]]) -> List[Dict[str, Any]
         f["winprob_rank"] = rank
 
     # ability_win_prob: win_score → z-score 正規化 → softmax（市場情報なし）
+    # win_score が未計算（旧スキーマ）の場合は None を設定して未計算と明示する
     ability_probs = calc_ability_win_probs(features)
+    has_valid = any(ap is not None for ap in ability_probs)
     for f, ap in zip(features, ability_probs):
-        f["ability_win_prob"] = round(ap, 4)
+        f["ability_win_prob"] = round(ap, 4) if ap is not None else None
 
-    # ability_win_prob_rank: ability_win_prob 降順
-    for rank, f in enumerate(
-        sorted(features, key=lambda x: float(x.get("ability_win_prob") or 0.0), reverse=True), start=1
-    ):
-        f["ability_win_prob_rank"] = rank
+    # ability_win_prob_rank: 有効値がある場合のみ設定
+    if has_valid:
+        for rank, f in enumerate(
+            sorted(
+                [f for f in features if f.get("ability_win_prob") is not None],
+                key=lambda x: float(x.get("ability_win_prob") or 0.0),
+                reverse=True,
+            ),
+            start=1,
+        ):
+            f["ability_win_prob_rank"] = rank
 
     return features
 
@@ -902,17 +910,24 @@ def calc_ability_win_probs(
     -------
     List[float]: 合計が 1.0 になる ability_win_prob リスト（features と同順）
     """
-    scores = [float(f.get("win_score") or 0.0) for f in features]
-    n = len(scores)
+    n = len(features)
     if n == 0:
         return []
+
+    # win_score が未計算（旧スキーマデータ）の場合は None を返す
+    # → 呼び出し元で ability_win_prob = None として保存し、未計算と区別する
+    raw_scores = [f.get("win_score") for f in features]
+    if all(s is None for s in raw_scores):
+        return [None] * n  # type: ignore[return-value]
+
+    scores = [float(s) if s is not None else 0.0 for s in raw_scores]
 
     # レース内 z-score 正規化
     mean = sum(scores) / n
     variance = sum((s - mean) ** 2 for s in scores) / n
     std = math.sqrt(variance)
 
-    # std が極小（≒ 全馬同スコア、5頭以下の混戦等）は均等分布を返す
+    # std が極小（≒ 全馬同スコア・真の混戦）は均等分布を返す
     if std < 1e-6:
         return [round(1.0 / n, 6)] * n
 
