@@ -44,6 +44,7 @@ from race_history_ai import (
     build_winner_condition_ai as history_build_winner_condition_ai,
     extract_race_id_from_url,
     fetch_past_10y_results,
+    fetch_past_10y_results_requests,
     analyze_10y_race_trend,
     match_current_runners_with_10y_trend,
     fetch_race_history_enriched,
@@ -60,6 +61,11 @@ from historical_pattern_engine import (
     apply_historical_pattern_bias,
     build_historical_pattern_profile as build_historical_pattern_profile_stats,
     score_feature_patterns,
+)
+
+from trend_analyzer import (
+    analyze_horse_trend,
+    apply_trend_analyzer_bias,
 )
 
 from selenium import webdriver
@@ -2805,33 +2811,44 @@ def _extract_first_int(text: str) -> Optional[int]:
         return None
 
 
-def extract_race_meta(driver: webdriver.Chrome, html_text: str = "") -> RaceMeta:
+def extract_race_meta(driver: Optional[webdriver.Chrome], html_text: str = "") -> RaceMeta:
     title = safe_driver_title(driver)
     race_info_text = ""
 
-    race_info_elements = driver.find_elements(By.CSS_SELECTOR, ".RaceData01, .RaceData02")
-    if race_info_elements:
-        race_info_text = " ".join([e.text for e in race_info_elements if e.text])
+    if driver is not None:
+        race_info_elements = driver.find_elements(By.CSS_SELECTOR, ".RaceData01, .RaceData02")
+        if race_info_elements:
+            race_info_text = " ".join([e.text for e in race_info_elements if e.text])
 
-    if not race_info_text and html_text:
+    if html_text:
         soup = BeautifulSoup(html_text, "html.parser")
-        for selector in [
-            ".RaceData01",
-            ".RaceData02",
-            "[class*='RaceData']",
-            "[class*='RaceInfo']",
-        ]:
-            nodes = soup.select(selector)
-            texts = [node.get_text(" ", strip=True) for node in nodes if node.get_text(" ", strip=True)]
-            if texts:
-                race_info_text = " ".join(texts)
-                break
-
+        # driver=None の場合（requestsモード）はHTMLからタイトルも抽出
+        if not title:
+            title_tag = soup.select_one("title")
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+            if not title:
+                rn = soup.select_one(".RaceName, .race_name, [class*='RaceName']")
+                if rn:
+                    title = rn.get_text(strip=True)
         if not race_info_text:
-            flat_text = soup.get_text(" ", strip=True)
-            m = re.search(r"(\d{1,2}[:時]\d{2}\s*分?\s*発走.{0,120}?\d{3,4}m.{0,80}?(?:良|稍重|重|不良)?)", flat_text)
-            if m:
-                race_info_text = m.group(1)
+            for selector in [
+                ".RaceData01",
+                ".RaceData02",
+                "[class*='RaceData']",
+                "[class*='RaceInfo']",
+            ]:
+                nodes = soup.select(selector)
+                texts = [node.get_text(" ", strip=True) for node in nodes if node.get_text(" ", strip=True)]
+                if texts:
+                    race_info_text = " ".join(texts)
+                    break
+
+            if not race_info_text:
+                flat_text = soup.get_text(" ", strip=True)
+                m = re.search(r"(\d{1,2}[:時]\d{2}\s*分?\s*発走.{0,120}?\d{3,4}m.{0,80}?(?:良|稍重|重|不良)?)", flat_text)
+                if m:
+                    race_info_text = m.group(1)
 
     target_surface, target_distance = parse_distance(race_info_text)
 
@@ -3396,6 +3413,60 @@ def fetch_newspaper_records(driver: webdriver.Chrome) -> Dict[str, Dict[str, Any
     return records_map
 
 
+def fetch_newspaper_records_from_html(html_text: str) -> Dict[str, Dict[str, Any]]:
+    """
+    requests モード用: newspaper.html の HTML 文字列から新聞データを抽出する。
+    fetch_newspaper_records(driver) の BeautifulSoup 版。
+    """
+    records_map: Dict[str, Dict[str, Any]] = {}
+    if not html_text:
+        return records_map
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    rows = soup.select("table.Newspaper_Table tbody tr")
+
+    for row in rows:
+        try:
+            name_node = row.select_one(".HorseName a") or row.select_one(".HorseName")
+            if not name_node:
+                continue
+            horse_name = name_node.get_text(strip=True)
+            if not horse_name:
+                continue
+
+            row_text = row.get_text("\n", strip=True)
+            row_lines = [l.strip() for l in row_text.splitlines() if l.strip()]
+
+            sire_name = ""
+            if row_lines and row_lines[0] != horse_name and row_lines[0] not in {"逃", "先", "差", "追", "自"}:
+                sire_name = row_lines[0]
+
+            style_char = parse_newspaper_style_char(row_text)
+            newspaper_mark = parse_newspaper_mark(row_text)
+
+            cols = row.find_all("td")
+            past_records: List[Dict[str, Any]] = []
+            for i in range(5):
+                idx = 6 + i
+                if idx >= len(cols):
+                    break
+                cell_text = cols[idx].get_text(" ", strip=True)
+                parsed = parse_newspaper_past_record_text(cell_text, style_char=style_char)
+                if parsed:
+                    past_records.append(parsed)
+
+            records_map[horse_name] = {
+                "records": past_records,
+                "sire_name": sire_name,
+                "style_char": style_char,
+                "newspaper_mark": newspaper_mark,
+            }
+        except Exception:
+            continue
+
+    return records_map
+
+
 def fetch_horse_records(
     driver: webdriver.Chrome,
     horse_url: str,
@@ -3538,20 +3609,13 @@ def fetch_horse_records_requests(
     if cached and isinstance(cached.get("records"), list):
         return cached["records"]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-        "Referer": "https://db.netkeiba.com/",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-
     try:
-        res = requests.get(horse_url, headers=headers, timeout=15)
-        res.encoding = res.apparent_encoding or "EUC-JP"
-        if res.status_code != 200:
+        from netkeiba_session import NetkeibaSession
+        _hs = NetkeibaSession()
+        html = _hs.fetch_html(horse_url, referer="https://db.netkeiba.com/")
+        if not html:
             return records
-        soup = BeautifulSoup(res.text, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         rows = soup.select(".db_h_race_results tbody tr")
     except Exception:
         return records
@@ -4206,6 +4270,7 @@ def analyze_race(
     history_limit: int = HISTORY_LIMIT_DEFAULT,
     headless: bool = False,
     force_refresh_cache: bool = False,
+    use_requests: bool = False,
 ) -> Dict[str, Any]:
     input_url = race_url.strip()
     if "newspaper.html" in input_url:
@@ -4240,9 +4305,9 @@ def analyze_race(
         except Exception:
             _cutoff_date = f"{_rid[:4]}/12/31"
 
-    # "cutoff_v2": race_idから正しい実日付を取得するよう修正したバージョン。
-    # 旧キャッシュ（cutoff 修正前のリーク済み分析結果）を自動無効化するための固定バージョン文字列。
-    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2")
+    # "cutoff_v2_hp_v1": historical_pattern/route_profile 統合後の結果を保証するバージョン。
+    # 旧キャッシュ（スコアが None のもの）を自動無効化するための固定バージョン文字列。
+    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2_hp_v1")
     if force_refresh_cache:
         print(f"[analyze_race] cache bypass race_id={_debug_race_id or 'unknown'}", flush=True)
     else:
@@ -4258,102 +4323,144 @@ def analyze_race(
                 print(f"[analyze_race] cache hit race_id={_input_rid or 'unknown'}", flush=True)
                 return refresh_result_payload(cached_result)
 
-    driver = build_webdriver(headless=headless)
+    driver = None
+    if not use_requests:
+        driver = build_webdriver(headless=headless)
     try:
-        print("[analyze_race] webdriver ready", flush=True)
-        driver = warmup_netkeiba_session(driver, headless=headless)
-        print("[analyze_race] warmup done", flush=True)
+        # =========================================================
+        # ページ取得（requestsモード / Seleniumモード 分岐）
+        # =========================================================
+        if use_requests:
+            # --- requests モード: NetkeibaSession (curl_cffi Chrome偽装) ---
+            from netkeiba_session import NetkeibaSession
+            _nsession = NetkeibaSession()
+            _nsession.warmup()
 
-        driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
-        random_sleep(5.0, 7.5)
-        emulate_human_behavior(driver)
+            print("[analyze_race] requests mode: fetching shutuba", flush=True)
+            page_src = _nsession.fetch_html(shutuba_url)
+            if not page_src:
+                return {
+                    "race_meta": {"race_title": "データ取得失敗", "race_info_text": "shutuba取得失敗",
+                                  "target_surface": None, "target_distance": None,
+                                  "target_course": "unknown", "target_ground": "", "predicted_pace": "unknown"},
+                    "features": [], "error": "FETCH_FAILED",
+                }
+            expected_starter_count = extract_expected_starter_count_from_html(page_src)
+            print(f"[analyze_race] requests: shutuba loaded expected_starters={expected_starter_count or 0}", flush=True)
 
-        page_src = safe_page_source(driver)
-        current_title = safe_driver_title(driver)
-        expected_starter_count = extract_expected_starter_count_from_html(page_src)
-        print(
-            f"[analyze_race] shutuba loaded expected_starters={expected_starter_count or 0}",
-            flush=True,
-        )
+            race_meta = extract_race_meta(None, html_text=page_src)
+            race_meta.starter_count = expected_starter_count
+            horses = fetch_horses(None, html_text=page_src)
+            print(f"[analyze_race] requests: fetched horses count={len(horses)}", flush=True)
+            if race_meta.starter_count is None:
+                race_meta.starter_count = len(horses) if horses else None
 
-        if is_blocked_page(page_src, current_title):
-            return {
-                "race_meta": {
-                    "race_title": "データ取得失敗",
-                    "race_info_text": "netkeiba側でアクセスがブロックされました",
-                    "target_surface": None,
-                    "target_distance": None,
-                    "target_course": "unknown",
-                    "target_ground": "",
-                    "predicted_pace": "unknown",
-                    "starter_count": expected_starter_count,
-                },
-                "features": [],
-                "error": "HTTP400_BLOCKED",
-            }
-
-        save_cookies(driver, COOKIE_FILE)
-
-        tables: List[Any] = []
-        prev_count = 0
-        stable_count = 0
-        print("[analyze_race] waiting shutuba rows stabilize", flush=True)
-        for _ in range(30):
+            newspaper_records: Dict[str, Dict[str, Any]] = {}
             try:
-                tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
-            except Exception:
-                tables = []
+                _np_html = _nsession.fetch_html(newspaper_url)
+                if _np_html:
+                    newspaper_records = fetch_newspaper_records_from_html(_np_html)
+            except Exception as _np_err:
+                print(f"[analyze_race] requests: newspaper failed: {_np_err}", flush=True)
+            print(f"[analyze_race] requests: newspaper loaded records={len(newspaper_records)}", flush=True)
 
-            current_count = len(tables)
-            target_count = expected_starter_count or 4
-            if current_count >= target_count:
-                if current_count == prev_count:
-                    stable_count += 1
-                    if stable_count >= 2:
+        else:
+            # --- Selenium モード: 既存パス（変更なし）---
+            print("[analyze_race] webdriver ready", flush=True)
+            driver = warmup_netkeiba_session(driver, headless=headless)
+            print("[analyze_race] warmup done", flush=True)
+
+            driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
+            random_sleep(5.0, 7.5)
+            emulate_human_behavior(driver)
+
+            page_src = safe_page_source(driver)
+            current_title = safe_driver_title(driver)
+            expected_starter_count = extract_expected_starter_count_from_html(page_src)
+            print(
+                f"[analyze_race] shutuba loaded expected_starters={expected_starter_count or 0}",
+                flush=True,
+            )
+
+            if is_blocked_page(page_src, current_title):
+                return {
+                    "race_meta": {
+                        "race_title": "データ取得失敗",
+                        "race_info_text": "netkeiba側でアクセスがブロックされました",
+                        "target_surface": None,
+                        "target_distance": None,
+                        "target_course": "unknown",
+                        "target_ground": "",
+                        "predicted_pace": "unknown",
+                        "starter_count": expected_starter_count,
+                    },
+                    "features": [],
+                    "error": "HTTP400_BLOCKED",
+                }
+
+            save_cookies(driver, COOKIE_FILE)
+
+            tables: List[Any] = []
+            prev_count = 0
+            stable_count = 0
+            print("[analyze_race] waiting shutuba rows stabilize", flush=True)
+            for _ in range(30):
+                try:
+                    tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
+                except Exception:
+                    tables = []
+
+                current_count = len(tables)
+                target_count = expected_starter_count or 4
+                if current_count >= target_count:
+                    if current_count == prev_count:
+                        stable_count += 1
+                        if stable_count >= 2:
+                            break
+                    else:
+                        stable_count = 0
+                    prev_count = current_count
+
+                time.sleep(1)
+
+            print(
+                f"[analyze_race] shutuba rows stabilized count={len(tables)} stable_count={stable_count}",
+                flush=True,
+            )
+            time.sleep(1.0)
+            page_src = safe_page_source(driver)  # 安定待ち後に再取得（全頭反映）
+
+            print("[analyze_race] extracting race meta", flush=True)
+            race_meta = extract_race_meta(driver, page_src)
+            race_meta.starter_count = expected_starter_count
+            print("[analyze_race] race meta extracted", flush=True)
+            print("[analyze_race] fetching horses", flush=True)
+            horses = fetch_horses(driver, page_src)
+            print(f"[analyze_race] fetched horses count={len(horses)}", flush=True)
+            if expected_starter_count and len(horses) < expected_starter_count:
+                for _ in range(2):
+                    driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
+                    time.sleep(2.0)
+                    retry_horses = fetch_horses(driver)
+                    if len(retry_horses) > len(horses):
+                        horses = retry_horses
+                    if len(horses) >= expected_starter_count:
                         break
-                else:
-                    stable_count = 0
-                prev_count = current_count
 
-            time.sleep(1)
+            if race_meta.starter_count is None:
+                race_meta.starter_count = len(horses) if horses else None
+            newspaper_records: Dict[str, Dict[str, Any]] = {}
 
-        print(
-            f"[analyze_race] shutuba rows stabilized count={len(tables)} stable_count={stable_count}",
-            flush=True,
-        )
-        time.sleep(1.0)
-
-        print("[analyze_race] extracting race meta", flush=True)
-        race_meta = extract_race_meta(driver, page_src)
-        race_meta.starter_count = expected_starter_count
-        print("[analyze_race] race meta extracted", flush=True)
-        print("[analyze_race] fetching horses", flush=True)
-        horses = fetch_horses(driver, page_src)
-        print(f"[analyze_race] fetched horses count={len(horses)}", flush=True)
-        if expected_starter_count and len(horses) < expected_starter_count:
-            for _ in range(2):
-                driver = safe_get(driver, shutuba_url, headless=headless, retries=1)
-                time.sleep(2.0)
-                retry_horses = fetch_horses(driver)
-                if len(retry_horses) > len(horses):
-                    horses = retry_horses
-                if len(horses) >= expected_starter_count:
-                    break
-
-        if race_meta.starter_count is None:
-            race_meta.starter_count = len(horses) if horses else None
-        newspaper_records: Dict[str, Dict[str, Any]] = {}
-
-        try:
-            driver = safe_get(driver, newspaper_url, headless=headless, retries=1)
-            random_sleep(2.0, 3.0)
-            newspaper_records = fetch_newspaper_records(driver)
-        except Exception:
-            newspaper_records = {}
-        print(
-            f"[analyze_race] newspaper loaded records={len(newspaper_records)}",
-            flush=True,
-        )
+            try:
+                driver = safe_get(driver, newspaper_url, headless=headless, retries=1)
+                random_sleep(2.0, 3.0)
+                newspaper_records = fetch_newspaper_records(driver)
+            except Exception:
+                newspaper_records = {}
+            print(
+                f"[analyze_race] newspaper loaded records={len(newspaper_records)}",
+                flush=True,
+            )
         # 新聞データが0件でも、馬リンクが取れていれば個別ページフォールバックを許可する。
         # これが無いと records_source=none が全頭に波及し、能力値が横並びになる。
         _allow_horse_page_fallback = any(str(h.get("link") or "").strip() for h in horses)
@@ -4396,7 +4503,20 @@ def analyze_race(
             _had_newspaper_records = bool(isinstance(newspaper_entry, dict) and newspaper_entry.get("records"))
 
             if not records:
-                if _allow_horse_page_fallback:
+                if use_requests:
+                    # requestsモード: Selenium不要の軽量版フォールバック
+                    print(
+                        f"[analyze_race] horse fallback (requests) idx={idx}/{len(horses)} name={horse['name']}",
+                        flush=True,
+                    )
+                    records = fetch_horse_records_requests(
+                        horse_url,
+                        history_limit=history_limit,
+                        cutoff_date=_cutoff_date,
+                    )
+                    sire_name = sire_name or ""
+                    _birthday = None
+                elif _allow_horse_page_fallback:
                     print(
                         f"[analyze_race] horse fallback idx={idx}/{len(horses)} name={horse['name']}",
                         flush=True,
@@ -4563,7 +4683,7 @@ def analyze_race(
         # =========================================================
         current_race_id = extract_race_id_from_url(shutuba_url)
         _training_map: Dict[str, Dict[str, Any]] = {}
-        if current_race_id:
+        if current_race_id and not use_requests:
             try:
                 _training_map = fetch_training_info(driver, current_race_id)
             except Exception:
@@ -4606,7 +4726,11 @@ def analyze_race(
             if current_race_id:
                 # expected_race_name を渡すことで、別レースが同スロットに入っているページを自動除外する
                 _expected_name = race_meta.race_title if race_meta else ""
-                past_10y_results = fetch_past_10y_results(driver, current_race_id, _expected_name)
+                past_10y_results = (
+                    fetch_past_10y_results_requests(current_race_id, _expected_name)
+                    if use_requests
+                    else fetch_past_10y_results(driver, current_race_id, _expected_name)
+                )
 
                 # 証拠ベース補正用: 全走者データを取得して条件別統計を構築
                 _condition_stats_error: str = ""
@@ -4664,8 +4788,12 @@ def analyze_race(
                         years=ROUTE_PROFILE_YEARS,
                     )
                     features = attach_route_profile_scores(features, route_profile)
-                except Exception:
+                except Exception as _rpe:
+                    print(f"[analyze_race] route_profile failed: {_rpe}", flush=True)
                     route_profile = {}
+                    for _f in features:
+                        _f.setdefault("route_profile_score", 0.0)
+                        _f.setdefault("route_profile_reasons", [])
 
                 try:
                     historical_pattern_profile = collect_historical_pattern_profile(
@@ -4674,8 +4802,12 @@ def analyze_race(
                         years=HISTORICAL_PATTERN_YEARS,
                     )
                     features = attach_historical_pattern_scores(features, historical_pattern_profile)
-                except Exception:
+                except Exception as _hpe:
+                    print(f"[analyze_race] historical_pattern failed: {_hpe}", flush=True)
                     historical_pattern_profile = {}
+                    for _f in features:
+                        _f.setdefault("historical_pattern_score", 0.0)
+                        _f.setdefault("historical_pattern_reasons", [])
 
                 condition_match_horses = []
                 condition_scores = deterministic_pattern.get("condition_scores", {}) or {}
@@ -4798,6 +4930,21 @@ def analyze_race(
             for f in features:
                 f["historical_pattern_applied"] = True
 
+        # 傾向分析（trend_analyzer）: 前走クラス/着順を構造化評価し win_prob に反映
+        # signal_judge は model_score に加算、trend_analyzer は win_prob に乗算のため独立
+        try:
+            _trend_ctx = {
+                "condition_stats_available": bool(condition_stats),
+                "race_trend_10y": race_trend_10y,
+            }
+            for f in features:
+                f["trend_analyzer_result"] = analyze_horse_trend(f, _trend_ctx)
+
+            probs = apply_trend_analyzer_bias(probs, features, weight=0.50)
+            print("[analyze_race] trend_analyzer bias applied", flush=True)
+        except Exception as _e:
+            print(f"[analyze_race] trend_analyzer skipped: {_e}", flush=True)
+
         for f, p in zip(features, probs):
             f["win_prob"] = round(p, 4)
         print("[analyze_race] probabilities assigned", flush=True)
@@ -4897,10 +5044,11 @@ def analyze_race(
         return result
     
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 # =========================================================
 # Odds apply
