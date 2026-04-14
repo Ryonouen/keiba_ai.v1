@@ -178,8 +178,8 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
         driver = uc.Chrome(options=options, use_subprocess=True)
         driver.implicitly_wait(5)
         try:
-            driver.set_page_load_timeout(12)
-            driver.set_script_timeout(15)
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
         except Exception:
             pass
         return driver
@@ -197,16 +197,13 @@ def build_webdriver(headless: bool = False) -> webdriver.Chrome:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--lang=ja-JP")
 
-    # v146 chromedriver is broken on this machine; use cached v145 if available
-    _v145 = os.path.expanduser(
-        "~/.wdm/drivers/chromedriver/mac64/145.0.7632.117/chromedriver-mac-arm64/chromedriver"
-    )
-    _driver_path = _v145 if os.path.exists(_v145) else ChromeDriverManager().install()
+    # Use webdriver-manager to resolve the correct chromedriver for the installed Chrome
+    _driver_path = ChromeDriverManager().install()
     driver = webdriver.Chrome(service=Service(_driver_path), options=options)
     driver.implicitly_wait(5)
     try:
-        driver.set_page_load_timeout(12)
-        driver.set_script_timeout(15)
+        driver.set_page_load_timeout(30)
+        driver.set_script_timeout(30)
     except Exception:
         pass
 
@@ -440,6 +437,7 @@ class RaceMeta:
     target_ground: str
     predicted_pace: str = ""
     starter_count: Optional[int] = None
+    race_date: str = ""  # YYYY-MM-DD（タイトルから抽出）
 
 
 # =========================================================
@@ -2863,6 +2861,12 @@ def extract_race_meta(driver: Optional[webdriver.Chrome], html_text: str = "") -
             target_ground = g
             break
 
+    # タイトルから日付を抽出（例: "2026年4月19日" → "2026-04-19"）
+    race_date = ""
+    m_date = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", title + " " + race_info_text)
+    if m_date:
+        race_date = f"{m_date.group(1)}-{int(m_date.group(2)):02d}-{int(m_date.group(3)):02d}"
+
     return RaceMeta(
         race_title=title,
         race_info_text=race_info_text,
@@ -2870,6 +2874,7 @@ def extract_race_meta(driver: Optional[webdriver.Chrome], html_text: str = "") -
         target_distance=target_distance,
         target_course=target_course,
         target_ground=target_ground,
+        race_date=race_date,
     )
 
 
@@ -2937,8 +2942,8 @@ def _extract_horse_rows_from_html(html_text: str) -> List[Dict[str, Any]]:
         jockey_text = _cell_text(".Jockey", "[class*='Jockey']", "a[href*='/jockey/']")
         trainer_text = _cell_text(".Trainer", "[class*='Trainer']", "a[href*='/trainer/']")
         weight_text = _cell_text(".Kinryo", "[class*='Kinryo']")
-        odds_text = _cell_text(".Odds", "[class*='Odds']")
-        popularity_text = _cell_text(".Ninki", "[class*='Ninki']", "[class*='Popular']")
+        odds_text = _cell_text(".Odds", "[class*='Odds']", ".Txt_R.Popular")
+        popularity_text = _cell_text(".Ninki", "[class*='Ninki']", ".Popular_Ninki", "[class*='Popular_Ninki']")
         age_text = _cell_text(".Barei", "[class*='Barei']")
         place_odds_text = _cell_text(".Place_Odds", "[class*='Place_Odds']")
 

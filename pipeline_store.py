@@ -101,6 +101,41 @@ def load_all_predictions() -> Dict[str, Any]:
     return _load(PREDICTIONS_FILE)
 
 
+def is_prediction_incomplete(pred: Dict[str, Any]) -> bool:
+    """
+    明らかに不完全な prediction レコードを検出する。
+
+    現状の主な壊れ方は「全頭取得できず 1〜3頭だけ保存される」ケースなので、
+    JRA 前提で 3頭以下は不完全とみなす。
+    併せて horse_number_map が存在する場合は件数不一致も不完全扱いにする。
+    """
+    if not isinstance(pred, dict):
+        return True
+
+    horses = pred.get("horses") or []
+    if not isinstance(horses, list) or not horses:
+        return True
+
+    if len(horses) <= 3:
+        return True
+
+    if not str(pred.get("start_time") or "").strip():
+        return True
+
+    horse_number_map = pred.get("horse_number_map") or {}
+    if not isinstance(horse_number_map, dict) or not horse_number_map:
+        return True
+    if len(horses) < len(horse_number_map):
+        return True
+
+    all_no_odds = all(h.get("win_odds") in (None, "", 0) for h in horses)
+    all_no_popularity = all(h.get("popularity") in (None, "", 0) for h in horses)
+    if all_no_odds and all_no_popularity:
+        return True
+
+    return False
+
+
 def load_race_start_times(date_str: str) -> Dict[str, str]:
     """
     指定 analysis_date の全レースの {race_id: start_datetime} を返す。
@@ -225,9 +260,47 @@ def save_prediction_v2(
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     race_info_text = race_meta.get("race_info_text", "")
     race_date = race_meta.get("race_date", "")
+    # analysis_date を YYYYMMDD 形式に正規化（"2026-04-19" → "20260419"）
+    analysis_date = analysis_date.replace("-", "") if analysis_date else ""
 
     start_time = _extract_start_time(race_info_text)
     start_datetime = f"{race_date}T{start_time}:00" if start_time and race_date else ""
+
+    def _feature_key(feature: Dict[str, Any]) -> str:
+        name = str(feature.get("horse_name") or "")
+        if name:
+            return f"name:{name}"
+        no = feature.get("horse_number")
+        return f"no:{no}"
+
+    def _feature_score(feature: Dict[str, Any]) -> int:
+        score = 0
+        for key in [
+            "horse_name", "horse_url", "horse_number", "gate", "jockey",
+            "popularity", "win_odds", "ability_score", "raw_ability_score",
+        ]:
+            value = feature.get(key)
+            if value not in (None, "", 0):
+                score += 1
+        records = feature.get("past_races") or feature.get("records") or []
+        if isinstance(records, list):
+            score += len(records)
+        return score
+
+    deduped_features: List[Dict[str, Any]] = []
+    deduped_by_key: Dict[str, Dict[str, Any]] = {}
+    ordered_keys: List[str] = []
+    for feature in features:
+        key = _feature_key(feature)
+        prev = deduped_by_key.get(key)
+        if prev is None:
+            deduped_by_key[key] = feature
+            ordered_keys.append(key)
+            continue
+        if _feature_score(feature) > _feature_score(prev):
+            deduped_by_key[key] = feature
+    deduped_features = [deduped_by_key[key] for key in ordered_keys]
+    features = deduped_features
 
     # horse_number_map と horse_id_map を features から構築
     horse_number_map: Dict[str, str] = {}
@@ -262,7 +335,10 @@ def save_prediction_v2(
             "horse_id":               horse_id_map.get(name, ""),
             "ai_win_prob":            round(float(f.get("win_prob") or 0.0), 4),
             "win_odds":               f.get("win_odds"),
-            "popularity":             f.get("popularity") or f.get("feat_popularity"),
+            "popularity":             f.get("popularity"),
+            "ability_score":          f.get("ability_score"),
+            "raw_ability_score":      f.get("raw_ability_score"),
+            "ai_power_index":         f.get("ai_power_index"),
             "running_style":          running_style,
             "running_style_source":   rs_source,
             "running_style_missing":  running_style == "unknown",
