@@ -59,7 +59,11 @@ from route_profile_engine import (
 )
 from historical_pattern_engine import (
     apply_historical_pattern_bias,
+    append_hist_distribution,
+    audit_hist_scores,
     build_historical_pattern_profile as build_historical_pattern_profile_stats,
+    detect_hist_sudden_changes,
+    HIST_SUDDEN_CHANGE_THRESHOLD,
     score_feature_patterns,
 )
 
@@ -107,6 +111,50 @@ HISTORICAL_PATTERN_YEARS: int = 8
 HISTORICAL_PATTERN_PROB_WEIGHT: float = 0.30
 HISTORICAL_PATTERN_CACHE_VERSION: str = "v1"
 TREND_ANALYZER_PROB_WEIGHT: float = 0.50
+RANKER_WEIGHT_DEFAULT: float = 0.35   # feat_last3f が十分に揃っているレース向けの標準値
+
+
+def _calc_ranker_weight(features: List[Dict[str, Any]]) -> tuple:
+    """
+    feat_last3f の欠損率に応じて ranker ブレンド比率を減衰させる。
+
+    背景:
+      ranker は feat_last3f（上がり3F）を最重要特徴の一つとして学習している。
+      shutuba 段階の未来レース分析では feat_last3f が全頭 0.0 になるケースが多く、
+      その場合 ranker は「0.0 = 欠損」という値を高いスコアとして誤解し、
+      実質的に市場人気順位の補完装置として機能してしまう。
+      この挙動を欠損率が高い場面で自動的に抑制するために weight を減衰させる。
+
+    欠損判定:
+      feat_last3f が None または 0.0 を欠損とみなす。
+      注意: 本物の上がり3F が 0.0 になるケースは現実にはないため、
+      現行運用上は 0.0 = 欠損とみなして問題ない。
+      将来的にデータ形式が変わった場合はこの判定を見直すこと。
+
+    返り値: (weight, missing_count, missing_rate)
+    """
+    if not features:
+        return RANKER_WEIGHT_DEFAULT, 0, 0.0
+
+    n = len(features)
+    missing = sum(
+        1 for f in features
+        if f.get("feat_last3f") is None or float(f.get("feat_last3f") or 0.0) == 0.0
+    )
+    rate = missing / n
+
+    if rate >= 0.8:
+        weight = 0.10
+    elif rate >= 0.5:
+        weight = 0.20
+    elif rate >= 0.2:
+        weight = 0.28
+    else:
+        weight = RANKER_WEIGHT_DEFAULT
+
+    return weight, missing, rate
+
+
 def random_sleep(min_sec: float = 0.8, max_sec: float = 1.8) -> None:
     time.sleep(random.uniform(min_sec, max_sec))
 
@@ -2987,7 +3035,7 @@ def _extract_horse_rows_from_html(html_text: str) -> List[Dict[str, Any]]:
 
     soup = BeautifulSoup(html_text, "html.parser")
     extracted_dom: List[Dict[str, Any]] = []
-    for tr in soup.select("table.Shutuba_Table tbody tr"):
+    for tr in soup.select("table.Shutuba_Table tr"):
         name_node = (
             tr.select_one(".HorseName a")
             or tr.select_one("[class*='HorseName'] a")
@@ -3130,7 +3178,7 @@ def fetch_horses(driver: webdriver.Chrome, html_text: str = "") -> List[Dict[str
         return horses
 
     try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
+        rows = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tr.HorseList")
     except Exception:
         return horses
 
@@ -3936,11 +3984,19 @@ def collect_historical_pattern_profile(
 def attach_historical_pattern_scores(
     features: List[Dict[str, Any]],
     historical_pattern_profile: Optional[Dict[str, Any]],
+    race_id: str = "",
 ) -> List[Dict[str, Any]]:
     if not features:
         return features
 
     sample_size = int((historical_pattern_profile or {}).get("sample_size") or 0)
+
+    # 急変監視: スコア計算前に既存値を保存（再分析時の前後差分検出用）
+    prev_scores: Dict[str, float] = {
+        str(f.get("horse_name") or ""): float(f.get("historical_pattern_score") or 0.0)
+        for f in features
+    }
+
     for feature in features:
         pattern_score, reasons = score_feature_patterns(feature, historical_pattern_profile or {})
         feature["historical_pattern_score"] = pattern_score if sample_size > 0 else 0.0
@@ -3949,6 +4005,29 @@ def attach_historical_pattern_scores(
             feature["model_score"] = round(
                 float(feature.get("model_score") or 0.0) + pattern_score * 0.10,
                 6,
+            )
+
+    # 監査ログ出力（sample_size > 0 のときのみ）
+    if sample_size > 0:
+        _audit = audit_hist_scores(race_id, features, historical_pattern_profile or {})
+        _capped_pos = sum(1 for a in _audit if a["is_capped"] and a["cap_direction"] == "+")
+        _capped_neg = sum(1 for a in _audit if a["is_capped"] and a["cap_direction"] == "-")
+        print(
+            f"[hist_audit] n={len(features)}"
+            f"  capped=(+{_capped_pos}/-{_capped_neg})"
+            f"  sample={sample_size}",
+            flush=True,
+        )
+
+        # 急変馬検出: 旧スコアとの差分が HIST_SUDDEN_CHANGE_THRESHOLD 以上
+        _after_scores: Dict[str, float] = {a["horse_name"]: a["hist_score"] for a in _audit}
+        _changes = detect_hist_sudden_changes(prev_scores, _after_scores)
+        for c in _changes:
+            print(
+                f"[hist_audit] SUDDEN_CHANGE {c['horse_name']}"
+                f"  {c['hist_before']:+.3f} → {c['hist_after']:+.3f}"
+                f"  (diff={c['diff']:+.3f})",
+                flush=True,
             )
 
     return features
@@ -4481,7 +4560,7 @@ def analyze_race(
             print("[analyze_race] waiting shutuba rows stabilize", flush=True)
             for _ in range(30):
                 try:
-                    tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tbody tr")
+                    tables = driver.find_elements(By.CSS_SELECTOR, "table.Shutuba_Table tr.HorseList")
                 except Exception:
                     tables = []
 
@@ -4876,7 +4955,29 @@ def analyze_race(
                         expected_race_name=_expected_name,
                         years=HISTORICAL_PATTERN_YEARS,
                     )
-                    features = attach_historical_pattern_scores(features, historical_pattern_profile)
+                    features = attach_historical_pattern_scores(
+                        features, historical_pattern_profile, race_id=current_race_id
+                    )
+                    # hist が実際に適用されるレース（sample_size >= 8）のみ JSONL に追記する。
+                    # sample_size < 8 は apply_historical_pattern_bias が呼ばれず hist 非適用と同義。
+                    if int((historical_pattern_profile or {}).get("sample_size") or 0) >= 8:
+                        try:
+                            _race_date = str(getattr(race_meta, "race_date", "") or "")
+                            _dist_path = append_hist_distribution(
+                                current_race_id, _expected_name, _race_date,
+                                features, historical_pattern_profile,
+                            )
+                            print(
+                                f"[hist_audit] DISTRIBUTION_LOG_APPENDED"
+                                f"  race_id={current_race_id}  path={_dist_path}",
+                                flush=True,
+                            )
+                        except Exception as _dist_e:
+                            print(
+                                f"[hist_audit] DISTRIBUTION_LOG_APPEND_FAILED"
+                                f"  race_id={current_race_id}  error={_dist_e}",
+                                flush=True,
+                            )
                 except Exception as _hpe:
                     print(f"[analyze_race] historical_pattern failed: {_hpe}", flush=True)
                     historical_pattern_profile = {}
@@ -4978,7 +5079,27 @@ def analyze_race(
             try:
                 from ranker_engine import predict_rank_score, blend_scores as _blend
                 rank_scores = predict_rank_score(features, profile="balanced")
-                probs = _blend(ml_probs, rank_scores, weight_ranker=0.35)
+                # 後段の検証用に ranker_score を feature_dict に保存する。
+                # 予測ロジック自体は変えず、説明可能性向上のための保存のみ。
+                if rank_scores and len(rank_scores) == len(features):
+                    for f, rs in zip(features, rank_scores):
+                        f["ranker_score"] = round(float(rs), 6)
+                # feat_last3f 欠損率に応じて ranker ブレンド比率を減衰させる。
+                # 欠損が多いレース（shutuba段階の未来レース等）では ranker が
+                # 市場人気順位の補完装置になるリスクが高いため weight を下げる。
+                _rw, _rw_missing, _rw_rate = _calc_ranker_weight(features)
+                _race_label = race_meta.race_title if race_meta else "unknown"
+                print(
+                    f"[ranker_guard] race={_race_label}  n={len(features)}"
+                    f"  last3f_missing={_rw_missing}/{len(features)}"
+                    f"  missing_rate={_rw_rate:.2f}"
+                    f"  applied_ranker_weight={_rw}",
+                    flush=True,
+                )
+                for f in features:
+                    f["last3f_missing_rate"]    = round(_rw_rate, 4)
+                    f["applied_ranker_weight"]  = _rw
+                probs = _blend(ml_probs, rank_scores, weight_ranker=_rw)
                 for f in features:
                     f["model_type"] = "lightgbm+ranker" if rank_scores else "lightgbm"
             except Exception:
@@ -5025,6 +5146,20 @@ def analyze_race(
 
         for f, p in zip(features, probs):
             f["win_prob"] = round(p, 4)
+        # デバッグ用サマリ: 各馬の主要スコアを一行出力（説明可能性確認用）
+        for f in sorted(features, key=lambda x: float(x.get("win_prob") or 0), reverse=True)[:5]:
+            print(
+                f"[prob_debug] {f.get('horse_name','?'):14s}"
+                f" ability={f.get('ability_score','N/A')}"
+                f" ability_wp={f.get('ability_win_prob','N/A')}"
+                f" feat_odds_log={f.get('feat_win_odds_log','N/A')}"
+                f" model_sc={f.get('model_score','N/A')}"
+                f" ranker_sc={f.get('ranker_score','N/A')}"
+                f" route={f.get('route_profile_score','N/A')}"
+                f" hist={f.get('historical_pattern_score','N/A')}"
+                f" win_prob={f.get('win_prob','N/A')}",
+                flush=True,
+            )
         print("[analyze_race] probabilities assigned", flush=True)
 
         # 学習データ勝者プロファイル補正（脚質・年齢・人気帯リフト）

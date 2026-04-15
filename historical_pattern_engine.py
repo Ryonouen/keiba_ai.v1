@@ -3,15 +3,32 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-TOKEN_SCORE_CAP = 0.45
+# ============================================================
+# Phase2 確定設定（2026-04-15 採用）
+# 変更履歴:
+#   Phase0: TOKEN_SCORE_CAP=0.45, race_any weight=0.50, min_starts=2
+#   Phase1: race_any weight=0.00（小サンプルnoise無効化）、min_starts=5 に引き上げ
+#   Phase2: TOKEN_SCORE_CAP=0.30（±0.40 飽和過多を緩和）
+# 次の再評価ポイント: hist_applied レースが 30〜50 件蓄積後
+# アルトラムス注意: Phase1 で min_starts 引き上げにより
+#   race_top3:毎日杯・シンザン記念 が除去され -0.40 → +0.40 に急変。
+#   急変監視フラグ付きで経過観察中（HIST_SUDDEN_CHANGE_THRESHOLD 参照）。
+# ============================================================
+TOKEN_SCORE_CAP = 0.30
 FEATURE_SCORE_CAP = 0.40
+
+# 監視用定数
+# |diff| がこの閾値以上の馬を「急変馬」として [hist_audit] ログに出力する
+HIST_SUDDEN_CHANGE_THRESHOLD = 0.50
+# append_hist_distribution() のデフォルト出力先
+HIST_DISTRIBUTION_LOG = "hist_distribution_log.jsonl"
 
 TOKEN_WEIGHT_PREFIXES: Tuple[Tuple[str, float], ...] = (
     ("race_top3:",     0.70),
-    ("race_any:",      0.50),
+    ("race_any:",      0.00),  # disabled: low-sample noise; restore if needed
     ("distance_top3:", 0.60),
     ("distance_any:",  0.40),
     ("grade_top3:",    0.55),
@@ -226,7 +243,7 @@ def build_historical_pattern_profile(samples: Iterable[Dict[str, Any]]) -> Dict[
     token_stats: Dict[str, Dict[str, float]] = {}
     for token, row in token_buckets.items():
         starts = row["starts"]
-        if starts < 2:
+        if starts < 5:
             continue
         win_rate = row["wins"] / starts
         top3_rate = row["top3"] / starts
@@ -296,3 +313,147 @@ def apply_historical_pattern_bias(
     if total <= 0:
         return probs
     return [value / total for value in adjusted]
+
+
+# ============================================================
+# 監視ユーティリティ（Phase2 以降の追跡用・ロジック変更なし）
+# ============================================================
+
+
+def audit_hist_scores(
+    race_id: str,
+    features: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+    top_k: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    各馬の hist_score・寄与トークン・飽和状態を辞書リストで返す。
+
+    返却フィールド:
+        race_id, horse_name, hist_score, raw_total,
+        is_capped, cap_direction ("+"/"-"/"none"),
+        top_tokens: [{token, score, weight, contribution, starts}]
+    """
+    token_stats = (profile or {}).get("token_stats") or {}
+    result: List[Dict[str, Any]] = []
+
+    for feature in features:
+        name = str(feature.get("horse_name") or "")
+        tokens = build_feature_pattern_tokens(feature)
+
+        # (|weighted|, token, raw_score, token_weight, weighted, starts)
+        matched: List[Tuple[float, str, float, float, float, int]] = []
+        for tok in tokens:
+            row = token_stats.get(tok)
+            if not row:
+                continue
+            score = float(row.get("score") or 0.0)
+            if score == 0:
+                continue
+            tw = _token_weight(tok)
+            if tw == 0.0:
+                continue
+            weighted = score * tw
+            matched.append((abs(weighted), tok, score, tw, weighted, int(row.get("starts") or 0)))
+
+        matched.sort(reverse=True)
+        top = matched[:top_k]
+
+        raw_total = sum(x[4] for x in top)
+        clamped = max(-FEATURE_SCORE_CAP, min(FEATURE_SCORE_CAP, raw_total))
+        is_capped = abs(clamped - raw_total) > 0.001
+        if raw_total > FEATURE_SCORE_CAP:
+            cap_dir = "+"
+        elif raw_total < -FEATURE_SCORE_CAP:
+            cap_dir = "-"
+        else:
+            cap_dir = "none"
+
+        result.append({
+            "race_id": race_id,
+            "horse_name": name,
+            "hist_score": round(clamped, 5),
+            "raw_total": round(raw_total, 5),
+            "is_capped": is_capped,
+            "cap_direction": cap_dir,
+            "top_tokens": [
+                {
+                    "token": tok,
+                    "score": round(s, 5),
+                    "weight": tw,
+                    "contribution": round(w, 5),
+                    "starts": st,
+                }
+                for _, tok, s, tw, w, st in top
+            ],
+        })
+
+    return result
+
+
+def detect_hist_sudden_changes(
+    before: Dict[str, float],
+    after: Dict[str, float],
+    threshold: float = HIST_SUDDEN_CHANGE_THRESHOLD,
+) -> List[Dict[str, Any]]:
+    """
+    旧スコアと新スコアの差分が threshold 以上の馬を返す。
+
+    before / after は {horse_name: hist_score} の辞書。
+    アルトラムスのような急変ケース（min_starts 変更で -0.40 → +0.40）の
+    自動検出に使う。結果は |diff| 降順でソートされる。
+    """
+    all_names = set(before) | set(after)
+    changes: List[Dict[str, Any]] = []
+    for name in sorted(all_names):
+        s_b = before.get(name, 0.0)
+        s_a = after.get(name, 0.0)
+        diff = s_a - s_b
+        if abs(diff) >= threshold:
+            changes.append({
+                "horse_name": name,
+                "hist_before": round(s_b, 5),
+                "hist_after": round(s_a, 5),
+                "diff": round(diff, 5),
+            })
+    changes.sort(key=lambda x: abs(x["diff"]), reverse=True)
+    return changes
+
+
+def append_hist_distribution(
+    race_id: str,
+    race_name: str,
+    race_date: str,
+    features: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+    log_path: Optional[str] = None,
+) -> str:
+    """
+    hist_score 分布を JSONL 形式でファイルに追記する。
+
+    hist_applied レースが 30〜50 件蓄積した時点での再監査用。
+    各行の構造:
+        {race_id, race_name, race_date, profile_sample_size,
+         token_score_cap, feature_score_cap,
+         horses: [audit_hist_scores() の出力]}
+
+    呼び出し例:
+        from historical_pattern_engine import append_hist_distribution
+        append_hist_distribution(race_id, race_name, race_date, features, profile)
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    path = _Path(log_path or HIST_DISTRIBUTION_LOG)
+    record = {
+        "race_id": race_id,
+        "race_name": race_name,
+        "race_date": race_date,
+        "profile_sample_size": int((profile or {}).get("sample_size") or 0),
+        "token_score_cap": TOKEN_SCORE_CAP,
+        "feature_score_cap": FEATURE_SCORE_CAP,
+        "horses": audit_hist_scores(race_id, features, profile),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+    return str(path)
