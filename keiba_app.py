@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import dashboard_loader as dl
-from value_ai import bet_recommendations_v2, build_ev_table
+from value_ai import bet_recommendations_v2, bet_recommendations_v3, build_ev_table
 
 # ──────────────────────────────────────────────────────────────
 # 定数
@@ -647,6 +647,72 @@ def _render_race_cards(races: List[Dict]) -> None:
                             st.markdown(
                                 f"**{_label}** {_reason} | 合計¥{_total:,}  \n"
                                 + "　".join(_combo_strs)
+                            )
+
+                # ── 買い目 v3 比較（キャリブレーション + ガード + ポリシー連動） ────
+                with st.expander("🧪 買い目 v3（キャリブ + ガード + ポリシー）", expanded=False):
+                    _ev_table3 = build_ev_table(horses)
+                    _v3 = bet_recommendations_v3(horses, _ev_table3, bankroll=10000)
+
+                    # ガード + レース形状
+                    _guard   = _v3.get("guard") or {}
+                    _policy  = _v3.get("policy") or {}
+                    _shape   = _v3.get("race_shape", "balanced")
+                    _shape_labels = {
+                        "solid":             "🔒 solid（固い本命）",
+                        "balanced":          "⚖️ balanced（均衡）",
+                        "chaotic":           "🌀 chaotic（荒れ傾向）",
+                        "ai_market_conflict": "⚔️ ai_market_conflict（AI vs 市場対立）",
+                    }
+                    st.caption(
+                        f"レース形状: **{_shape_labels.get(_shape, _shape)}** | "
+                        f"アラート: **{_guard.get('alert_level','?')}** | "
+                        f"予算乗数: **{_policy.get('bankroll_multiplier',1.0):.0%}** | "
+                        f"{_policy.get('note','')}"
+                    )
+                    if _guard.get("is_alert"):
+                        st.warning(_guard.get("message", ""))
+
+                    # v3 スコアテーブル
+                    _enriched3 = _v3.get("enriched") or []
+                    if _enriched3:
+                        _score_rows3 = []
+                        for _h in _enriched3:
+                            _gap3   = float(_h.get("prob_gap_v3") or 0.0)
+                            _calib  = float(_h.get("calibrated_ai_win_prob") or 0.0)
+                            _ai_raw = float(_h.get("ai_win_prob") or _h.get("win_prob") or 0.0)
+                            _score_rows3.append({
+                                "馬名":       _h.get("horse_name", ""),
+                                "AI勝率":     f"{_ai_raw:.3f}",
+                                "キャリブ勝率": f"{_calib:.3f}",
+                                "市場勝率":   f'{float(_h.get("market_win_prob") or 0.0):.3f}',
+                                "乖離":       f"{_gap3:+.2f}pt",
+                                "補正量":     f'{float(_h.get("calibration_delta") or 0.0):+.3f}',
+                                "単勝スコア": f'{float(_h.get("win_bet_score_v3") or 0.0):.3f}',
+                                "複勝スコア": f'{float(_h.get("place_bet_score_v3") or 0.0):.3f}',
+                                "EV":         f'{float(_h.get("win_ev_v3") or 0.0):.2f}',
+                                "軸禁止":     "🚫" if _h.get("axis_ban_v3") else "",
+                                "相手禁止":   "🚫" if _h.get("partner_ban_v3") else "",
+                            })
+                        st.dataframe(pd.DataFrame(_score_rows3), width="stretch", hide_index=True)
+
+                    # 券種別推奨
+                    _bet_labels3 = [("単勝", "tansho"), ("複勝", "fukusho"), ("ワイド", "wide"), ("馬連", "umaren")]
+                    for _label3, _key3 in _bet_labels3:
+                        _plan3 = _v3.get(_key3) or {}
+                        if _plan3.get("skip"):
+                            st.caption(f"{_label3}: {_plan3.get('skip_reason', 'スキップ')}")
+                        else:
+                            _tickets3  = _plan3.get("tickets") or []
+                            _reason3   = _plan3.get("reason", "")
+                            _total3    = _plan3.get("total_stake", 0)
+                            _combo_strs3 = [
+                                "・".join(t.get("combination") or []) + f" ¥{t.get('stake',100)}"
+                                for t in _tickets3
+                            ]
+                            st.markdown(
+                                f"**{_label3}** {_reason3} | 合計¥{_total3:,}  \n"
+                                + "　".join(_combo_strs3)
                             )
 
                 # 各馬 傾向分析（trend_analyzer）
