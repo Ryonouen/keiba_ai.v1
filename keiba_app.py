@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import dashboard_loader as dl
+from value_ai import bet_recommendations_v2, build_ev_table
 
 # ──────────────────────────────────────────────────────────────
 # 定数
@@ -603,6 +604,50 @@ def _render_race_cards(races: List[Dict]) -> None:
                 st.markdown("**AI予測 vs 実際の着順**")
                 _render_column_legend()
                 _render_horse_table(horses, race["status"])
+
+                # ── 買い目 v2 比較（期待値・乖離ベース） ─────────────────────
+                with st.expander("🔬 買い目 v2（期待値・乖離ベース）", expanded=False):
+                    _ev_table = build_ev_table(horses)
+                    _v2 = bet_recommendations_v2(horses, _ev_table, bankroll=10000)
+                    if _v2.get("warning"):
+                        st.warning(_v2["warning"])
+
+                    # 軸/相手スコア表
+                    _enriched = _v2.get("enriched") or []
+                    if _enriched:
+                        _score_rows = []
+                        for _h in _enriched:
+                            _gap = float(_h.get("prob_gap_v2") or 0.0)
+                            _gap_str = f"{_gap:+.2f}pt"
+                            _score_rows.append({
+                                "馬名":     _h.get("horse_name", ""),
+                                "軸スコア": f'{_h.get("axis_score_v2", 0):.3f}',
+                                "相手スコア": f'{_h.get("partner_score_v2", 0):.3f}',
+                                "乖離":     _gap_str,
+                                "EV":      f'{_h.get("win_ev_v2", 0):.2f}',
+                                "軸禁止":   "🚫" if _h.get("axis_ban") else "",
+                                "相手禁止": "🚫" if _h.get("partner_ban") else "",
+                            })
+                        st.dataframe(pd.DataFrame(_score_rows), width="stretch", hide_index=True)
+
+                    # 券種別推奨
+                    _bet_labels = [("単勝", "tansho"), ("複勝", "fukusho"), ("ワイド", "wide"), ("馬連", "umaren")]
+                    for _label, _key in _bet_labels:
+                        _plan = _v2.get(_key) or {}
+                        if _plan.get("skip"):
+                            st.caption(f"{_label}: {_plan.get('skip_reason', 'スキップ')}")
+                        else:
+                            _tickets = _plan.get("tickets") or []
+                            _reason  = _plan.get("reason", "")
+                            _total   = _plan.get("total_stake", 0)
+                            _combo_strs = [
+                                "・".join(t.get("combination") or []) + f" ¥{t.get('stake',100)}"
+                                for t in _tickets
+                            ]
+                            st.markdown(
+                                f"**{_label}** {_reason} | 合計¥{_total:,}  \n"
+                                + "　".join(_combo_strs)
+                            )
 
                 # 各馬 傾向分析（trend_analyzer）
                 _ta_horses = [h for h in horses if (h.get("feature_dict") or {}).get("trend_analyzer_result")]

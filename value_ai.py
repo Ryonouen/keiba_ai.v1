@@ -165,6 +165,29 @@ DANGER_GAP_POP3: float = 0.10   # 2〜3番人気: 10pt以上
 DANGER_GAP_POP6: float = 0.05   # 4〜6番人気: 5pt以上
 # 7番人気以下: DANGER_GAP_MIN (0.03) をそのまま使用
 
+# ── v2 買い目生成 定数 ─────────────────────────────────────────────
+# 閾値変更は下記定数だけ触れば全関数に反映される。
+V2_AXIS_BAN_GAP: float      = -0.08   # prob_gap <= this → axis_ban=True（軸禁止）
+V2_PARTNER_BAN_GAP: float   = -0.10   # prob_gap <= this → partner_ban 判定入口
+V2_PARTNER_BAN_EV: float    = 0.75    # win_ev <= this かつ gap 条件満足 → partner_ban=True
+V2_AXIS_W_WIN_PROB: float   = 0.35    # axis_score_v2: ai_win_prob の重み
+V2_AXIS_W_TOP2: float       = 0.25    # axis_score_v2: top2_prob の重み
+V2_AXIS_W_TOP3: float       = 0.10    # axis_score_v2: top3_prob の重み
+V2_AXIS_W_MARKET: float     = 0.10    # axis_score_v2: market_win_prob の重み（能力/市場差分）
+V2_AXIS_W_GAP: float        = 0.10    # axis_score_v2: prob_gap 正規化値の重み
+V2_AXIS_W_EV: float         = 0.05    # axis_score_v2: win_ev 正規化値の重み
+V2_AXIS_W_TREND: float      = 0.05    # axis_score_v2: trend_delta 正規化値の重み
+V2_PARTNER_W_TOP3: float    = 0.45    # partner_score: top3_prob の重み
+V2_PARTNER_W_GAP: float     = 0.25    # partner_score: prob_gap 正規化値の重み
+V2_PARTNER_W_EV: float      = 0.20    # partner_score: win_ev 正規化値の重み
+V2_PARTNER_W_TREND: float   = 0.10    # partner_score: trend_delta 正規化値の重み
+V2_TANSHO_EV_MIN: float     = 1.0     # 単勝推奨: win_ev の最低値
+V2_PARTNER_MAX: int         = 4       # 馬連流し: 相手の最大点数
+V2_WIDE_BAN_BOTH_GAP: float = -0.05  # ワイド: 両馬ともこれ以下なら対象外
+V2_RACE_WARN_GAP: float     = -0.08  # race-level warning: 人気馬の gap 閾値
+V2_RACE_WARN_POP: int       = 3      # race-level warning: 対象人気帯（1〜N位）
+V2_RACE_WARN_COUNT: int     = 2      # race-level warning: 該当頭数の下限
+
 
 # =========================================================
 # EV テーブル構築
@@ -3074,3 +3097,353 @@ def select_primary_betmaster(
             best_plan = plan
 
     return best_plan
+
+
+# =========================================================
+# v2 買い目生成: 期待値・乖離ベース (bet_recommendations_v2)
+# =========================================================
+# 既存ロジック（recommend_bet_plan 系）は無変更。
+# v2 は axis_ban / partner_ban で市場乖離の大きい馬を事前除外し、
+# 軸スコア(axis_score_v2) / 相手スコア(partner_score_v2) で馬を評価する。
+#
+# 主な変更点:
+#   - axis_score_v2: ai_win_prob + top2/3_prob + market_win_prob + prob_gap + win_ev + trend_delta
+#   - partner_score_v2: top3_prob + prob_gap + win_ev + trend_delta
+#   - axis_ban: prob_gap <= V2_AXIS_BAN_GAP の馬は軸に使わない
+#   - partner_ban: prob_gap <= V2_PARTNER_BAN_GAP かつ win_ev 低い馬は相手にも使わない
+#   - 券種ごとに独立した関数で生成
+#   - race-level warning: 人気上位の危険馬が複数いる場合にアラートを出す
+# =========================================================
+
+
+def _v2_norm_gap(prob_gap: float) -> float:
+    """prob_gap を [0,1] に正規化（-0.20 → 0, 0 → 0.5, +0.20 → 1）"""
+    return min(1.0, max(0.0, (prob_gap + 0.20) / 0.40))
+
+
+def _v2_norm_ev(win_ev: float) -> float:
+    """win_ev を [0,1] に正規化（0.5 → 0, 1.5 → 1）"""
+    return min(1.0, max(0.0, (win_ev - 0.5) / 1.0))
+
+
+def _v2_norm_trend(trend_delta: float) -> float:
+    """trend_delta を [0,1] に正規化（-0.10 → 0, 0 → 0.5, +0.10 → 1）"""
+    return min(1.0, max(0.0, (trend_delta + 0.10) / 0.20))
+
+
+def _enrich_horses_v2(
+    features: List[Dict[str, Any]],
+    ev_table: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    各馬に v2 スコアとban フラグを付与して返す。
+
+    追加フィールド:
+        axis_score_v2  : 軸適性スコア（0〜1）
+        axis_ban       : True = 軸不可（prob_gap 過大マイナス）
+        partner_score_v2 : 相手適性スコア（0〜1）
+        partner_ban    : True = 相手不可（gap + EV 両方低い）
+        prob_gap_v2    : ev_table から取得した prob_gap（=value_gap）
+        win_ev_v2      : features の win_ev（またはフォールバック値）
+        trend_delta_v2 : features の trend_delta
+    """
+    ev_by_name: Dict[str, Dict[str, Any]] = {
+        row["horse_name"]: row for row in (ev_table or [])
+    }
+
+    enriched: List[Dict[str, Any]] = []
+    for f in features:
+        h = dict(f)  # 元の feature を壊さないコピー
+        name      = str(h.get("horse_name") or "")
+        ev_row    = ev_by_name.get(name) or {}
+
+        # ── 基礎値取得 ──────────────────────────────────────────
+        ai_win_prob     = float(h.get("ai_win_prob") or h.get("win_prob") or 0.0)
+        market_win_prob = float(ev_row.get("market_win_prob") or 0.0)
+        prob_gap        = float(ev_row.get("value_gap") or 0.0)   # = ai_win_prob - market
+        _win_ev_raw     = h.get("win_ev")
+        if _win_ev_raw is not None:
+            win_ev = float(_win_ev_raw)
+        else:
+            # win_ev が未保存の場合は win_prob × win_odds で再計算
+            _wp  = float(h.get("win_prob") or h.get("ai_win_prob") or 0.0)
+            _wo  = float(h.get("win_odds") or 0.0)
+            win_ev = round(_wp * _wo, 4) if _wp > 0 and _wo > 0 else 0.0
+        trend_delta     = float(h.get("trend_delta") or 0.0)
+
+        # top2_prob / top3_prob: 既に feature に入っている場合はそれを使う、なければ推定
+        top2_prob = float(h.get("top2_prob") or 0.0)
+        top3_prob = float(h.get("top3_prob") or 0.0)
+        if top2_prob == 0.0 or top3_prob == 0.0:
+            _race_structure: Dict[str, Any] = {}
+            _pp = estimate_placement_probs(h, _race_structure)
+            top2_prob = top2_prob or _pp.get("p_top2", 0.0)
+            top3_prob = top3_prob or _pp.get("p_top3", 0.0)
+
+        # ── 正規化 ────────────────────────────────────────────
+        gap_norm   = _v2_norm_gap(prob_gap)
+        ev_norm    = _v2_norm_ev(win_ev)
+        trend_norm = _v2_norm_trend(trend_delta)
+
+        # ── axis_score_v2 ─────────────────────────────────────
+        axis_score_v2 = (
+            ai_win_prob    * V2_AXIS_W_WIN_PROB
+            + top2_prob    * V2_AXIS_W_TOP2
+            + top3_prob    * V2_AXIS_W_TOP3
+            + market_win_prob * V2_AXIS_W_MARKET
+            + gap_norm     * V2_AXIS_W_GAP
+            + ev_norm      * V2_AXIS_W_EV
+            + trend_norm   * V2_AXIS_W_TREND
+        )
+        axis_score_v2 = round(min(1.0, axis_score_v2), 4)
+
+        # ── partner_score_v2 ──────────────────────────────────
+        partner_score_v2 = (
+            top3_prob      * V2_PARTNER_W_TOP3
+            + gap_norm     * V2_PARTNER_W_GAP
+            + ev_norm      * V2_PARTNER_W_EV
+            + trend_norm   * V2_PARTNER_W_TREND
+        )
+        partner_score_v2 = round(min(1.0, partner_score_v2), 4)
+
+        # ── ban フラグ ────────────────────────────────────────
+        axis_ban    = prob_gap <= V2_AXIS_BAN_GAP
+        partner_ban = (prob_gap <= V2_PARTNER_BAN_GAP) and (win_ev <= V2_PARTNER_BAN_EV)
+
+        h.update({
+            "axis_score_v2":    axis_score_v2,
+            "axis_ban":         axis_ban,
+            "partner_score_v2": partner_score_v2,
+            "partner_ban":      partner_ban,
+            "prob_gap_v2":      round(prob_gap, 4),
+            "win_ev_v2":        round(win_ev, 4),
+            "trend_delta_v2":   round(trend_delta, 4),
+        })
+        enriched.append(h)
+
+    return enriched
+
+
+def _gen_tansho_v2(
+    enriched: List[Dict[str, Any]],
+    bankroll: int,
+) -> Dict[str, Any]:
+    """
+    単勝 v2: axis_ban=False かつ win_ev >= V2_TANSHO_EV_MIN の馬を
+    axis_score_v2 降順で最大1頭推奨。
+    """
+    candidates = [
+        h for h in enriched
+        if not h.get("axis_ban")
+        and float(h.get("win_ev_v2") or 0.0) >= V2_TANSHO_EV_MIN
+    ]
+    candidates.sort(key=lambda x: float(x.get("axis_score_v2") or 0.0), reverse=True)
+
+    if not candidates:
+        return {"bet_type": "単勝", "tickets": [], "skip": True, "skip_reason": "EV>=1.0 の軸候補なし"}
+
+    top = candidates[0]
+    name = str(top.get("horse_name") or "")
+    ev   = float(top.get("win_ev_v2") or 0.0)
+    gap  = float(top.get("prob_gap_v2") or 0.0)
+    stake = max(100, (bankroll // 10) // 100 * 100)
+    return {
+        "bet_type":  "単勝",
+        "horses":    [name],
+        "tickets":   [{"combination": [name], "stake": stake}],
+        "total_stake": stake,
+        "ticket_count": 1,
+        "reason":    f"{name} EV={ev:.2f} gap={gap:+.2f}pt",
+        "skip":      False,
+    }
+
+
+def _gen_fukusho_v2(
+    enriched: List[Dict[str, Any]],
+    bankroll: int,
+) -> Dict[str, Any]:
+    """
+    複勝 v2: partner_ban=False の馬を partner_score_v2 降順で最大2頭推奨。
+    EV 要件なし（複勝はEV計算精度が低いため）。
+    """
+    candidates = [h for h in enriched if not h.get("partner_ban")]
+    candidates.sort(key=lambda x: float(x.get("partner_score_v2") or 0.0), reverse=True)
+    picks = candidates[:2]
+
+    if not picks:
+        return {"bet_type": "複勝", "tickets": [], "skip": True, "skip_reason": "partner_ban 除外後に候補なし"}
+
+    stake_each = max(100, (bankroll // (len(picks) * 10)) // 100 * 100)
+    tickets = [{"combination": [str(h.get("horse_name") or "")], "stake": stake_each} for h in picks]
+    names   = [str(h.get("horse_name") or "") for h in picks]
+    return {
+        "bet_type":  "複勝",
+        "horses":    names,
+        "tickets":   tickets,
+        "total_stake": stake_each * len(picks),
+        "ticket_count": len(picks),
+        "reason":    f"partner_score上位: {' / '.join(names)}",
+        "skip":      False,
+    }
+
+
+def _gen_wide_v2(
+    enriched: List[Dict[str, Any]],
+    bankroll: int,
+) -> Dict[str, Any]:
+    """
+    ワイド v2: partner_ban=False の馬を partner_score_v2 降順で上位3頭選出し
+    組み合わせを作成。ただし両馬ともprob_gap <= V2_WIDE_BAN_BOTH_GAP の組は除外。
+    """
+    candidates = [h for h in enriched if not h.get("partner_ban")]
+    candidates.sort(key=lambda x: float(x.get("partner_score_v2") or 0.0), reverse=True)
+    pool = candidates[:4]
+
+    if len(pool) < 2:
+        return {"bet_type": "ワイド", "tickets": [], "skip": True, "skip_reason": "ワイド候補が2頭未満"}
+
+    valid_pairs = []
+    for i in range(len(pool)):
+        for j in range(i + 1, len(pool)):
+            a, b = pool[i], pool[j]
+            gap_a = float(a.get("prob_gap_v2") or 0.0)
+            gap_b = float(b.get("prob_gap_v2") or 0.0)
+            # 両馬ともマイナス乖離大の組み合わせは除外
+            if gap_a <= V2_WIDE_BAN_BOTH_GAP and gap_b <= V2_WIDE_BAN_BOTH_GAP:
+                continue
+            valid_pairs.append((a, b))
+
+    if not valid_pairs:
+        return {"bet_type": "ワイド", "tickets": [], "skip": True, "skip_reason": "有効なワイドペアなし（両馬マイナス乖離）"}
+
+    stake_each = max(100, (bankroll // len(valid_pairs)) // 100 * 100)
+    tickets = [
+        {"combination": [str(a.get("horse_name") or ""), str(b.get("horse_name") or "")], "stake": stake_each}
+        for a, b in valid_pairs
+    ]
+    names = list(dict.fromkeys(
+        str(h.get("horse_name") or "")
+        for pair in valid_pairs for h in pair
+    ))
+    return {
+        "bet_type":  "ワイド",
+        "horses":    names,
+        "tickets":   tickets,
+        "total_stake": stake_each * len(tickets),
+        "ticket_count": len(tickets),
+        "reason":    f"partner_score上位ペア {len(tickets)}点（両マイナス乖離組除外）",
+        "skip":      False,
+    }
+
+
+def _gen_umaren_v2(
+    enriched: List[Dict[str, Any]],
+    bankroll: int,
+) -> Dict[str, Any]:
+    """
+    馬連 v2: axis_score_v2 最上位の非 axis_ban 馬を軸とし、
+    partner_score_v2 上位の非 partner_ban 馬を相手にして流し。
+    """
+    axes = [h for h in enriched if not h.get("axis_ban")]
+    axes.sort(key=lambda x: float(x.get("axis_score_v2") or 0.0), reverse=True)
+
+    if not axes:
+        return {"bet_type": "馬連", "tickets": [], "skip": True, "skip_reason": "axis_ban 除外後に軸候補なし"}
+
+    axis_horse = axes[0]
+    axis_name  = str(axis_horse.get("horse_name") or "")
+
+    partners = [
+        h for h in enriched
+        if not h.get("partner_ban") and str(h.get("horse_name") or "") != axis_name
+    ]
+    partners.sort(key=lambda x: float(x.get("partner_score_v2") or 0.0), reverse=True)
+    picks = partners[:V2_PARTNER_MAX]
+
+    if not picks:
+        return {"bet_type": "馬連", "tickets": [], "skip": True, "skip_reason": "partner_ban 除外後に相手候補なし"}
+
+    stake_each = max(100, (bankroll // len(picks)) // 100 * 100)
+    tickets = [
+        {"combination": [axis_name, str(p.get("horse_name") or "")], "stake": stake_each}
+        for p in picks
+    ]
+    partner_names = [str(p.get("horse_name") or "") for p in picks]
+    gap  = float(axis_horse.get("prob_gap_v2") or 0.0)
+    ascore = float(axis_horse.get("axis_score_v2") or 0.0)
+    return {
+        "bet_type":  "馬連",
+        "horses":    [axis_name] + partner_names,
+        "tickets":   tickets,
+        "total_stake": stake_each * len(tickets),
+        "ticket_count": len(tickets),
+        "reason":    f"軸: {axis_name}(axis={ascore:.3f}, gap={gap:+.2f}pt) 流し{len(tickets)}点",
+        "skip":      False,
+    }
+
+
+def race_warning_v2(
+    features: List[Dict[str, Any]],
+    ev_table: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    人気上位馬（1〜V2_RACE_WARN_POP 位）に prob_gap <= V2_RACE_WARN_GAP の馬が
+    V2_RACE_WARN_COUNT 頭以上いる場合に警告文字列を返す。それ以外は None。
+    """
+    ev_by_name: Dict[str, Dict[str, Any]] = {
+        row["horse_name"]: row for row in (ev_table or [])
+    }
+    flagged = []
+    for f in features:
+        name   = str(f.get("horse_name") or "")
+        ev_row = ev_by_name.get(name) or {}
+        pop    = int(ev_row.get("popularity_rank") or 99)
+        gap    = float(ev_row.get("value_gap") or 0.0)
+        if pop <= V2_RACE_WARN_POP and gap <= V2_RACE_WARN_GAP:
+            flagged.append(f"{name}({pop}人気, gap={gap:+.2f}pt)")
+    if len(flagged) >= V2_RACE_WARN_COUNT:
+        return f"⚠️ 人気上位に乖離大の馬が複数: {' / '.join(flagged)}"
+    return None
+
+
+def bet_recommendations_v2(
+    features: List[Dict[str, Any]],
+    ev_table: List[Dict[str, Any]],
+    bankroll: int = 10000,
+) -> Dict[str, Any]:
+    """
+    v2 買い目生成エントリポイント。既存 recommend_bet_plan とは独立。
+
+    Returns:
+        {
+            "enriched":   List[Dict]  — axis_score_v2 / partner_score_v2 付き馬リスト（降順）
+            "tansho":     Dict        — 単勝推奨
+            "fukusho":    Dict        — 複勝推奨
+            "wide":       Dict        — ワイド推奨
+            "umaren":     Dict        — 馬連推奨
+            "warning":    str|None    — race-level warning
+        }
+    """
+    if not features:
+        empty = {"bet_type": "-", "tickets": [], "skip": True, "skip_reason": "データなし"}
+        return {
+            "enriched": [],
+            "tansho":   empty,
+            "fukusho":  empty,
+            "wide":     empty,
+            "umaren":   empty,
+            "warning":  None,
+        }
+
+    enriched = _enrich_horses_v2(features, ev_table)
+    # axis_score_v2 降順で整列（UI 表示用）
+    enriched_sorted = sorted(enriched, key=lambda x: float(x.get("axis_score_v2") or 0.0), reverse=True)
+
+    return {
+        "enriched": enriched_sorted,
+        "tansho":   _gen_tansho_v2(enriched_sorted, bankroll),
+        "fukusho":  _gen_fukusho_v2(enriched_sorted, bankroll),
+        "wide":     _gen_wide_v2(enriched_sorted, bankroll),
+        "umaren":   _gen_umaren_v2(enriched_sorted, bankroll),
+        "warning":  race_warning_v2(features, ev_table),
+    }
