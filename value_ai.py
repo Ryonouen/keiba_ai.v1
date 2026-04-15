@@ -231,6 +231,9 @@ def build_ev_table(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "win_odds":               win_odds,
             "market_win_prob":        market_win_prob,
             "value_gap":              value_gap,
+            # popularity_rank は win_odds の昇順で毎回再計算される動的順位。
+            # features["popularity"]（スクレイピング時点の固定人気）とは別物であり、
+            # オッズ更新後は両者がズレる場合がある。assign_roles での扱い注意。
             "popularity_rank":        market_rank,
             # --- 将来の妙味・危険馬判定強化用 ---
             "ability_score":          round(float(f.get("ability_score") or 50.0), 1),
@@ -359,7 +362,10 @@ def detect_value_horses(
         f = features_by_name.get(horse_name, {})
 
         # 安定性下限チェック: 成績が極端にバラバラな馬（飛びやすい）を妙味候補から除外
-        # consistency_index / trend_index が未取得の場合はデフォルト 0.5 扱いで通す
+        # consistency_index / trend_index が未取得の場合は 0.5（中程度）扱いで通す。
+        # これは「データ不足 = 危険とは断定しない」という意図的な設計であり、
+        # デフォルトを VALUE_MIN_STABLE_SCORE(0.42) 以下に下げると
+        # データ未取得の馬を一律除外することになるため変更しないこと。
         consistency = float(f.get("consistency_index") or 0.5)
         trend = float(f.get("trend_index") or 0.5)
         stable = (consistency + trend) / 2.0
@@ -1054,6 +1060,9 @@ def calc_fukusho_ev(f: Dict[str, Any]) -> Optional[float]:
         est_place_odds = float(place_odds)
     else:
         mkt_prob = _market_place_prob(float(win_odds))
+        # _market_place_prob は max(0.05, ...) を保証するため mkt_prob > 0 は常に True。
+        # else 分岐（MARKET_PLACE_MULT 使用）には現在到達しない。
+        # _market_place_prob の実装が変わった場合のセーフティとして残している。
         est_place_odds = 1.0 / mkt_prob if mkt_prob > 0 else float(win_odds) / MARKET_PLACE_MULT
     return round(ai_place_prob * est_place_odds, 3)
 
@@ -2328,6 +2337,8 @@ def assign_roles(
     )
 
     # 危険人気馬名セット（人気帯別乖離閾値を使用）
+    # ここで使う popularity_rank は ev_table の動的順位（現在の win_odds 昇順）。
+    # features["popularity"]（スクレイピング時の固定人気）ではない。
     danger_names: Set[str] = set()
     for row in ev_table:
         vg  = row.get("value_gap")
@@ -2387,11 +2398,27 @@ def assign_roles(
         himo_threshold_adj  = -0.02 if "LONGSHOT_UPSIDE"   in jockey_codes else 0.0
 
         _is_truly_danger = _truly_map.get(name, _truly_default) if name in danger_names else False
+        # _pop は features["popularity"]（スクレイピング時点の固定アンカー）。
+        # ev_table の popularity_rank（動的）とはオッズ更新後にズレる場合がある。
+        # 危険軟化条件（下記）はこの乖離があるときに意味を持つ設計。
         _pop = int(f.get("popularity") or 99)
         _ev_vg = float((ev_by_name.get(name) or {}).get("value_gap") or 0.0)
 
-        # 1〜3番人気はvalue_gap が -0.08 以上深くないとfadeにしない
-        # （AIのwin_prob精度が不十分なため、市場評価上位馬を安易に消しにしない）
+        # 1〜3番人気の危険判定軟化条件。
+        #
+        # なぜ必要か:
+        #   danger_names は ev_table の popularity_rank（現在の win_odds 昇順）で構築する。
+        #   _pop は features の popularity フィールド（スクレイピング時点の人気）。
+        #   オッズ更新により両者がズレる場合がある。例:
+        #     スクレイピング時 2番人気(popularity=2) → オッズ更新後 5番人気(popularity_rank=5)
+        #     → danger_names の閾値は -0.05（4〜6番人気）→ vg=-0.06 で入る
+        #     → _pop=2, _ev_vg=-0.06 > -0.08 → この条件が発動し、fadeではなくhimoに軟化
+        #
+        # 発動しないケース（データに乖離がない通常フロー）:
+        #   popularity と popularity_rank が一致している場合、pop=1-3 で danger_names 入りには
+        #   vg <= -0.10 or -0.15 が必要となり、_ev_vg > -0.08 は常に False になる。
+        #
+        # DANGER_GAP_POP1/POP3 を変更する場合はこの条件との整合を確認すること。
         if name in danger_names and _is_truly_danger and _pop <= 3 and _ev_vg > -0.08:
             # 危険判定を軟化: fadeではなくhimoに留める
             _is_truly_danger = False

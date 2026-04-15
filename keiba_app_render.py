@@ -1200,6 +1200,11 @@ if st.session_state.result:
     with top_tabs[0]:
 
         st.subheader("勝率ランキング")
+        st.caption(
+            "能力勝率：オッズ非依存の純粋な能力評価（市場フリー） ／ "
+            "AI勝率：オッズ・展開を加味した最終予測 ／ "
+            "能差+：能力がAI評価を上回る（市場割安候補） ／ 能差−：人気先行候補"
+        )
 
         # Ensure optional columns exist to avoid KeyError
         if "newspaper_mark" not in df.columns:
@@ -1210,22 +1215,52 @@ if st.session_state.result:
         # ability_score が存在するとき（新設フィールド）は列に追加
         if "ability_score" in df.columns:
             _rank_cols.insert(2, "ability_score")
+        # ability_win_prob が存在するとき（Phase 2 新設）は列に追加
+        if "ability_win_prob" in df.columns:
+            _rank_cols.append("ability_win_prob")
+        if "ability_win_prob_rank" in df.columns:
+            _rank_cols.append("ability_win_prob_rank")
 
         rank = df[_rank_cols].copy()
 
         _rename = {
-            "horse_name": "馬名",
-            "newspaper_mark": "新聞印",
-            "ability_score": "能力値",      # ベース能力 (0〜100)
-            "win_prob": "勝率",
-            "place_prob": "複勝圏AI",
-            "fair_win_odds": "AIフェア単勝",
-            "ai_power_index": "AIパワー",
+            "horse_name":          "馬名",
+            "newspaper_mark":      "新聞印",
+            "ability_score":       "能力値",       # ベース能力 (0〜100)
+            "win_prob":            "勝率",
+            "place_prob":          "複勝圏AI",
+            "fair_win_odds":       "AIフェア単勝",
+            "ai_power_index":      "AIパワー",
+            "ability_win_prob":    "能力勝率",     # 市場フリー能力勝率
+            "ability_win_prob_rank": "能力順",
         }
         rank = rank.rename(columns=_rename)
 
         rank["勝率"] = rank["勝率"].apply(lambda x: round(x * 100, 1))
         rank["複勝圏AI"] = rank["複勝圏AI"].apply(lambda x: round(x * 100, 1))
+
+        # 能力勝率 / 能力順 / 能差: None / NaN → "--"
+        if "能力勝率" in rank.columns:
+            rank["能力勝率"] = rank["能力勝率"].apply(
+                lambda x: f"{round(x * 100, 1)}%" if x is not None and str(x) not in ("", "nan") else "--"
+            )
+        if "能力順" in rank.columns:
+            rank["能力順"] = rank["能力順"].apply(
+                lambda x: str(int(x)) if x is not None and str(x) not in ("", "nan") else "--"
+            )
+        if "能力勝率" in rank.columns:
+            # 能差列（ability_win_prob - win_prob）を計算して追加
+            raw_awp = df["ability_win_prob"] if "ability_win_prob" in df.columns else None
+            raw_wp  = df["win_prob"]
+            if raw_awp is not None:
+                diff_series = raw_awp.subtract(raw_wp)
+                rank["能差"] = diff_series.apply(
+                    lambda x: (
+                        f"+{x*100:.1f}pt" if x > 0.005
+                        else f"{x*100:.1f}pt" if x < -0.005
+                        else "±0"
+                    ) if x is not None and str(x) != "nan" else "--"
+                )
 
         # ability_score は 0〜100 スコアなのでそのまま表示
         st.dataframe(rank.sort_values("能力値" if "能力値" in rank.columns else "勝率",

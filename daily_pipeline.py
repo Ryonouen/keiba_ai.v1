@@ -181,6 +181,11 @@ def _inject_estimated_odds_recalc(features: List[Dict[str, Any]]) -> None:
     """
     推定オッズを features に注入した後に odds-dependent フィールドを再計算する。
     win_prob はそのまま保持し、win_ev / win_market_edge / value_flag 等だけ更新する。
+
+    Note: popularity（スクレイピング時点の固定人気）は意図的に更新しない。
+    popularity は assign_roles の危険軟化条件で「固定アンカー」として使われており、
+    win_odds 更新に追従させると、動的な popularity_rank（ev_table）との区別が失われる。
+    popularity の推定更新は別フローで guards（if not f.get("popularity")）付きで行う。
     """
     try:
         from race_ai_engine import (
@@ -192,6 +197,12 @@ def _inject_estimated_odds_recalc(features: List[Dict[str, Any]]) -> None:
         return
 
     for f in features:
+        # win_odds は更新されるため、ML特徴量 feat_win_odds_log も追従再計算する必要がある。
+        # 分析時点でオッズが未取得だった場合に feat_win_odds_log=0.0 のまま残るのを防ぐ。
+        # 一方で popularity は fixed anchor として意図的に追従させない（fixed anchor 設計を参照）。
+        _win_odds = float(f.get("win_odds") or 1.0)
+        f["feat_win_odds_log"] = round(_math.log(max(_win_odds, 1.0)), 4)
+
         p = float(f.get("win_prob") or 0.0)
         f["win_ev"]                = calc_expected_value(p, f.get("win_odds"))
         f["win_market_edge"]       = calc_market_edge(p, f.get("win_odds"))
@@ -334,6 +345,9 @@ def _run_daily_race_analysis_for_ids(
                             f["win_odds"]          = runner["win_odds"]
                             f["odds_is_estimated"] = False
                             injected_odds += 1
+                        # popularity が既にセットされている場合は確定人気でも上書きしない。
+                        # features["popularity"] はスクレイピング時点の固定アンカーとして使われており、
+                        # assign_roles の危険軟化条件がこの値に依存するため安易に同期しない。
                         if not f.get("popularity") and runner.get("popularity"):
                             f["popularity"] = runner["popularity"]
                             injected_pop   += 1
@@ -1200,6 +1214,8 @@ def update_race_odds(race_id: str) -> Dict[str, Any]:
                 f["odds_is_estimated"] = True
 
     # 予想オッズから人気順位を推定（実オッズ未開放時のみ）
+    # popularity が既にセットされている場合は上書きしない（固定アンカーを保持）。
+    # スクレイピング時に取得済みの popularity を推定値で汚染しないための guards。
     if _is_estimated and new_odds:
         sorted_by_odds = sorted(new_odds.items(), key=lambda x: x[1])
         est_pop_map = {name: rank for rank, (name, _) in enumerate(sorted_by_odds, 1)}

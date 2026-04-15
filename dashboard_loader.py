@@ -317,19 +317,32 @@ def _build_horse_row(horse: Dict) -> Dict:
     if win_prob is not None and place_prob is not None:
         top2_prob = win_prob + (place_prob - win_prob) * 2 / 3
 
+    # ability_win_prob: v2 top-level → feature_dict → None (旧スキーマ)
+    _awp_raw = horse.get("ability_win_prob")
+    if _awp_raw is None and is_v2:
+        _awp_raw = fd.get("ability_win_prob")
+    ability_win_prob = float(_awp_raw) if _awp_raw is not None else None
+
+    _awr_raw = horse.get("ability_win_prob_rank")
+    if _awr_raw is None and is_v2:
+        _awr_raw = fd.get("ability_win_prob_rank")
+    ability_win_prob_rank = int(_awr_raw) if _awr_raw is not None else None
+
     return {
-        "horse_name":    horse.get("horse_name", ""),
-        "ai_win_prob":   win_prob,
-        "place_prob":    place_prob,
-        "top2_prob":     top2_prob,
-        "win_ev":        win_ev,
-        "win_odds":      win_odds,
-        "popularity":    int(popularity_raw) if popularity_raw is not None else None,
-        "running_style": STYLE_MAP.get(running_style_raw or "", None),
-        "ability_score": float(fd.get("ability_score")) if is_v2 and fd.get("ability_score") is not None else None,
-        "raw_ability_score": float(fd.get("raw_ability_score")) if is_v2 and fd.get("raw_ability_score") is not None else None,
-        "odds_is_estimated": bool(fd.get("odds_is_estimated")) if is_v2 else bool(horse.get("odds_is_estimated")),
-        "feature_dict":  fd if is_v2 else None,
+        "horse_name":         horse.get("horse_name", ""),
+        "ai_win_prob":        win_prob,
+        "ability_win_prob":   ability_win_prob,
+        "ability_win_prob_rank": ability_win_prob_rank,
+        "place_prob":         place_prob,
+        "top2_prob":          top2_prob,
+        "win_ev":             win_ev,
+        "win_odds":           win_odds,
+        "popularity":         int(popularity_raw) if popularity_raw is not None else None,
+        "running_style":      STYLE_MAP.get(running_style_raw or "", None),
+        "ability_score":      float(fd.get("ability_score")) if is_v2 and fd.get("ability_score") is not None else None,
+        "raw_ability_score":  float(fd.get("raw_ability_score")) if is_v2 and fd.get("raw_ability_score") is not None else None,
+        "odds_is_estimated":  bool(fd.get("odds_is_estimated")) if is_v2 else bool(horse.get("odds_is_estimated")),
+        "feature_dict":       fd if is_v2 else None,
         # enriched fields (filled by _enrich_horses_from_result)
         "horse_no":      None,
         "gate":          None,
