@@ -32,7 +32,7 @@ _GRADE_BG    = {"A": "#3d3200", "B": "#0d2e1a", "C": "#222", "D": "#1a1a1a"}
 
 def _confidence_grade(win_ev: "float | None") -> "tuple[str, str, str]":
     """
-    単勝期待値 (win_ev) から信頼度グレード (A/B/C/D)、文字色、背景色を返す。
+    単勝期待値 (win_ev) から妙味度グレード (A/B/C/D)、文字色、背景色を返す。
     A: EV>=1.2（プラス期待値・妙味あり）
     B: EV>=0.9（市場とほぼ拮抗）
     C: EV>=0.65（やや過剰人気）
@@ -67,7 +67,7 @@ def _ability_bar_html(ability_score: "float | None") -> str:
              "#3498db" if score >= 30 else "#555")
     return (
         f'<span style="display:inline-flex;align-items:center;gap:5px">'
-        f'<span style="color:#ccc;font-size:12px;min-width:52px;text-align:right">{score:.4f}</span>'
+        f'<span style="color:#ccc;font-size:12px;min-width:52px;text-align:right">{score:.1f}</span>'
         f'<span style="display:inline-block;background:#2a2a3a;border-radius:2px;'
         f'height:7px;width:50px;overflow:hidden">'
         f'<span style="display:block;background:{color};height:7px;'
@@ -308,10 +308,30 @@ def _render_bet_type_table(races: List[Dict]) -> None:
     st.dataframe(df, width="stretch", hide_index=True)
 
 
+def _render_column_legend() -> None:
+    """
+    馬テーブルの列説明（凡例）を2行構成で表示する。
+    能力勝率・AI勝率・能差の違いをコンパクトに示す。
+    将来の3者比較（能力 / AI / 市場）に対応する設計を意識した配置。
+    """
+    st.markdown(
+        '<div style="font-size:11px;color:#888;margin:2px 0 6px 0;line-height:1.8">'
+        '<span><b style="color:#a0c4ff">能力勝率</b> 市場フリーの能力評価　'
+        '<b style="color:#ccc">AI勝率</b> オッズ加味の最終予測　'
+        '<b style="color:#f0c040">妙味度</b> 単勝EV基準 A(≥1.2)〜D(&lt;0.65)</span><br>'
+        '<span><b style="color:#d6d9e6">予測群</b> AI勝率ベースのランク S(≥20%)／A(≥12%)／B(≥7%)／C　'
+        '💎 乖離+3pt以上割安　⚠ 乖離-4pt以上割高　※妙味度(EV)とは独立</span><br>'
+        '<span><b style="color:#2ecc71">能↑</b> 能力がAI評価を上回る（割安候補）　'
+        '<b style="color:#e57373">能↓</b> AI評価が能力を上回る（要注意）</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_horse_table(horses: List[Dict], status: str) -> None:
     """
     AI予測順 vs 実際の着順テーブル。
-    信頼度(A-D) / 能力値バー / 勝率 / 2着内率 / 3着内率 を含む全カラム表示。
+    妙味度(A-D) / 能力値バー / 勝率 / 2着内率 / 3着内率 を含む全カラム表示。
     """
     has_result = status == "result"
     medal = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -338,6 +358,11 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         pop             = h.get("popularity")
         pop_estimated   = h.get("odds_is_estimated", False)
         win_prob        = h.get("ai_win_prob")
+        ability_win_prob = h.get("ability_win_prob")    # 市場フリー能力勝率
+        ability_diff     = (
+            round(ability_win_prob - win_prob, 4)
+            if ability_win_prob is not None and win_prob is not None else None
+        )
         market_win_prob = h.get("market_win_prob")
         prob_gap        = h.get("prob_gap")
         place_prob      = h.get("place_prob")
@@ -395,7 +420,7 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         else:
             pop_str = '<span style="color:#333">—</span>'
 
-        # 信頼度グレード
+        # 妙味度グレード
         grade, g_color, g_bg = _confidence_grade(win_ev)
         grade_cell = (
             f'<span style="background:{g_bg};color:{g_color};font-size:12px;'
@@ -428,6 +453,24 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         # 能力値バー (ability_score = ベース能力 0〜100, win_prob とは独立)
         ability_cell = _ability_bar_html(h.get("ability_score"))
 
+        # 能力勝率（market-free）
+        if ability_win_prob is not None:
+            ability_win_cell = f'<span style="color:#a0c4ff;font-size:12px">{ability_win_prob*100:.1f}%</span>'
+        else:
+            ability_win_cell = '<span style="color:#555;font-size:12px;opacity:0.45">—</span>'
+
+        # 能↑↓（ability_win_prob - ai_win_prob）: 正=能力>AI、負=AI>能力
+        if ability_diff is None:
+            ability_diff_cell = '<span style="color:#555;font-size:12px;opacity:0.45">—</span>'
+        else:
+            diff_color = '#2ecc71' if ability_diff > 0.005 else '#e57373' if ability_diff < -0.005 else '#888'
+            if ability_diff > 0.005:
+                ability_diff_cell = f'<span style="color:{diff_color};font-size:12px">↑ +{ability_diff*100:.1f}pt</span>'
+            elif ability_diff < -0.005:
+                ability_diff_cell = f'<span style="color:{diff_color};font-size:12px">↓ {ability_diff*100:.1f}pt</span>'
+            else:
+                ability_diff_cell = f'<span style="color:{diff_color};font-size:12px">{ability_diff*100:.1f}pt</span>'
+
         # 勝率 / 2着内率 / 3着内率 (top-3ハイライト)
         is_top = actual is not None and actual <= 3
         win_cell   = _pct_cell(win_prob,   is_top)
@@ -441,12 +484,14 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
             f'<td style="padding:5px 3px;text-align:center">{no_cell}</td>'
             f'<td style="padding:5px 7px">{name_cell}</td>'
             f'<td style="padding:5px 3px;text-align:center">{pop_str}</td>'
-            f'<td style="padding:5px 3px;text-align:center">{grade_cell}</td>'
             f'<td style="padding:5px 3px;text-align:center">{eval_cell}</td>'
             f'<td style="padding:5px 4px">{ability_cell}</td>'
-            f'<td style="padding:5px 4px;text-align:right">{win_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right">{ability_win_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right">{ability_diff_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:right;border-left:1px solid #2a2a3a">{win_cell}</td>'
             f'<td style="padding:5px 4px;text-align:right">{market_cell}</td>'
             f'<td style="padding:5px 4px;text-align:right">{gap_cell}</td>'
+            f'<td style="padding:5px 4px;text-align:center">{grade_cell}</td>'
             f'<td style="padding:5px 4px;text-align:right">{top2_cell}</td>'
             f'<td style="padding:5px 4px;text-align:right">{top3_cell}</td>'
             f'</tr>'
@@ -461,7 +506,7 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
 
     table = (
         '<div style="overflow-x:auto">'
-        '<table style="width:100%;min-width:800px;border-collapse:collapse;'
+        '<table style="width:100%;min-width:976px;border-collapse:collapse;'
         'font-family:sans-serif;font-size:12px">'
         '<thead><tr style="border-bottom:1px solid #2a2a3a">'
         + _th("AI順", w="36px")
@@ -469,12 +514,14 @@ def _render_horse_table(horses: List[Dict], status: str) -> None:
         + _th("馬番", w="40px")
         + _th("馬名 / 騎手", "left")
         + _th("人気", w="50px")
-        + _th("信頼度", w="48px")
-        + _th("評価", w="64px")
+        + _th("予測群", w="64px")
         + _th("能力値", "left", "110px")
-        + _th("AI勝率", "right", "56px")
+        + _th("能力勝率", "right", "58px")
+        + _th("能↑↓", "right", "54px")
+        + f'<th style="padding:4px 4px;text-align:right;color:#555;font-size:10px;font-weight:normal;width:56px;border-left:1px solid #2a2a3a">AI勝率</th>'
         + _th("市場勝率", "right", "64px")
         + _th("乖離", "right", "56px")
+        + _th("妙味度", "right", "48px")
         + _th("2着内率", "right", "58px")
         + _th("3着内率", "right", "58px")
         + '</tr></thead>'
@@ -554,6 +601,7 @@ def _render_race_cards(races: List[Dict]) -> None:
             horses = race["horses"]
             if horses:
                 st.markdown("**AI予測 vs 実際の着順**")
+                _render_column_legend()
                 _render_horse_table(horses, race["status"])
 
                 # 各馬 傾向分析（trend_analyzer）
@@ -587,19 +635,20 @@ def _render_race_cards(races: List[Dict]) -> None:
                             st.markdown("</div>", unsafe_allow_html=True)
 
                 score_debug_rows = race.get("score_debug_rows") or []
-                if score_debug_rows:
-                    st.markdown("**AIスコア中間値デバッグ**")
-                    st.dataframe(pd.DataFrame(score_debug_rows), width="stretch", hide_index=True)
-
                 top_vs_bottom_debug = race.get("top_vs_bottom_debug") or {}
-                if top_vs_bottom_debug:
-                    st.markdown("**AI1位 vs AI最下位 比較**")
-                    compare_rows = [
-                        {"区分": "AI1位", **(top_vs_bottom_debug.get("top") or {})},
-                        {"区分": "AI最下位", **(top_vs_bottom_debug.get("bottom") or {})},
-                        {"区分": "差分", **(top_vs_bottom_debug.get("diff") or {})},
-                    ]
-                    st.dataframe(pd.DataFrame(compare_rows), width="stretch", hide_index=True)
+                if score_debug_rows or top_vs_bottom_debug:
+                    with st.expander("🔧 デバッグ情報", expanded=False):
+                        if score_debug_rows:
+                            st.markdown("**AIスコア中間値デバッグ**")
+                            st.dataframe(pd.DataFrame(score_debug_rows), width="stretch", hide_index=True)
+                        if top_vs_bottom_debug:
+                            st.markdown("**AI1位 vs AI最下位 比較**")
+                            compare_rows = [
+                                {"区分": "AI1位", **(top_vs_bottom_debug.get("top") or {})},
+                                {"区分": "AI最下位", **(top_vs_bottom_debug.get("bottom") or {})},
+                                {"区分": "差分", **(top_vs_bottom_debug.get("diff") or {})},
+                            ]
+                            st.dataframe(pd.DataFrame(compare_rows), width="stretch", hide_index=True)
 
 
 # ──────────────────────────────────────────────────────────────
