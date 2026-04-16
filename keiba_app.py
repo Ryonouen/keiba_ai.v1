@@ -673,26 +673,31 @@ def _render_race_cards(races: List[Dict]) -> None:
                     if _guard.get("is_alert"):
                         st.warning(_guard.get("message", ""))
 
-                    # v3 スコアテーブル
+                    # v3 スコアテーブル（raw / calibrated 比較）
                     _enriched3 = _v3.get("enriched") or []
                     if _enriched3:
                         _score_rows3 = []
                         for _h in _enriched3:
-                            _gap3   = float(_h.get("prob_gap_v3") or 0.0)
-                            _calib  = float(_h.get("calibrated_ai_win_prob") or 0.0)
-                            _ai_raw = float(_h.get("ai_win_prob") or _h.get("win_prob") or 0.0)
+                            _ai_raw  = float(_h.get("ai_win_prob") or _h.get("win_prob") or 0.0)
+                            _calib   = float(_h.get("calibrated_ai_win_prob") or 0.0)
+                            _mkt     = float(_h.get("market_win_prob") or 0.0)
+                            _raw_gap = float(_h.get("prob_gap_v3") or 0.0)
+                            _cgap    = float(_h.get("calibrated_prob_gap_v3") or 0.0)
+                            _raw_ev  = float(_h.get("raw_win_ev_v3") or 0.0)
+                            _ev_v3   = float(_h.get("win_ev_v3") or 0.0)
                             _score_rows3.append({
-                                "馬名":       _h.get("horse_name", ""),
-                                "AI勝率":     f"{_ai_raw:.3f}",
-                                "キャリブ勝率": f"{_calib:.3f}",
-                                "市場勝率":   f'{float(_h.get("market_win_prob") or 0.0):.3f}',
-                                "乖離":       f"{_gap3:+.2f}pt",
-                                "補正量":     f'{float(_h.get("calibration_delta") or 0.0):+.3f}',
-                                "単勝スコア": f'{float(_h.get("win_bet_score_v3") or 0.0):.3f}',
-                                "複勝スコア": f'{float(_h.get("place_bet_score_v3") or 0.0):.3f}',
-                                "EV":         f'{float(_h.get("win_ev_v3") or 0.0):.2f}',
-                                "軸禁止":     "🚫" if _h.get("axis_ban_v3") else "",
-                                "相手禁止":   "🚫" if _h.get("partner_ban_v3") else "",
+                                "馬名":         _h.get("horse_name", ""),
+                                "AI勝率":       f"{_ai_raw:.3f}",
+                                "キャリブ勝率":   f"{_calib:.3f}",
+                                "市場勝率":     f"{_mkt:.3f}",
+                                "raw_gap":      f"{_raw_gap:+.3f}",
+                                "calib_gap":    f"{_cgap:+.3f}",
+                                "raw_EV":       f"{_raw_ev:.2f}",
+                                "EV_v3":        f"{_ev_v3:.2f}",
+                                "単勝score":    f'{float(_h.get("win_bet_score_v3") or 0.0):.3f}',
+                                "複勝score":    f'{float(_h.get("place_bet_score_v3") or 0.0):.3f}',
+                                "軸禁止":       "🚫" if _h.get("axis_ban_v3") else "",
+                                "相手禁止":     "🚫" if _h.get("partner_ban_v3") else "",
                             })
                         st.dataframe(pd.DataFrame(_score_rows3), width="stretch", hide_index=True)
 

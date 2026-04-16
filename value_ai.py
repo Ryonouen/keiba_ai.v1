@@ -3561,45 +3561,72 @@ def _calibrate_win_probs_v3(
 def market_disagreement_guard_v3(
     features: List[Dict[str, Any]],
     ev_table: List[Dict[str, Any]],
+    enriched_list: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    1〜V3_GUARD_POP_BAND 番人気のうち prob_gap <= V3_GUARD_GAP_THRESH の馬数を集計し、
+    1〜V3_GUARD_POP_BAND 番人気のうち gap <= V3_GUARD_GAP_THRESH の馬数を集計し、
     アラートレベルを返す。
+
+    enriched_list が渡された場合は calibrated_prob_gap_v3 でも集計し、
+    アラート判定を calibrated ベースで行う（より精度の高い判定）。
+    raw ベースの件数は raw_underestimated_count として保持。
 
     Returns:
         {
-            is_alert                  : bool
-            alert_level               : "high" | "medium" | "normal"
-            top_pop_underestimated_count: int
-            avg_negative_gap_top3_pop : float
-            message                   : str
+            is_alert                     : bool
+            alert_level                  : "high" | "medium" | "normal"
+            top_pop_underestimated_count : int   — calibrated ベース（enriched_list あり）
+                                                   または raw ベース（なし）
+            avg_negative_gap_top3_pop    : float — calibrated gap の平均（同上）
+            raw_underestimated_count     : int   — raw value_gap ベースの件数
+            calibrated_underestimated_count: int — calibrated_prob_gap_v3 ベース（なければ -1）
+            message                      : str
         }
     """
     ev_by_name: Dict[str, Dict[str, Any]] = {
         row["horse_name"]: row for row in (ev_table or [])
     }
 
-    underestimated: List[tuple] = []   # (name, pop, gap)
+    # ── raw gap ベース集計（常時） ──────────────────────────────────
+    raw_under: List[tuple] = []   # (name, pop, gap)
     for f in features:
         name   = str(f.get("horse_name") or "")
         ev_row = ev_by_name.get(name) or {}
         pop    = int(ev_row.get("popularity_rank") or f.get("popularity") or 99)
         gap    = float(ev_row.get("value_gap") or 0.0)
         if pop <= V3_GUARD_POP_BAND and gap <= V3_GUARD_GAP_THRESH:
-            underestimated.append((name, pop, gap))
+            raw_under.append((name, pop, gap))
+    raw_count = len(raw_under)
 
-    count   = len(underestimated)
-    avg_neg = sum(g for _, _, g in underestimated) / count if count > 0 else 0.0
+    # ── calibrated gap ベース集計（enriched_list あり時） ──────────
+    calib_count = -1
+    calib_under: List[tuple] = []
+    if enriched_list is not None:
+        enr_by_name = {h["horse_name"]: h for h in enriched_list}
+        for f in features:
+            name   = str(f.get("horse_name") or "")
+            ev_row = ev_by_name.get(name) or {}
+            enr    = enr_by_name.get(name) or {}
+            pop    = int(ev_row.get("popularity_rank") or f.get("popularity") or 99)
+            cgap   = float(enr.get("calibrated_prob_gap_v3") or ev_row.get("value_gap") or 0.0)
+            if pop <= V3_GUARD_POP_BAND and cgap <= V3_GUARD_GAP_THRESH:
+                calib_under.append((name, pop, cgap))
+        calib_count = len(calib_under)
+
+    # ── アラート判定: calibrated 優先、なければ raw ────────────────
+    active_under = calib_under if enriched_list is not None else raw_under
+    count   = len(active_under)
+    avg_neg = sum(g for _, _, g in active_under) / count if count > 0 else 0.0
 
     if count >= V3_GUARD_HIGH_COUNT:
         alert_level = "high"
         is_alert    = True
-        detail = ", ".join(f"{n}({p}人気, {g:+.2f}pt)" for n, p, g in underestimated)
+        detail = ", ".join(f"{n}({p}人気, {g:+.2f}pt)" for n, p, g in active_under)
         msg = f"⚠️ 高アラート: 1-3番人気に乖離大が{count}頭 [{detail}]"
     elif count >= V3_GUARD_MED_COUNT:
         alert_level = "medium"
         is_alert    = True
-        detail = ", ".join(f"{n}({p}人気, {g:+.2f}pt)" for n, p, g in underestimated)
+        detail = ", ".join(f"{n}({p}人気, {g:+.2f}pt)" for n, p, g in active_under)
         msg = f"⚡ 中アラート: 1-3番人気に乖離大が{count}頭 [{detail}]"
     else:
         alert_level = "normal"
@@ -3607,11 +3634,13 @@ def market_disagreement_guard_v3(
         msg         = "市場乖離は正常範囲内"
 
     return {
-        "is_alert":                    is_alert,
-        "alert_level":                 alert_level,
-        "top_pop_underestimated_count": count,
-        "avg_negative_gap_top3_pop":   round(avg_neg, 4),
-        "message":                     msg,
+        "is_alert":                       is_alert,
+        "alert_level":                    alert_level,
+        "top_pop_underestimated_count":   count,
+        "avg_negative_gap_top3_pop":      round(avg_neg, 4),
+        "raw_underestimated_count":       raw_count,
+        "calibrated_underestimated_count": calib_count,
+        "message":                        msg,
     }
 
 
@@ -3658,52 +3687,53 @@ def bet_size_policy_v3(guard_result: Dict[str, Any]) -> Dict[str, Any]:
 def race_shape_classifier_v3(
     features: List[Dict[str, Any]],
     ev_table: List[Dict[str, Any]],
-    calibrated: List[Dict[str, Any]],
+    enriched_list: List[Dict[str, Any]],
 ) -> str:
     """
-    レース形状を分類する。
+    レース形状を分類する。enriched_list から calibrated_prob_gap_v3 と win_ev_v3 を使う。
 
     Returns: "solid" | "balanced" | "chaotic" | "ai_market_conflict"
 
     優先順位:
-      1. ai_market_conflict: prob_gap<=-0.08 かつ人気上位が V3_SHAPE_CONFLICT_COUNT 以上
+      1. ai_market_conflict: calibrated_prob_gap_v3 <= -0.08 かつ人気上位が
+                             V3_SHAPE_CONFLICT_COUNT 以上
       2. solid             : キャリブ済み上位3頭の合計確率 > V3_SHAPE_SOLID_CONC
-      3. chaotic           : EV>=1.0 の馬が V3_SHAPE_EV_COUNT_CHAOS 以上、
+      3. chaotic           : win_ev_v3>=1.0 の馬が V3_SHAPE_EV_COUNT_CHAOS 以上、
                              または上位3頭合計 < V3_SHAPE_BALANCED_LOW
       4. balanced          : それ以外
     """
     ev_by_name: Dict[str, Dict[str, Any]] = {
         row["horse_name"]: row for row in (ev_table or [])
     }
+    enr_by_name: Dict[str, Dict[str, Any]] = {
+        h["horse_name"]: h for h in (enriched_list or [])
+    }
 
-    # 1. ai_market_conflict チェック
+    # 1. ai_market_conflict チェック（calibrated_prob_gap_v3 ベース）
     conflict_count = 0
     for f in features:
         name   = str(f.get("horse_name") or "")
         ev_row = ev_by_name.get(name) or {}
+        enr    = enr_by_name.get(name) or {}
         pop    = int(ev_row.get("popularity_rank") or f.get("popularity") or 99)
-        gap    = float(ev_row.get("value_gap") or 0.0)
-        if pop <= V3_GUARD_POP_BAND and gap <= V3_GUARD_GAP_THRESH:
+        cgap   = float(enr.get("calibrated_prob_gap_v3") or ev_row.get("value_gap") or 0.0)
+        if pop <= V3_GUARD_POP_BAND and cgap <= V3_GUARD_GAP_THRESH:
             conflict_count += 1
     if conflict_count >= V3_SHAPE_CONFLICT_COUNT:
         return "ai_market_conflict"
 
-    # 2. 上位3頭集中度（キャリブ済み）
+    # 2. 上位3頭集中度（calibrated_ai_win_prob）
     calib_probs = sorted(
-        [float(h.get("calibrated_ai_win_prob") or 0.0) for h in calibrated],
+        [float(h.get("calibrated_ai_win_prob") or 0.0) for h in enriched_list],
         reverse=True,
     )
     top3_conc = sum(calib_probs[:3]) if len(calib_probs) >= 3 else sum(calib_probs)
 
-    # 3. EV>=1.0 の馬の数
-    ev_count = 0
-    for f in features:
-        name     = str(f.get("horse_name") or "")
-        ev_row   = ev_by_name.get(name) or {}
-        win_odds = float(f.get("win_odds") or ev_row.get("win_odds") or 0.0)
-        ai_prob  = float(f.get("ai_win_prob") or f.get("win_prob") or 0.0)
-        if ai_prob > 0 and win_odds > 0 and ai_prob * win_odds >= 1.0:
-            ev_count += 1
+    # 3. EV>=1.0 の馬の数（win_ev_v3 = calibrated EV）
+    ev_count = sum(
+        1 for h in enriched_list
+        if float(h.get("win_ev_v3") or 0.0) >= 1.0
+    )
 
     if top3_conc > V3_SHAPE_SOLID_CONC:
         return "solid"
@@ -3747,11 +3777,11 @@ def _calc_wide_pair_score_v3(
     h_a: Dict[str, Any],
     h_b: Dict[str, Any],
 ) -> float:
-    """ワイドペアスコア v3: 両馬の top3/gap/EV の平均で評価。"""
+    """ワイドペアスコア v3: 両馬の top3/gap/EV の平均で評価。gap は calibrated 優先。"""
     top3_a = float(h_a.get("top3_prob_v3") or 0.0)
     top3_b = float(h_b.get("top3_prob_v3") or 0.0)
-    gap_a  = float(h_a.get("prob_gap_v3") or 0.0)
-    gap_b  = float(h_b.get("prob_gap_v3") or 0.0)
+    gap_a  = float(h_a.get("calibrated_prob_gap_v3") or h_a.get("prob_gap_v3") or 0.0)
+    gap_b  = float(h_b.get("calibrated_prob_gap_v3") or h_b.get("prob_gap_v3") or 0.0)
     ev_a   = float(h_a.get("win_ev_v3") or 0.0)
     ev_b   = float(h_b.get("win_ev_v3") or 0.0)
 
@@ -3770,11 +3800,11 @@ def _calc_umaren_pair_score_v3(
     axis: Dict[str, Any],
     partner: Dict[str, Any],
 ) -> float:
-    """馬連ペアスコア v3: 軸のキャリブ勝率 + 相手の top3_prob で評価。"""
+    """馬連ペアスコア v3: 軸のキャリブ勝率 + 相手の top3_prob で評価。gap は calibrated 優先。"""
     axis_calib    = float(axis.get("calibrated_ai_win_prob") or 0.0)
-    axis_gap      = float(axis.get("prob_gap_v3") or 0.0)
+    axis_gap      = float(axis.get("calibrated_prob_gap_v3") or axis.get("prob_gap_v3") or 0.0)
     part_top3     = float(partner.get("top3_prob_v3") or 0.0)
-    part_gap      = float(partner.get("prob_gap_v3") or 0.0)
+    part_gap      = float(partner.get("calibrated_prob_gap_v3") or partner.get("prob_gap_v3") or 0.0)
 
     axis_gap_norm = _v2_norm_gap(axis_gap)
     part_gap_norm = _v2_norm_gap(part_gap)
@@ -3795,16 +3825,19 @@ def _enrich_horses_v3(
     各馬に v3 スコア・フラグを付与して返す。
 
     追加フィールド:
-        calibrated_ai_win_prob : 人気帯補正・正規化済み勝率
-        calibration_delta      : 補正量
-        win_bet_score_v3       : 単勝適性スコア
-        place_bet_score_v3     : 複勝適性スコア
-        prob_gap_v3            : prob_gap（= value_gap）
-        win_ev_v3              : win EV（ai_win_prob × win_odds）
-        trend_delta_v3         : trend_delta
-        top3_prob_v3           : top3_prob
-        axis_ban_v3            : True = 軸禁止
-        partner_ban_v3         : True = 相手禁止
+        market_win_prob          : 1/win_odds（市場勝率）
+        calibrated_ai_win_prob   : 人気帯補正・正規化済み勝率
+        calibration_delta        : 補正量（正規化前）
+        prob_gap_v3              : raw gap = ai_win_prob - market_win_prob（= value_gap）
+        calibrated_prob_gap_v3   : calibrated gap = calibrated_ai_win_prob - market_win_prob
+        raw_win_ev_v3            : raw EV = ai_win_prob × win_odds
+        win_ev_v3                : calibrated EV = calibrated_ai_win_prob × win_odds
+        trend_delta_v3           : trend_delta
+        top3_prob_v3             : top3_prob
+        axis_ban_v3              : True = 軸禁止（calibrated_prob_gap_v3 ベース）
+        partner_ban_v3           : True = 相手禁止（calibrated_prob_gap_v3 + win_ev_v3 ベース）
+        win_bet_score_v3         : 単勝適性スコア（calibrated gap + calibrated EV）
+        place_bet_score_v3       : 複勝適性スコア（calibrated gap + trend）
     """
     calibrated_list = _calibrate_win_probs_v3(features, ev_table)
     ev_by_name: Dict[str, Dict[str, Any]] = {
@@ -3816,16 +3849,23 @@ def _enrich_horses_v3(
         name    = str(h.get("horse_name") or "")
         ev_row  = ev_by_name.get(name) or {}
 
-        calibrated_prob = float(h.get("calibrated_ai_win_prob") or 0.0)
-        prob_gap        = float(ev_row.get("value_gap") or 0.0)
+        calibrated_prob  = float(h.get("calibrated_ai_win_prob") or 0.0)
+        market_win_prob  = float(ev_row.get("market_win_prob") or 0.0)
+        raw_prob_gap     = float(ev_row.get("value_gap") or 0.0)           # ai_win_prob - market
+        calib_prob_gap   = round(calibrated_prob - market_win_prob, 4)     # calibrated - market
 
-        win_odds    = float(h.get("win_odds") or ev_row.get("win_odds") or 0.0)
-        _win_ev_raw = h.get("win_ev")
-        if _win_ev_raw is not None:
-            win_ev = float(_win_ev_raw)
+        win_odds = float(h.get("win_odds") or ev_row.get("win_odds") or 0.0)
+
+        # raw EV: stored win_ev 優先 → ai_win_prob × win_odds
+        _stored_ev = h.get("win_ev")
+        if _stored_ev is not None:
+            raw_win_ev = float(_stored_ev)
         else:
-            _wp  = float(h.get("win_prob") or h.get("ai_win_prob") or 0.0)
-            win_ev = round(_wp * win_odds, 4) if _wp > 0 and win_odds > 0 else 0.0
+            _wp_raw = float(h.get("win_prob") or h.get("ai_win_prob") or 0.0)
+            raw_win_ev = round(_wp_raw * win_odds, 4) if _wp_raw > 0 and win_odds > 0 else 0.0
+
+        # calibrated EV: calibrated_prob × win_odds（v3 の主軸）
+        win_ev_v3 = round(calibrated_prob * win_odds, 4) if calibrated_prob > 0 and win_odds > 0 else 0.0
 
         trend_delta = float(h.get("trend_delta") or 0.0)
 
@@ -3836,18 +3876,23 @@ def _enrich_horses_v3(
             top2_prob = top2_prob or _pp.get("p_top2", 0.0)
             top3_prob = top3_prob or _pp.get("p_top3", 0.0)
 
-        axis_ban_v3    = prob_gap <= V3_AXIS_BAN_GAP
-        partner_ban_v3 = (prob_gap <= V3_PARTNER_BAN_GAP) and (win_ev <= V3_PARTNER_BAN_EV)
+        # ban フラグ: calibrated gap + calibrated EV を使用
+        axis_ban_v3    = calib_prob_gap <= V3_AXIS_BAN_GAP
+        partner_ban_v3 = (calib_prob_gap <= V3_PARTNER_BAN_GAP) and (win_ev_v3 <= V3_PARTNER_BAN_EV)
 
         h.update({
-            "prob_gap_v3":       round(prob_gap, 4),
-            "win_ev_v3":         round(win_ev, 4),
-            "trend_delta_v3":    round(trend_delta, 4),
-            "top3_prob_v3":      round(top3_prob, 4),
-            "axis_ban_v3":       axis_ban_v3,
-            "partner_ban_v3":    partner_ban_v3,
-            "win_bet_score_v3":  _calc_win_bet_score_v3(calibrated_prob, prob_gap, win_ev),
-            "place_bet_score_v3": _calc_place_bet_score_v3(top3_prob, prob_gap, trend_delta),
+            "market_win_prob":        round(market_win_prob, 4),
+            "prob_gap_v3":            round(raw_prob_gap, 4),       # raw gap（保持）
+            "calibrated_prob_gap_v3": calib_prob_gap,               # calibrated gap（v3 主軸）
+            "raw_win_ev_v3":          round(raw_win_ev, 4),         # raw EV（保持）
+            "win_ev_v3":              win_ev_v3,                    # calibrated EV（v3 主軸）
+            "trend_delta_v3":         round(trend_delta, 4),
+            "top3_prob_v3":           round(top3_prob, 4),
+            "axis_ban_v3":            axis_ban_v3,
+            "partner_ban_v3":         partner_ban_v3,
+            # スコア: calibrated gap / calibrated EV を使用
+            "win_bet_score_v3":       _calc_win_bet_score_v3(calibrated_prob, calib_prob_gap, win_ev_v3),
+            "place_bet_score_v3":     _calc_place_bet_score_v3(top3_prob, calib_prob_gap, trend_delta),
         })
         enriched.append(h)
 
@@ -3874,7 +3919,7 @@ def _gen_tansho_v3(
     top   = candidates[0]
     name  = str(top.get("horse_name") or "")
     ev    = float(top.get("win_ev_v3") or 0.0)
-    gap   = float(top.get("prob_gap_v3") or 0.0)
+    cgap  = float(top.get("calibrated_prob_gap_v3") or top.get("prob_gap_v3") or 0.0)
     calib = float(top.get("calibrated_ai_win_prob") or 0.0)
     score = float(top.get("win_bet_score_v3") or 0.0)
     stake = max(100, (effective_brl // 10) // 100 * 100)
@@ -3884,7 +3929,7 @@ def _gen_tansho_v3(
         "tickets":      [{"combination": [name], "stake": stake}],
         "total_stake":  stake,
         "ticket_count": 1,
-        "reason":       f"{name} score={score:.3f} EV={ev:.2f} calib={calib:.3f} gap={gap:+.2f}pt",
+        "reason":       f"{name} score={score:.3f} EV={ev:.2f} calib={calib:.3f} cgap={cgap:+.2f}pt",
         "skip":         False,
     }
 
@@ -4014,16 +4059,16 @@ def _gen_umaren_v3(
         for p in picks
     ]
     partner_names = [str(p.get("horse_name") or "") for p in picks]
-    calib = float(axis_horse.get("calibrated_ai_win_prob") or 0.0)
-    gap   = float(axis_horse.get("prob_gap_v3") or 0.0)
-    score = float(axis_horse.get("win_bet_score_v3") or 0.0)
+    calib  = float(axis_horse.get("calibrated_ai_win_prob") or 0.0)
+    cgap   = float(axis_horse.get("calibrated_prob_gap_v3") or axis_horse.get("prob_gap_v3") or 0.0)
+    score  = float(axis_horse.get("win_bet_score_v3") or 0.0)
     return {
         "bet_type":     "馬連",
         "horses":       [axis_name] + partner_names,
         "tickets":      tickets,
         "total_stake":  stake_each * len(tickets),
         "ticket_count": len(tickets),
-        "reason":       f"軸: {axis_name}(score={score:.3f}, calib={calib:.3f}, gap={gap:+.2f}pt) 流し{len(tickets)}点",
+        "reason":       f"軸: {axis_name}(score={score:.3f}, calib={calib:.3f}, cgap={cgap:+.2f}pt) 流し{len(tickets)}点",
         "skip":         False,
     }
 
@@ -4054,6 +4099,7 @@ def bet_recommendations_v3(
         _no_guard = {
             "is_alert": False, "alert_level": "normal",
             "top_pop_underestimated_count": 0, "avg_negative_gap_top3_pop": 0.0,
+            "raw_underestimated_count": 0, "calibrated_underestimated_count": -1,
             "message": "データなし",
         }
         return {
@@ -4069,16 +4115,13 @@ def bet_recommendations_v3(
             "summary":    {},
         }
 
-    guard    = market_disagreement_guard_v3(features, ev_table)
-    policy   = bet_size_policy_v3(guard)
+    # enrich 先行 → guard に enriched を渡して calibrated gap ベースで判定
     enriched = _enrich_horses_v3(features, ev_table)
+    guard    = market_disagreement_guard_v3(features, ev_table, enriched_list=enriched)
+    policy   = bet_size_policy_v3(guard)
 
-    # race_shape に渡す calibrated リスト（horse_name + calibrated_ai_win_prob のみ）
-    calibrated_slim = [
-        {"horse_name": h["horse_name"], "calibrated_ai_win_prob": h.get("calibrated_ai_win_prob", 0.0)}
-        for h in enriched
-    ]
-    race_shape = race_shape_classifier_v3(features, ev_table, calibrated_slim)
+    # race_shape は enriched list を直接渡す（calibrated_prob_gap_v3 / win_ev_v3 を内部使用）
+    race_shape = race_shape_classifier_v3(features, ev_table, enriched)
 
     enriched_sorted = sorted(
         enriched,
@@ -4087,11 +4130,15 @@ def bet_recommendations_v3(
     )
 
     summary = {
-        "alert_level":    guard["alert_level"],
-        "race_shape":     race_shape,
-        "bankroll_mult":  policy["bankroll_multiplier"],
-        "umaren_enabled": policy["umaren_enabled"],
-        "policy_note":    policy["note"],
+        "alert_level":                    guard["alert_level"],
+        "race_shape":                     race_shape,
+        "bankroll_mult":                  policy["bankroll_multiplier"],
+        "umaren_enabled":                 policy["umaren_enabled"],
+        "top_pop_underestimated_count":   guard["top_pop_underestimated_count"],
+        "avg_negative_gap_top3_pop":      guard["avg_negative_gap_top3_pop"],
+        "raw_underestimated_count":       guard["raw_underestimated_count"],
+        "calibrated_underestimated_count": guard["calibrated_underestimated_count"],
+        "policy_note":                    policy["note"],
     }
 
     return {
