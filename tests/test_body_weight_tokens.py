@@ -66,6 +66,29 @@ def test_body_weight_gaining_token():
     assert "body_weight:gaining" in tokens
 
 
+def test_parse_body_weight_from_netkeiba_result_column():
+    from race_ai_engine import _parse_body_weight_from_result_cols
+
+    class Cell:
+        def __init__(self, text):
+            self.text = text
+
+        def get_text(self, strip=False):
+            return self.text.strip() if strip else self.text
+
+    cols = [Cell("") for _ in range(33)]
+    cols[15] = Cell("")
+    cols[28] = Cell("490(-10)")
+
+    body_weight, body_weight_change = _parse_body_weight_from_result_cols(
+        cols,
+        lambda col: col.get_text(strip=True),
+    )
+
+    assert body_weight == 490
+    assert body_weight_change == -10
+
+
 def test_no_body_weight_token_when_absent():
     from historical_pattern_engine import build_feature_pattern_tokens
     feature = {

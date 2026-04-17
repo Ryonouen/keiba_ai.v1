@@ -1,51 +1,66 @@
-def test_build_historical_pattern_profile_learns_key_tokens():
+def _sample(target_rank, gate, race_name, race_rank, distance=1600, date="2025/12/08"):
+    return {
+        "target_rank": target_rank,
+        "age": 3,
+        "gate": gate,
+        "past_races": [
+            {
+                "race_name": race_name,
+                "rank": race_rank,
+                "distance": distance,
+                "date": date,
+            }
+        ],
+    }
+
+
+def test_race_top3_token_requires_min_starts_five():
     from historical_pattern_engine import build_historical_pattern_profile
 
     samples = [
-        {
-            "target_rank": 1,
-            "age": 3,
-            "gate": 3,
-            "past_races": [
-                {"race_name": "阪神ジュベナイルF(GI)", "rank": 2, "distance": 1600, "date": "2025/12/08"},
-                {"race_name": "アルテミスS(GIII)", "rank": 1, "distance": 1600, "date": "2025/10/26"},
-            ],
-        },
-        {
-            "target_rank": 2,
-            "age": 3,
-            "gate": 2,
-            "past_races": [
-                {"race_name": "阪神ジュベナイルF(GI)", "rank": 3, "distance": 1600, "date": "2025/12/08"},
-            ],
-        },
-        {
-            "target_rank": 8,
-            "age": 3,
-            "gate": 8,
-            "past_races": [
-                {"race_name": "フィリーズレビュー(GII)", "rank": 9, "distance": 1400, "date": "2026/03/10"},
-            ],
-        },
-        {
-            "target_rank": 11,
-            "age": 3,
-            "gate": 7,
-            "past_races": [
-                {"race_name": "アネモネS(L)", "rank": 6, "distance": 1600, "date": "2026/03/15"},
-            ],
-        },
+        *[
+            _sample(
+                target_rank=rank,
+                gate=gate,
+                race_name="阪神ジュベナイルF(GI)",
+                race_rank=2,
+            )
+            for rank, gate in [(1, 1), (2, 2), (3, 3), (4, 4)]
+        ],
+        *[
+            _sample(
+                target_rank=rank,
+                gate=gate,
+                race_name="フィリーズレビュー(GII)",
+                race_rank=9,
+                distance=1400,
+                date="2026/03/10",
+            )
+            for rank, gate in [(8, 5), (9, 6), (10, 7), (11, 8), (12, 9)]
+        ],
     ]
 
     profile = build_historical_pattern_profile(samples)
     token_stats = profile["token_stats"]
 
+    assert "race_top3:阪神ジュベナイルF" not in token_stats
+
+    samples.append(
+        _sample(
+            target_rank=1,
+            gate=5,
+            race_name="阪神ジュベナイルF(GI)",
+            race_rank=3,
+        )
+    )
+    profile = build_historical_pattern_profile(samples)
+    token_stats = profile["token_stats"]
+
+    assert token_stats["race_top3:阪神ジュベナイルF"]["starts"] == 5
     assert token_stats["race_top3:阪神ジュベナイルF"]["score"] > 0
-    assert token_stats["age:3"]["score"] > -0.2
-    assert token_stats["gate:inner"]["score"] > token_stats["gate:outer"]["score"]
 
 
-def test_score_historical_patterns_prefers_hanshin_jf_top3_history():
+def test_score_historical_patterns_prefers_supported_hanshin_jf_top3_history():
     from historical_pattern_engine import (
         build_feature_pattern_tokens,
         build_historical_pattern_profile,
@@ -53,38 +68,38 @@ def test_score_historical_patterns_prefers_hanshin_jf_top3_history():
     )
 
     samples = [
-        {
-            "target_rank": 1,
-            "age": 3,
-            "gate": 2,
-            "past_races": [
-                {"race_name": "阪神ジュベナイルF(GI)", "rank": 1, "distance": 1600, "date": "2025/12/08"},
-            ],
-        },
-        {
-            "target_rank": 2,
-            "age": 3,
-            "gate": 4,
-            "past_races": [
-                {"race_name": "阪神ジュベナイルF(GI)", "rank": 3, "distance": 1600, "date": "2025/12/08"},
-            ],
-        },
-        {
-            "target_rank": 10,
-            "age": 3,
-            "gate": 8,
-            "past_races": [
-                {"race_name": "フィリーズレビュー(GII)", "rank": 10, "distance": 1400, "date": "2026/03/10"},
-            ],
-        },
-        {
-            "target_rank": 12,
-            "age": 3,
-            "gate": 7,
-            "past_races": [
-                {"race_name": "アネモネS(L)", "rank": 8, "distance": 1600, "date": "2026/03/15"},
-            ],
-        },
+        *[
+            _sample(
+                target_rank=target_rank,
+                gate=gate,
+                race_name="阪神ジュベナイルF(GI)",
+                race_rank=race_rank,
+            )
+            for target_rank, gate, race_rank in [
+                (1, 1, 1),
+                (2, 2, 2),
+                (3, 3, 3),
+                (1, 4, 2),
+                (2, 5, 3),
+            ]
+        ],
+        *[
+            _sample(
+                target_rank=target_rank,
+                gate=gate,
+                race_name="フィリーズレビュー(GII)",
+                race_rank=race_rank,
+                distance=1400,
+                date="2026/03/10",
+            )
+            for target_rank, gate, race_rank in [
+                (8, 6, 8),
+                (9, 7, 9),
+                (10, 8, 10),
+                (11, 9, 11),
+                (12, 10, 12),
+            ]
+        ],
     ]
 
     profile = build_historical_pattern_profile(samples)
@@ -113,8 +128,69 @@ def test_score_historical_patterns_prefers_hanshin_jf_top3_history():
     assert "race_top3:阪神ジュベナイルF" in build_feature_pattern_tokens(good_feature)
     assert good_score > bad_score
     assert any("阪神ジュベナイルF" in reason for reason in good_reasons)
-    # フィリーズレビューは1サンプルのみ→starts<2でフィルタされるため reasons に出ない（正常）
     assert bad_score <= 0.0
+
+
+def test_race_any_matches_do_not_contribute_to_score():
+    from historical_pattern_engine import score_feature_patterns
+
+    profile = {
+        "sample_size": 5,
+        "token_stats": {
+            "race_any:阪神ジュベナイルF": {
+                "starts": 5,
+                "wins": 5,
+                "top3": 5,
+                "score": 0.30,
+            },
+        },
+    }
+    feature = {
+        "horse_name": "RaceAnyOnly",
+        "age": 3,
+        "gate": 4,
+        "past_races": [
+            {"race_name": "阪神ジュベナイルF(GI)", "rank": 9, "distance": 1600, "date": "2025/12/08"},
+        ],
+    }
+
+    score, reasons = score_feature_patterns(feature, profile)
+
+    assert any("race_any:阪神ジュベナイルF" in reason for reason in reasons)
+    assert score == 0.0
+
+
+def test_token_score_is_capped_at_phase2_limit():
+    from historical_pattern_engine import TOKEN_SCORE_CAP, build_historical_pattern_profile
+
+    samples = [
+        *[
+            _sample(
+                target_rank=1,
+                gate=gate,
+                race_name="阪神ジュベナイルF(GI)",
+                race_rank=1,
+            )
+            for gate in range(1, 6)
+        ],
+        *[
+            _sample(
+                target_rank=10 + i,
+                gate=6 + i,
+                race_name=f"未勝利{i}",
+                race_rank=9,
+                distance=1400,
+                date="2026/03/10",
+            )
+            for i in range(30)
+        ],
+    ]
+
+    profile = build_historical_pattern_profile(samples)
+    token_score = profile["token_stats"]["race_top3:阪神ジュベナイルF"]["score"]
+
+    assert TOKEN_SCORE_CAP == 0.30
+    assert abs(token_score) <= 0.30
 
 
 def test_low_support_token_is_dampened():

@@ -6,6 +6,11 @@ import datetime
 import re
 import requests
 from bs4 import BeautifulSoup
+from historical_pattern_ui import (
+    get_historical_pattern_ui_reason_groups,
+    get_route_profile_display_reasons,
+    has_historical_pattern_ui_reasons,
+)
 from netkeiba_scrape_helpers import parse_today_races_from_html
 
 if "result" not in st.session_state:
@@ -1591,11 +1596,16 @@ if st.session_state.result:
         st.markdown(f'<div class="card">{comment}</div>', unsafe_allow_html=True)
 
         # -----------------------------
-        # 各馬 傾向分析（trend_analyzer）
+        # 各馬 傾向分析（trend_analyzer / route / historical pattern）
         # -----------------------------
         st.subheader("📋 各馬傾向分析")
         _ta_features = result.get("features") or []
-        _ta_has_data = any(f.get("trend_analyzer_result") for f in _ta_features)
+        _ta_has_data = any(
+            f.get("trend_analyzer_result")
+            or f.get("route_profile_reasons")
+            or has_historical_pattern_ui_reasons(f)
+            for f in _ta_features
+        )
         if _ta_has_data:
             for f in sorted(_ta_features, key=lambda x: float(x.get("win_prob") or 0), reverse=True):
                 _ta = f.get("trend_analyzer_result") or {}
@@ -1604,20 +1614,41 @@ if st.session_state.result:
                 _summary = _ta.get("trend_summary") or ""
                 _adj = float(_ta.get("trend_adjustment") or 1.0)
                 _horse = f.get("horse_name") or "-"
+                _route_reasons = get_route_profile_display_reasons(f)
+                _hist_groups = get_historical_pattern_ui_reason_groups(f)
+                _hist_positive = _hist_groups["positive"][:2]
+                _hist_negative = _hist_groups["negative"][:2]
 
-                if not _match and not _risk:
+                if not _match and not _risk and not _route_reasons and not _hist_positive and not _hist_negative:
                     continue
 
-                adj_pct = round((_adj - 1.0) * 100, 1)
-                adj_str = f"+{adj_pct}%" if adj_pct >= 0 else f"{adj_pct}%"
-                adj_color = "#2ecc71" if adj_pct > 0 else ("#e74c3c" if adj_pct < 0 else "#aaaaaa")
+                _badges = []
+                if _ta:
+                    adj_pct = round((_adj - 1.0) * 100, 1)
+                    adj_str = f"+{adj_pct}%" if adj_pct >= 0 else f"{adj_pct}%"
+                    adj_color = "#2ecc71" if adj_pct > 0 else ("#e74c3c" if adj_pct < 0 else "#aaaaaa")
+                    _badges.append(
+                        f'<span style="color:{adj_color}; font-weight:bold;">傾向補正 {adj_str}</span>'
+                    )
+                if _hist_positive or _hist_negative:
+                    _hist_score = float(f.get("historical_pattern_score") or 0.0)
+                    _hist_color = "#2ecc71" if _hist_score > 0 else ("#e74c3c" if _hist_score < 0 else "#aaaaaa")
+                    _badges.append(
+                        f'<span style="color:{_hist_color}; font-weight:bold;">近年傾向 {_hist_score:+.3f}</span>'
+                    )
 
                 st.markdown(
                     f'<div class="card" style="margin-bottom:6px; padding:8px 12px;">'
                     f'<b>{_horse}</b> '
-                    f'<span style="color:{adj_color}; font-weight:bold;">傾向補正 {adj_str}</span>',
+                    + " ".join(_badges),
                     unsafe_allow_html=True,
                 )
+                if _route_reasons:
+                    st.caption("ローテ傾向: " + " ／ ".join(_route_reasons))
+                if _hist_positive:
+                    st.caption("近年傾向 プラス要因: " + " ／ ".join(_hist_positive))
+                if _hist_negative:
+                    st.caption("近年傾向 マイナス要因: " + " ／ ".join(_hist_negative))
                 if _summary:
                     st.caption(_summary)
                 if _match:

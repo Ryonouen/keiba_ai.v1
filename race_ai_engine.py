@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from io import StringIO
 from statistics import mean, pstdev
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from pathlib import Path
 from openai import OpenAI
 from openai_cost_guard import safe_chat_create
@@ -65,6 +65,7 @@ from historical_pattern_engine import (
     detect_hist_sudden_changes,
     HIST_SUDDEN_CHANGE_THRESHOLD,
     score_feature_patterns,
+    _token_weight,
 )
 
 from trend_analyzer import (
@@ -109,9 +110,12 @@ ROUTE_PROFILE_PROB_WEIGHT: float = 0.35
 ROUTE_PROFILE_CACHE_VERSION: str = "v3"
 HISTORICAL_PATTERN_YEARS: int = 8
 HISTORICAL_PATTERN_PROB_WEIGHT: float = 0.30
-HISTORICAL_PATTERN_CACHE_VERSION: str = "v1"
+HISTORICAL_PATTERN_CACHE_VERSION: str = "v2_body_weight"
 TREND_ANALYZER_PROB_WEIGHT: float = 0.50
 RANKER_WEIGHT_DEFAULT: float = 0.35   # feat_last3f が十分に揃っているレース向けの標準値
+HORSE_RECORDS_CACHE_VERSION: str = "body_weight_v2"
+HORSE_RECORDS_REQ_CACHE_VERSION: str = "body_weight_v2"
+BODY_WEIGHT_RESULT_COL_INDEX: int = 28
 
 
 def _calc_ranker_weight(features: List[Dict[str, Any]]) -> tuple:
@@ -600,6 +604,23 @@ def parse_body_weight(text: str) -> Tuple[Optional[int], Optional[int]]:
         return int(m.group(1)), int(m.group(2))
     except Exception:
         return None, None
+
+
+def _parse_body_weight_from_result_cols(
+    cols: List[Any],
+    get_text: Callable[[Any], str],
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    netkeiba の馬戦績テーブルでは馬体重が td[28] に入る。
+    Selenium/BeautifulSoup の両方から同じ列を読むための薄い helper。
+    """
+    if len(cols) <= BODY_WEIGHT_RESULT_COL_INDEX:
+        return None, None
+    try:
+        body_weight_text = get_text(cols[BODY_WEIGHT_RESULT_COL_INDEX])
+    except Exception:
+        body_weight_text = ""
+    return parse_body_weight(body_weight_text)
 
 
 def safe_float_mean(values: List[float]) -> Optional[float]:
@@ -3606,7 +3627,7 @@ def fetch_horse_records(
     if driver is None:
         return records, ""
 
-    cache_name = cache_key("horse_records", horse_url, history_limit, cutoff_date or "")
+    cache_name = cache_key("horse_records", HORSE_RECORDS_CACHE_VERSION, horse_url, history_limit, cutoff_date or "")
     cached = load_json_cache(cache_name)
     if cached:
         cached_records = cached.get("records", [])
@@ -3675,6 +3696,7 @@ def fetch_horse_records(
             last3f = parse_last3f(last3f_text)
             popularity_rec = int(popularity_text) if popularity_text.isdigit() else None
             weight_rec = parse_float(weight_text_rec)
+            horse_body_weight, horse_body_weight_change = _parse_body_weight_from_result_cols(cols, safe_text)
 
             records.append({
                 "date": date,
@@ -3698,6 +3720,8 @@ def fetch_horse_records(
                 "distance_text": distance_text,
                 "surface": surface,
                 "distance": distance,
+                "body_weight": horse_body_weight,
+                "body_weight_change": horse_body_weight_change,
             })
             collected += 1
 
@@ -3727,7 +3751,7 @@ def fetch_horse_records_requests(
 
     horse_url = normalize_horse_result_url(horse_url)
 
-    cache_name = cache_key("horse_records_req", horse_url, history_limit, cutoff_date or "")
+    cache_name = cache_key("horse_records_req", HORSE_RECORDS_REQ_CACHE_VERSION, horse_url, history_limit, cutoff_date or "")
     cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
     if cached and isinstance(cached.get("records"), list):
         return cached["records"]
@@ -3765,7 +3789,6 @@ def fetch_horse_records_requests(
         jockey = cols[12].get_text(strip=True) if len(cols) > 12 else ""
         weight_text_rec = cols[13].get_text(strip=True) if len(cols) > 13 else ""
         distance_text = cols[14].get_text(strip=True) if len(cols) > 14 else ""
-        body_weight_text = cols[15].get_text(strip=True) if len(cols) > 15 else ""
         time_text = cols[17].get_text(strip=True) if len(cols) > 17 else ""
         last3f_text = cols[18].get_text(strip=True) if len(cols) > 18 else ""
         margin_text = cols[19].get_text(strip=True) if len(cols) > 19 else ""
@@ -3780,7 +3803,10 @@ def fetch_horse_records_requests(
         last3f = parse_last3f(last3f_text)
         popularity_rec = int(popularity_text) if popularity_text.isdigit() else None
         weight_rec = parse_float(weight_text_rec)
-        horse_body_weight, horse_body_weight_change = parse_body_weight(body_weight_text)
+        horse_body_weight, horse_body_weight_change = _parse_body_weight_from_result_cols(
+            cols,
+            lambda col: col.get_text(strip=True),
+        )
 
         records.append({
             "date": date,
@@ -3981,6 +4007,176 @@ def collect_historical_pattern_profile(
     return profile
 
 
+def _parse_historical_pattern_reason(reason: str) -> Optional[Tuple[str, float]]:
+    m = re.match(r"^(.+)\(([+-]?\d+(?:\.\d+)?)\)$", str(reason or "").strip())
+    if not m:
+        return None
+    try:
+        return m.group(1), float(m.group(2))
+    except Exception:
+        return None
+
+
+def _hist_distance_label(bucket: str) -> str:
+    return {
+        "le_1400": "1400m以下",
+        "1600": "1600m",
+        "1800": "1800m",
+        "ge_2000": "2000m以上",
+    }.get(bucket, str(bucket or "不明距離"))
+
+
+def _historical_pattern_reason_text(token: str, score: float) -> str:
+    positive = score > 0
+    if token.startswith("race_top3:"):
+        name = token.split(":", 1)[1]
+        return f"{name}で3着以内の実績は好材料" if positive else f"{name}で3着以内の履歴は近年傾向ではやや割引"
+    if token.startswith("distance_top3:"):
+        label = _hist_distance_label(token.split(":", 1)[1])
+        return f"{label}で3着以内の実績は好材料" if positive else f"{label}で3着以内の履歴は近年傾向ではやや割引"
+    if token.startswith("grade_top3:"):
+        grade = token.split(":", 1)[1]
+        return f"{grade}で3着以内の実績は好材料" if positive else f"{grade}で3着以内の履歴は近年傾向ではやや割引"
+    if token.startswith("trial_group:"):
+        group = token.split(":", 1)[1]
+        label = "トライアル組" if group == "gi_prep" else "直行・非トライアル組"
+        return f"近走で{label}に該当する点は近年傾向では好材料" if positive else f"近走で{label}に該当する点は近年傾向ではやや割引"
+    if token.startswith("body_weight:"):
+        value = token.split(":", 1)[1]
+        labels = {
+            "under_440": "前走馬体重440kg未満",
+            "440_459": "前走馬体重440〜459kg",
+            "460_479": "前走馬体重460〜479kg",
+            "480_plus": "前走馬体重480kg以上",
+            "gaining": "前走から馬体重増",
+            "losing": "前走から馬体重減",
+        }
+        label = labels.get(value, f"馬体重傾向({value})")
+        return f"{label}は近年傾向では好材料" if positive else f"{label}は近年傾向ではやや割引"
+    if token.startswith("gate:"):
+        label = {"inner": "内枠", "middle": "中枠", "outer": "外枠"}.get(token.split(":", 1)[1], "枠順")
+        return f"{label}傾向は好材料" if positive else f"{label}傾向は近年傾向ではやや割引"
+    if token.startswith("month_top3:"):
+        month = token.split(":", 1)[1]
+        return f"{month}月に3着以内の履歴は好材料" if positive else f"{month}月に3着以内の履歴は近年傾向ではやや割引"
+    if token.startswith("distance_any:"):
+        label = _hist_distance_label(token.split(":", 1)[1])
+        return f"{label}の出走経験は補助的な好材料" if positive else f"{label}の出走経験は近年傾向では補助的に割引"
+    if token.startswith("grade_any:"):
+        grade = token.split(":", 1)[1]
+        return f"{grade}出走経験は補助的な好材料" if positive else f"{grade}出走経験は近年傾向では補助的に割引"
+    if token.startswith("month_any:"):
+        month = token.split(":", 1)[1]
+        return f"{month}月出走歴は補助的な好材料" if positive else f"{month}月出走歴は近年傾向では補助的に割引"
+    if token.startswith("race_any:"):
+        name = token.split(":", 1)[1]
+        return f"{name}出走歴は補助的な好材料" if positive else f"{name}出走歴は近年傾向では補助的に割引"
+    return f"{token} は好材料" if positive else f"{token} は近年傾向ではやや割引"
+
+
+def _historical_reason_priority(
+    token: str,
+    score: float,
+    starts: int,
+    route_overlap: bool,
+) -> float:
+    priority = abs(score * _token_weight(token)) * 1000.0
+    if token.startswith("race_top3:"):
+        priority += 20.0
+    elif token.startswith("distance_top3:"):
+        priority += 14.0
+    elif token.startswith("grade_top3:"):
+        priority += 12.0
+    elif token.startswith("trial_group:"):
+        priority += 10.0
+    elif token.startswith("body_weight:"):
+        priority += 8.0
+    elif token.startswith("gate:"):
+        priority += 4.0
+
+    if token in {"race_top3:2歳新馬"}:
+        priority -= 95.0
+    if token.startswith(("race_any:", "distance_any:", "month_any:", "grade_any:")):
+        priority -= 110.0
+    if 5 <= starts <= 7:
+        priority -= 105.0
+    if route_overlap:
+        priority -= 120.0
+    return priority
+
+
+def _has_route_overlap(token: str, route_reasons: List[str]) -> bool:
+    if not token.startswith("race_top3:"):
+        return False
+    race_name = token.split(":", 1)[1]
+    return bool(race_name and any(race_name in str(reason or "") for reason in route_reasons))
+
+
+def _build_historical_pattern_display_reason_groups(
+    reasons: List[str],
+    historical_pattern_profile: Dict[str, Any],
+    route_reasons: Optional[List[str]] = None,
+    group_limit: int = 3,
+) -> Dict[str, List[Dict[str, Any]]]:
+    token_stats = (historical_pattern_profile or {}).get("token_stats") or {}
+    route_reasons = route_reasons or []
+    grouped: Dict[str, List[Dict[str, Any]]] = {"positive": [], "negative": []}
+
+    for reason in reasons:
+        parsed = _parse_historical_pattern_reason(reason)
+        if not parsed:
+            continue
+        token, score = parsed
+        weight = _token_weight(token)
+        if weight == 0.0:
+            continue
+        row = token_stats.get(token) or {}
+        starts = int(row.get("starts") or 0)
+        route_overlap = _has_route_overlap(token, route_reasons)
+        contribution = score * weight
+        if contribution == 0:
+            continue
+        item = {
+            "token": token,
+            "text": _historical_pattern_reason_text(token, score),
+            "score": round(score, 5),
+            "starts": starts,
+            "contribution": round(contribution, 5),
+            "route_overlap": route_overlap,
+            "priority": round(_historical_reason_priority(token, score, starts, route_overlap), 5),
+        }
+        key = "positive" if contribution > 0 else "negative"
+        grouped[key].append(item)
+
+    for key in ("positive", "negative"):
+        grouped[key].sort(key=lambda item: item["priority"], reverse=True)
+        selected: List[Dict[str, Any]] = []
+        race_top3_count = 0
+        for item in grouped[key]:
+            if item["token"].startswith("race_top3:"):
+                if race_top3_count >= 2:
+                    continue
+                race_top3_count += 1
+            selected.append({k: v for k, v in item.items() if k != "priority"})
+            if len(selected) >= group_limit:
+                break
+        grouped[key] = selected
+
+    return grouped
+
+
+def _flatten_historical_pattern_display_reasons(
+    groups: Dict[str, List[Dict[str, Any]]],
+    per_group: int = 2,
+) -> List[str]:
+    display: List[str] = []
+    for item in (groups.get("positive") or [])[:per_group]:
+        display.append(f"プラス要因: {item['text']}")
+    for item in (groups.get("negative") or [])[:per_group]:
+        display.append(f"マイナス要因: {item['text']}")
+    return display
+
+
 def attach_historical_pattern_scores(
     features: List[Dict[str, Any]],
     historical_pattern_profile: Optional[Dict[str, Any]],
@@ -4001,6 +4197,13 @@ def attach_historical_pattern_scores(
         pattern_score, reasons = score_feature_patterns(feature, historical_pattern_profile or {})
         feature["historical_pattern_score"] = pattern_score if sample_size > 0 else 0.0
         feature["historical_pattern_reasons"] = reasons[:4]
+        reason_groups = _build_historical_pattern_display_reason_groups(
+            reasons,
+            historical_pattern_profile or {},
+            route_reasons=feature.get("route_profile_reasons") or [],
+        )
+        feature["historical_pattern_reason_groups"] = reason_groups
+        feature["historical_pattern_display_reasons"] = _flatten_historical_pattern_display_reasons(reason_groups)
         if "model_score" in feature:
             feature["model_score"] = round(
                 float(feature.get("model_score") or 0.0) + pattern_score * 0.10,
@@ -4459,9 +4662,9 @@ def analyze_race(
         except Exception:
             _cutoff_date = f"{_rid[:4]}/12/31"
 
-    # "cutoff_v2_hp_v1": historical_pattern/route_profile 統合後の結果を保証するバージョン。
-    # 旧キャッシュ（スコアが None のもの）を自動無効化するための固定バージョン文字列。
-    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2_hp_v1")
+    # "cutoff_v2_hp_v2": historical_pattern 表示理由と body_weight 入力修正後の結果を保証する。
+    # 旧キャッシュ（body_weight 欠損・表示用 reasons なし）を自動無効化するための固定バージョン文字列。
+    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2_hp_v2")
     if force_refresh_cache:
         print(f"[analyze_race] cache bypass race_id={_debug_race_id or 'unknown'}", flush=True)
     else:
