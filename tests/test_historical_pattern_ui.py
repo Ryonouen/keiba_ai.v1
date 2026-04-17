@@ -158,3 +158,74 @@ def test_audit_historical_pattern_ui_reasons_detects_display_noise():
     assert audit["issue_counts"]["strong_young_reason"] == 0
     assert audit["issue_counts"]["mechanical_phrase"] == 0
     assert audit["examples"]["raw_token"][0]["horse_name"] == "ノイズ馬"
+
+
+def test_historical_pattern_ui_polishes_age_labels():
+    from historical_pattern_ui import get_historical_pattern_ui_reason_groups
+
+    feature = {
+        "historical_pattern_display_reasons": [
+            "マイナス要因: age:6以上 は近年傾向ではやや割引",
+        ],
+    }
+
+    groups = get_historical_pattern_ui_reason_groups(feature)
+
+    assert groups["negative"] == ["6歳以上は近年傾向ではやや割引"]
+
+
+def test_historical_pattern_ui_softens_low_support_body_weight_reasons():
+    from historical_pattern_ui import get_historical_pattern_ui_reason_groups
+
+    feature = {
+        "historical_pattern_reason_groups": {
+            "positive": [],
+            "negative": [
+                {
+                    "token": "body_weight:460_479",
+                    "text": "前走馬体重460〜479kgは近年傾向ではやや割引",
+                    "starts": 6,
+                },
+            ],
+        },
+    }
+
+    groups = get_historical_pattern_ui_reason_groups(feature)
+
+    assert groups["negative"] == [
+        "前走馬体重460〜479kgは近年傾向ではやや割引（参考度はやや控えめ）"
+    ]
+
+
+def test_historical_pattern_ui_limits_body_weight_reasons_to_one_per_horse():
+    from historical_pattern_ui import get_historical_pattern_ui_reason_groups
+
+    feature = {
+        "historical_pattern_reason_groups": {
+            "positive": [],
+            "negative": [
+                {
+                    "token": "body_weight:460_479",
+                    "text": "前走馬体重460〜479kgは近年傾向ではやや割引",
+                    "starts": 47,
+                },
+                {
+                    "token": "body_weight:440_459",
+                    "text": "前走馬体重440〜459kgは近年傾向ではやや割引",
+                    "starts": 21,
+                },
+                {
+                    "token": "grade_top3:G2",
+                    "text": "G2で3着以内の履歴は近年傾向ではやや割引",
+                    "starts": 30,
+                },
+            ],
+        },
+    }
+
+    groups = get_historical_pattern_ui_reason_groups(feature)
+
+    assert groups["negative"] == [
+        "前走馬体重460〜479kgは近年傾向ではやや割引",
+        "G2級での好走履歴は近年傾向ではやや割引",
+    ]

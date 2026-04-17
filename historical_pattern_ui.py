@@ -16,8 +16,9 @@ _DISTANCE_TOP3_POSITIVE_RE = re.compile(r"(\d{3,4}m(?:以下|以上)?)で3着以
 _DISTANCE_TOP3_NEGATIVE_RE = re.compile(r"(\d{3,4}m(?:以下|以上)?)で3着以内の履歴は近年傾向ではやや割引")
 _GRADE_TOP3_POSITIVE_RE = re.compile(r"\b(G[123])で3着以内の実績は好材料")
 _GRADE_TOP3_NEGATIVE_RE = re.compile(r"\b(G[123])で3着以内の履歴は近年傾向ではやや割引")
+_AGE_LABEL_RE = re.compile(r"\bage:(\d+)以上\s*は")
 _RAW_TOKEN_RE = re.compile(
-    r"(?:race|distance|grade|month|gate|body_weight|trial_group)_[a-z0-9_]*:|prev_[a-z_]+=",
+    r"(?:race|distance|grade|month|gate|body_weight|trial_group|age)_[a-z0-9_]*:|age:|prev_[a-z_]+=",
     re.IGNORECASE,
 )
 _MECHANICAL_PHRASE_RE = re.compile(r"(?:\d{3,4}m(?:以下|以上)?|G[123])で3着以内")
@@ -46,7 +47,22 @@ def _polish_historical_pattern_text(text: str) -> str:
     reason = _DISTANCE_TOP3_NEGATIVE_RE.sub(r"\1での好走履歴は近年傾向ではやや割引", reason)
     reason = _GRADE_TOP3_POSITIVE_RE.sub(r"\1級での好走実績は近年傾向で好材料", reason)
     reason = _GRADE_TOP3_NEGATIVE_RE.sub(r"\1級での好走履歴は近年傾向ではやや割引", reason)
+    reason = _AGE_LABEL_RE.sub(r"\1歳以上は", reason)
     return reason
+
+
+def _is_body_weight_token(token: str) -> bool:
+    return str(token or "").startswith("body_weight:")
+
+
+def _is_body_weight_reason(text: str) -> bool:
+    return str(text or "").startswith(("前走馬体重", "前走から馬体重"))
+
+
+def _append_low_support_note(text: str) -> str:
+    if "参考度" in text:
+        return text
+    return f"{text}（参考度はやや控えめ）"
 
 
 def _clean_display_reason_prefix(text: str) -> Tuple[str, str]:
@@ -65,8 +81,28 @@ def _clean_display_reason_prefix(text: str) -> Tuple[str, str]:
 def _group_item_text(item: Any) -> str:
     if isinstance(item, dict):
         text = item.get("text") or item.get("display_text") or item.get("reason") or ""
-        return _polish_historical_pattern_text(str(text))
+        polished = _polish_historical_pattern_text(str(text))
+        try:
+            starts = int(item.get("starts") or 0)
+        except Exception:
+            starts = 0
+        if _is_body_weight_token(str(item.get("token") or "")) and 5 <= starts <= 7:
+            return _append_low_support_note(polished)
+        return polished
     return _polish_historical_pattern_text(str(item or ""))
+
+
+def _limit_body_weight_reasons(groups: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    body_seen = False
+    limited: Dict[str, List[str]] = {"positive": [], "negative": []}
+    for key in ("positive", "negative"):
+        for reason in groups.get(key) or []:
+            if _is_body_weight_reason(reason):
+                if body_seen:
+                    continue
+                body_seen = True
+            limited[key].append(reason)
+    return limited
 
 
 def get_historical_pattern_ui_reason_groups(feature: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -86,7 +122,7 @@ def get_historical_pattern_ui_reason_groups(feature: Dict[str, Any]) -> Dict[str
                 if text:
                     groups[key].append(text)
         if groups["positive"] or groups["negative"]:
-            return groups
+            return _limit_body_weight_reasons(groups)
 
     display_reasons = (feature or {}).get("historical_pattern_display_reasons") or []
     for reason in display_reasons:
@@ -94,14 +130,14 @@ def get_historical_pattern_ui_reason_groups(feature: Dict[str, Any]) -> Dict[str
         if text:
             groups[key].append(text)
     if groups["positive"] or groups["negative"]:
-        return groups
+        return _limit_body_weight_reasons(groups)
 
     legacy_reasons = (feature or {}).get("historical_pattern_reasons") or []
     for reason in legacy_reasons:
         key, text = _clean_display_reason_prefix(str(reason or ""))
         if text:
             groups[key].append(text)
-    return groups
+    return _limit_body_weight_reasons(groups)
 
 
 def has_historical_pattern_ui_reasons(feature: Dict[str, Any]) -> bool:
