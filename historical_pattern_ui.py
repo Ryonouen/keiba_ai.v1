@@ -12,6 +12,15 @@ _GRADE_LABEL_REPLACEMENTS = (
     (re.compile(r"\bOP(?=で|の|組|$)"), "オープン級"),
     (re.compile(r"\bL(?=で|の|組|$)"), "リステッド"),
 )
+_DISTANCE_TOP3_POSITIVE_RE = re.compile(r"(\d{3,4}m(?:以下|以上)?)で3着以内の実績は好材料")
+_DISTANCE_TOP3_NEGATIVE_RE = re.compile(r"(\d{3,4}m(?:以下|以上)?)で3着以内の履歴は近年傾向ではやや割引")
+_GRADE_TOP3_POSITIVE_RE = re.compile(r"\b(G[123])で3着以内の実績は好材料")
+_GRADE_TOP3_NEGATIVE_RE = re.compile(r"\b(G[123])で3着以内の履歴は近年傾向ではやや割引")
+_RAW_TOKEN_RE = re.compile(
+    r"(?:race|distance|grade|month|gate|body_weight|trial_group)_[a-z0-9_]*:|prev_[a-z_]+=",
+    re.IGNORECASE,
+)
+_MECHANICAL_PHRASE_RE = re.compile(r"(?:\d{3,4}m(?:以下|以上)?|G[123])で3着以内")
 
 
 def _polish_historical_pattern_text(text: str) -> str:
@@ -33,6 +42,10 @@ def _polish_historical_pattern_text(text: str) -> str:
 
     for pattern, label in _GRADE_LABEL_REPLACEMENTS:
         reason = pattern.sub(label, reason)
+    reason = _DISTANCE_TOP3_POSITIVE_RE.sub(r"\1での好走実績は距離面の好材料", reason)
+    reason = _DISTANCE_TOP3_NEGATIVE_RE.sub(r"\1での好走履歴は近年傾向ではやや割引", reason)
+    reason = _GRADE_TOP3_POSITIVE_RE.sub(r"\1級での好走実績は近年傾向で好材料", reason)
+    reason = _GRADE_TOP3_NEGATIVE_RE.sub(r"\1級での好走履歴は近年傾向ではやや割引", reason)
     return reason
 
 
@@ -152,3 +165,57 @@ def get_route_profile_display_reasons(feature: Dict[str, Any], limit: int = 2) -
         if len(display) >= limit:
             break
     return display
+
+
+def _collect_ui_reason_texts(feature: Dict[str, Any]) -> List[Tuple[str, str]]:
+    texts: List[Tuple[str, str]] = []
+    for reason in get_route_profile_display_reasons(feature or {}):
+        texts.append(("route", reason))
+    hist_groups = get_historical_pattern_ui_reason_groups(feature or {})
+    for key in ("positive", "negative"):
+        for reason in hist_groups.get(key) or []:
+            texts.append((f"historical_{key}", reason))
+    return texts
+
+
+def _has_strong_young_reason(text: str) -> bool:
+    if "2歳新馬" not in text and "2歳未勝利" not in text:
+        return False
+    return "補助的" not in text and "参考度" not in text
+
+
+def audit_historical_pattern_ui_reasons(
+    features: List[Dict[str, Any]],
+    example_limit: int = 5,
+) -> Dict[str, Any]:
+    """実レース表示理由の軽量監査用サマリーを返す。"""
+    issue_keys = ("raw_token", "raw_grade", "strong_young_reason", "mechanical_phrase")
+    issue_counts = {key: 0 for key in issue_keys}
+    examples: Dict[str, List[Dict[str, str]]] = {key: [] for key in issue_keys}
+
+    def add_issue(issue: str, horse_name: str, text: str, source: str) -> None:
+        issue_counts[issue] += 1
+        if len(examples[issue]) < example_limit:
+            examples[issue].append({
+                "horse_name": horse_name,
+                "source": source,
+                "text": text,
+            })
+
+    for feature in features or []:
+        horse_name = str((feature or {}).get("horse_name") or "-")
+        for source, text in _collect_ui_reason_texts(feature or {}):
+            if _RAW_TOKEN_RE.search(text):
+                add_issue("raw_token", horse_name, text, source)
+            if any(marker in text for marker in ("Lで", "OPで", "GIで", "GIIで", "GIIIで")):
+                add_issue("raw_grade", horse_name, text, source)
+            if _has_strong_young_reason(text):
+                add_issue("strong_young_reason", horse_name, text, source)
+            if _MECHANICAL_PHRASE_RE.search(text):
+                add_issue("mechanical_phrase", horse_name, text, source)
+
+    return {
+        "checked_horses": len(features or []),
+        "issue_counts": issue_counts,
+        "examples": examples,
+    }
