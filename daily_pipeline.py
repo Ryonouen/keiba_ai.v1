@@ -96,6 +96,306 @@ def get_race_ids_by_date(date_str: str) -> List[str]:
     return fetch_race_ids_by_date(date_str)
 
 
+def _prediction_race_ids_for_date(date_str: str) -> List[str]:
+    preds = pipeline_store.load_all_predictions()
+    race_ids: List[str] = []
+    for race_id, pred in preds.items():
+        if not isinstance(pred, dict):
+            continue
+        if str(pred.get("analysis_date") or "") == date_str:
+            race_ids.append(str(race_id))
+    return race_ids
+
+
+def _merge_result_fetch_race_ids(date_str: str) -> List[str]:
+    race_ids: List[str] = []
+    seen = set()
+    for rid in list(get_race_ids_by_date(date_str) or []) + _prediction_race_ids_for_date(date_str):
+        rid = str(rid or "")
+        if not rid or rid in seen:
+            continue
+        race_ids.append(rid)
+        seen.add(rid)
+    return race_ids
+
+
+def _prediction_schedule_map_for_date(date_str: str) -> Dict[str, Dict[str, Any]]:
+    schedule: Dict[str, Dict[str, Any]] = {}
+    preds = pipeline_store.load_all_predictions()
+    for race_id, pred in preds.items():
+        if not isinstance(pred, dict):
+            continue
+        if str(pred.get("analysis_date") or "") != date_str:
+            continue
+        start_time = str(pred.get("start_time") or "").strip()
+        start_datetime = str(pred.get("start_datetime") or "").strip()
+        if not start_datetime and start_time:
+            try:
+                start_datetime = _dt.strptime(
+                    f"{date_str} {start_time}", "%Y%m%d %H:%M"
+                ).isoformat(timespec="seconds")
+            except (TypeError, ValueError):
+                start_datetime = ""
+        schedule[str(race_id)] = {
+            "start_time": start_time,
+            "start_datetime": start_datetime,
+        }
+    return schedule
+
+
+def _parse_prediction_start_datetime(
+    pred: Optional[Dict[str, Any]],
+    date_str: str,
+) -> Optional[_dt]:
+    if not isinstance(pred, dict):
+        pred = {}
+    start_datetime = str(pred.get("start_datetime") or "").strip()
+    if start_datetime:
+        try:
+            return _dt.fromisoformat(start_datetime)
+        except ValueError:
+            pass
+    start_time = str(pred.get("start_time") or "").strip()
+    if start_time:
+        try:
+            return _dt.strptime(f"{date_str} {start_time}", "%Y%m%d %H:%M")
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _classify_missing_result_status(
+    race_id: str,
+    date_str: str,
+    result_delay_minutes: int = 30,
+    now: Optional[_dt] = None,
+) -> str:
+    now = now or _dt.now()
+    pred = pipeline_store.load_prediction(race_id)
+    start_dt = _parse_prediction_start_datetime(pred, date_str)
+    if start_dt is not None:
+        if now < start_dt + _td(minutes=result_delay_minutes):
+            return "not_ready"
+        return "fetch_failed"
+
+    try:
+        race_date = _dt.strptime(date_str, "%Y%m%d").date()
+        if race_date > now.date():
+            return "not_ready"
+    except ValueError:
+        pass
+    return "fetch_failed"
+
+
+def _save_missing_result_marker(
+    race_id: str,
+    date_str: str,
+    reason: str,
+    result_delay_minutes: int = 30,
+) -> str:
+    status = _classify_missing_result_status(
+        race_id,
+        date_str,
+        result_delay_minutes=result_delay_minutes,
+    )
+    pipeline_store.save_pipeline_result_fetch_status(
+        race_id,
+        status,
+        reason=reason,
+    )
+    return status
+
+
+def _latest_head_count_map_for_date(date_str: str) -> Dict[str, int]:
+    try:
+        from dashboard_loader import _fetch_schedule_map_for_date
+        schedule = _fetch_schedule_map_for_date(date_str) or {}
+    except Exception:
+        return {}
+
+    head_counts: Dict[str, int] = {}
+    for race_id, meta in schedule.items():
+        if not isinstance(meta, dict):
+            continue
+        value = meta.get("head_count")
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            head_counts[str(race_id)] = count
+    return head_counts
+
+
+def audit_stale_predictions_for_date(date_str: str) -> Dict[str, Any]:
+    """
+    保存済み prediction の出走頭数系 stale を検出し、stale_prediction marker を付ける。
+
+    再分析は実行しない。marker は次フェーズの手動/自動再分析の入力にする。
+    """
+    preds = pipeline_store.load_all_predictions()
+    latest_head_counts = _latest_head_count_map_for_date(date_str)
+
+    summary: Dict[str, Any] = {
+        "date": date_str,
+        "checked": 0,
+        "stale": 0,
+        "marked": 0,
+        "details": [],
+    }
+
+    for race_id, pred in preds.items():
+        if not isinstance(pred, dict):
+            continue
+        if str(pred.get("analysis_date") or "") != date_str:
+            continue
+
+        summary["checked"] += 1
+        race_id = str(race_id)
+        horses = pred.get("horses") or []
+        saved_count = len(horses) if isinstance(horses, list) else 0
+        horse_number_map = pred.get("horse_number_map") or {}
+        reasons: List[str] = []
+        expected_counts: List[int] = []
+
+        if not isinstance(horse_number_map, dict) or not horse_number_map:
+            reasons.append("empty_horse_number_map")
+        elif len(horse_number_map) != saved_count:
+            reasons.append("horse_number_map_count_mismatch")
+            expected_counts.append(len(horse_number_map))
+
+        latest_head_count = latest_head_counts.get(race_id)
+        if latest_head_count is not None and latest_head_count != saved_count:
+            reasons.append("latest_head_count_mismatch")
+            expected_counts.append(latest_head_count)
+
+        race_result = pipeline_store.load_pipeline_race_result(race_id) or {}
+        result_runners = race_result.get("runners") or []
+        if isinstance(result_runners, list) and result_runners:
+            result_count = len(result_runners)
+            if result_count != saved_count:
+                reasons.append("result_runner_count_mismatch")
+                expected_counts.append(result_count)
+
+        if not reasons:
+            continue
+
+        expected_count = expected_counts[-1] if expected_counts else None
+        marked = pipeline_store.mark_prediction_stale(
+            race_id,
+            reasons,
+            source="daily_pipeline_audit",
+            expected_count=expected_count,
+            saved_count=saved_count,
+        )
+        summary["stale"] += 1
+        if marked:
+            summary["marked"] += 1
+        summary["details"].append({
+            "race_id": race_id,
+            "reasons": reasons,
+            "expected_count": expected_count,
+            "saved_count": saved_count,
+            "marked": marked,
+        })
+
+    return summary
+
+
+def _stale_prediction_race_ids_for_date(date_str: str) -> List[str]:
+    preds = pipeline_store.load_all_predictions()
+    race_ids: List[str] = []
+    for race_id, pred in preds.items():
+        if not isinstance(pred, dict):
+            continue
+        if str(pred.get("analysis_date") or "") != date_str:
+            continue
+        marker = pred.get("stale_prediction") if isinstance(pred.get("stale_prediction"), dict) else {}
+        if marker.get("is_stale") is True:
+            race_ids.append(str(race_id))
+    return race_ids
+
+
+def reanalyze_stale_predictions_for_date(
+    date_str: str,
+    per_race_timeout_sec: int = 300,
+    use_requests: bool = False,
+) -> Dict[str, Any]:
+    """
+    stale_prediction.is_stale == true の保存済み race_id だけを安全再分析する。
+
+    成功時の stale marker 削除は save_prediction_v2() の payload 上書きに任せる。
+    失敗時は prediction を触らないため marker は残る。
+    use_requests=True: 馬個別ページを NetkeibaSession(curl_cffi) 経由で取得。
+    Selenium の page_load_timeout による積算 timeout を回避する。
+    """
+    race_ids = _stale_prediction_race_ids_for_date(date_str)
+    summary: Dict[str, Any] = {
+        "date": date_str,
+        "total": len(race_ids),
+        "success": 0,
+        "skipped": 0,
+        "errors": [],
+        "race_ids": race_ids,
+        "details": [],
+    }
+
+    print(f"[{date_str}] stale再分析: 対象 {len(race_ids)} レース", flush=True)
+    for i, race_id in enumerate(race_ids, 1):
+        print(f"  [{i}/{len(race_ids)}] {race_id} stale再分析...", flush=True)
+        try:
+            result = run_daily_race_analysis_one_safe(
+                date_str,
+                race_id,
+                per_race_timeout_sec=per_race_timeout_sec,
+                force_refresh_cache=True,
+                use_requests=use_requests,
+            )
+        except Exception as e:
+            summary["skipped"] += 1
+            err = {"race_id": race_id, "error": str(e)}
+            summary["errors"].append(err)
+            summary["details"].append({"race_id": race_id, "success": 0, "skipped": 1, "errors": [err]})
+            print(f"    → エラー: {e}", flush=True)
+            continue
+
+        returned_success = int(result.get("success") or 0)
+        skipped = int(result.get("skipped") or 0)
+        errors = list(result.get("errors") or [])
+        pred_after = pipeline_store.load_prediction(race_id) or {}
+        marker_after = (
+            pred_after.get("stale_prediction")
+            if isinstance(pred_after.get("stale_prediction"), dict)
+            else {}
+        )
+        marker_cleared = marker_after.get("is_stale") is not True
+        success = 1 if returned_success > 0 and marker_cleared else 0
+        if not success:
+            skipped = max(skipped, 1)
+            if returned_success > 0 and not marker_cleared and not errors:
+                errors.append({"race_id": race_id, "error": "stale_marker_still_present"})
+
+        summary["success"] += success
+        summary["skipped"] += skipped
+        summary["errors"].extend(errors)
+        summary["details"].append({
+            "race_id": race_id,
+            "success": success,
+            "skipped": skipped,
+            "errors": errors,
+        })
+
+        if success:
+            print("    → stale再分析 完了", flush=True)
+        else:
+            print("    → stale再分析 失敗/スキップ（marker維持）", flush=True)
+
+        if i < len(race_ids):
+            time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
+
+    return summary
+
+
 def _race_url(race_id: str) -> str:
     return SHUTUBA_URL_TEMPLATE.format(race_id=race_id)
 
@@ -733,7 +1033,7 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
     """
     from dividend_scraper import scrape_race_result
 
-    race_ids = get_race_ids_by_date(date_str)
+    race_ids = _merge_result_fetch_race_ids(date_str)
     summary: Dict[str, Any] = {
         "date": date_str, "total": len(race_ids),
         "success": 0, "skipped": 0, "errors": [],
@@ -752,8 +1052,14 @@ def evaluate_prediction_for_day(date_str: str) -> Dict[str, Any]:
 
             result = scrape_race_result(race_id)
             if result is None:
+                status = _save_missing_result_marker(
+                    race_id,
+                    date_str,
+                    reason="scrape_race_result_none",
+                    result_delay_minutes=30,
+                )
                 summary["skipped"] += 1
-                print(f"    → 結果なし（未開催/取得失敗）。スキップ", flush=True)
+                print(f"    → 結果なし（{status}）。次回再試行対象として記録", flush=True)
                 continue
 
             pipeline_store.save_pipeline_race_result(race_id, result)
@@ -797,7 +1103,7 @@ def watch_results(
     from dividend_scraper import scrape_race_result
     from datetime import datetime as _dt, timedelta as _td
 
-    race_ids = get_race_ids_by_date(date_str)
+    race_ids = _merge_result_fetch_race_ids(date_str)
     if not race_ids:
         print(f"[watch_results] {date_str}: レースIDなし。終了。", flush=True)
         return
@@ -805,6 +1111,8 @@ def watch_results(
     # レースのスケジュール情報を取得（発走時刻）
     from dashboard_loader import _fetch_schedule_map_for_date
     schedule = _fetch_schedule_map_for_date(date_str)
+    for race_id, meta in _prediction_schedule_map_for_date(date_str).items():
+        schedule.setdefault(race_id, meta)
 
     done: set = set()  # 取得済み race_id
 
@@ -861,7 +1169,13 @@ def watch_results(
                     done.add(race_id)
                     newly_fetched += 1
                 else:
-                    print(f"[watch_results] {race_id} 結果未確定。次回再試行。", flush=True)
+                    status = _save_missing_result_marker(
+                        race_id,
+                        date_str,
+                        reason="scrape_race_result_none",
+                        result_delay_minutes=result_delay_minutes,
+                    )
+                    print(f"[watch_results] {race_id} 結果なし({status})。次回再試行。", flush=True)
             except Exception as e:
                 print(f"[watch_results] {race_id} エラー: {e}", flush=True)
 

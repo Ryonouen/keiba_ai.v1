@@ -101,6 +101,44 @@ def load_all_predictions() -> Dict[str, Any]:
     return _load(PREDICTIONS_FILE)
 
 
+def mark_prediction_stale(
+    race_id: str,
+    reasons: List[str],
+    source: str,
+    expected_count: Optional[int] = None,
+    saved_count: Optional[int] = None,
+) -> bool:
+    """prediction payload 直下に stale marker を保存する。"""
+    data = _load(PREDICTIONS_FILE)
+    pred = data.get(race_id)
+    if not isinstance(pred, dict):
+        return False
+
+    unique_reasons: List[str] = []
+    for reason in reasons or []:
+        reason = str(reason or "").strip()
+        if reason and reason not in unique_reasons:
+            unique_reasons.append(reason)
+    if not unique_reasons:
+        return False
+
+    marker: Dict[str, Any] = {
+        "is_stale": True,
+        "reasons": unique_reasons,
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+    }
+    if expected_count is not None:
+        marker["expected_count"] = int(expected_count)
+    if saved_count is not None:
+        marker["saved_count"] = int(saved_count)
+
+    pred["stale_prediction"] = marker
+    data[race_id] = pred
+    _save(PREDICTIONS_FILE, data)
+    return True
+
+
 def is_prediction_incomplete(pred: Dict[str, Any]) -> bool:
     """
     明らかに不完全な prediction レコードを検出する。
@@ -405,6 +443,43 @@ def load_all_bet_suggestions() -> Dict[str, Any]:
 def save_pipeline_race_result(race_id: str, result: Dict[str, Any]) -> None:
     data = _load(RACE_RESULTS_FILE)
     data[race_id] = result
+    _save(RACE_RESULTS_FILE, data)
+
+
+def save_pipeline_result_fetch_status(
+    race_id: str,
+    status: str,
+    reason: str = "",
+) -> None:
+    """
+    結果取得に失敗・未確定だった状態を pipeline_race_results に記録する。
+
+    finish_order がある正常結果は上書きしない。次回の評価処理ではこの
+    marker を通常結果として扱わず、再取得対象として残す。
+    """
+    data = _load(RACE_RESULTS_FILE)
+    existing = data.get(race_id) if isinstance(data.get(race_id), dict) else {}
+    if existing and existing.get("finish_order"):
+        return
+
+    attempt_count = 0
+    try:
+        attempt_count = int((existing or {}).get("result_fetch_attempt_count") or 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+
+    marker = {
+        **(existing or {}),
+        "race_id": race_id,
+        "result_fetch_status": status,
+        "result_fetch_attempted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "result_fetch_attempt_count": attempt_count + 1,
+        "result_fetch_reason": reason,
+        "finish_order": (existing or {}).get("finish_order") or [],
+        "runners": (existing or {}).get("runners") or [],
+        "dividends": (existing or {}).get("dividends") or {},
+    }
+    data[race_id] = marker
     _save(RACE_RESULTS_FILE, data)
 
 

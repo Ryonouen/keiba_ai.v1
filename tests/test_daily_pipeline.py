@@ -79,6 +79,24 @@ def test_save_and_load_race_result(tmp_path, monkeypatch):
     assert r["finish_order"][0] == "馬A"
 
 
+def test_save_result_fetch_status_does_not_overwrite_finished_result(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    pipeline_store.save_pipeline_race_result(
+        "202501050811",
+        {"finish_order": ["馬A", "馬B"], "runners": [{"horse_name": "馬A"}]},
+    )
+
+    pipeline_store.save_pipeline_result_fetch_status(
+        "202501050811",
+        "fetch_failed",
+        reason="blocked",
+    )
+
+    r = pipeline_store.load_pipeline_race_result("202501050811")
+    assert r["finish_order"] == ["馬A", "馬B"]
+    assert "result_fetch_status" not in r
+
+
 def test_save_and_load_bet_outcomes(tmp_path, monkeypatch):
     _tmp_store(monkeypatch)
     outcomes = [
