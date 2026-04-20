@@ -18,6 +18,7 @@ daily_pipeline.py
 from __future__ import annotations
 
 import argparse
+import json as _json_dp
 import math as _math
 import logging as _logging
 import random
@@ -316,9 +317,18 @@ def _run_daily_race_analysis_for_ids(
             danger_v2      = result.get("danger_favorites_v2") or []
 
             if not features:
+                _err = result.get("error") or "features_empty"
+                # 親プロセス(run_daily_race_analysis_one_safe)が読み取れるよう代表エラーを保存
+                try:
+                    _sink = _os_dp.path.join(_os_dp.path.dirname(_os_dp.path.abspath(__file__)),
+                                             f".pipeline_err_{race_id}.json")
+                    with open(_sink, "w") as _f:
+                        _json_dp.dump({"error": _err}, _f)
+                except Exception:
+                    pass
                 summary["skipped"] += 1
-                summary["errors"].append({"race_id": race_id, "error": "features empty"})
-                print(f"    → features 空。スキップ", flush=True)
+                summary["errors"].append({"race_id": race_id, "error": _err})
+                print(f"    → features 空 ({_err})。スキップ", flush=True)
                 continue
 
             # オッズ・人気が欠損している場合の補完（確定オッズ優先、未開催なら予想オッズ）
@@ -456,6 +466,7 @@ def run_daily_race_analysis_one(
     date_str: str,
     race_id: str,
     force_refresh_cache: bool = False,
+    use_requests: bool = False,
 ) -> Dict[str, Any]:
     """1レースだけ分析して保存する（safe実行用の内部API）。"""
     return _run_daily_race_analysis_for_ids(
@@ -463,6 +474,7 @@ def run_daily_race_analysis_one(
         [race_id],
         analyze_timeout_sec=0,
         force_refresh_cache=force_refresh_cache,
+        use_requests=use_requests,
     )
 
 
@@ -471,15 +483,23 @@ def run_daily_race_analysis_one_safe(
     race_id: str,
     per_race_timeout_sec: int = 300,
     force_refresh_cache: bool = False,
+    use_requests: bool = False,
 ) -> Dict[str, Any]:
     """
     1レースだけを別プロセスで安全実行する。
     ハング時は timeout で強制終了し、親プロセス側で状況を返す。
     """
     script_path = _os_dp.path.abspath(__file__)
+    _err_sink = _os_dp.path.join(_os_dp.path.dirname(script_path), f".pipeline_err_{race_id}.json")
+    try:
+        _os_dp.remove(_err_sink)
+    except FileNotFoundError:
+        pass
     cmd = [_sys.executable, script_path, "--analyze-one", date_str, race_id]
     if force_refresh_cache:
         cmd.append("--force-refresh-cache")
+    if use_requests:
+        cmd.append("--use-requests")
     summary: Dict[str, Any] = {
         "date": date_str,
         "total": 1,
@@ -517,9 +537,16 @@ def run_daily_race_analysis_one_safe(
             summary["success"] = 1
             print("    → 完了", flush=True)
         else:
+            _child_err = f"exit_code={returncode}"
+            try:
+                with open(_err_sink) as _f:
+                    _child_err = _json_dp.load(_f).get("error") or _child_err
+                _os_dp.remove(_err_sink)
+            except Exception:
+                pass
             summary["skipped"] = 1
-            summary["errors"].append({"race_id": race_id, "error": f"exit_code={returncode}"})
-            print(f"    → エラー: exit_code={returncode}", flush=True)
+            summary["errors"].append({"race_id": race_id, "error": _child_err})
+            print(f"    → エラー: {_child_err}", flush=True)
     except _subprocess.TimeoutExpired:
         summary["skipped"] = 1
         summary["errors"].append({"race_id": race_id, "error": f"timeout({per_race_timeout_sec}s)"})
@@ -1480,6 +1507,8 @@ if __name__ == "__main__":
                         help="未取得レースのみ再分析（例: 20250406）")
     parser.add_argument("--analyze-missing-safe", metavar="DATE",
                         help="未取得レースを1件ずつ別プロセスで再分析（ハング回避）")
+    parser.add_argument("--reanalyze-stale", metavar="DATE",
+                        help="stale_prediction.is_stale=true のレースだけ再分析")
     parser.add_argument("--analyze-timeout", type=int, default=420,
                         help="--analyze-missing 時の1レースあたりタイムアウト秒（0で無効, デフォルト: 420）")
     parser.add_argument("--force-refresh-cache", action="store_true",
@@ -1512,11 +1541,14 @@ if __name__ == "__main__":
         )
 
     elif args.analyze_one:
-        run_daily_race_analysis_one(
+        _one_result = run_daily_race_analysis_one(
             args.analyze_one[0],
             args.analyze_one[1],
             force_refresh_cache=args.force_refresh_cache,
+            use_requests=args.use_requests,
         )
+        if not _one_result.get("success"):
+            _sys.exit(1)
 
     elif args.analyze_one_safe:
         run_daily_race_analysis_one_safe(
@@ -1531,6 +1563,13 @@ if __name__ == "__main__":
 
     elif args.analyze_missing:
         run_daily_race_analysis_missing(args.analyze_missing, analyze_timeout_sec=args.analyze_timeout)
+
+    elif args.reanalyze_stale:
+        reanalyze_stale_predictions_for_date(
+            args.reanalyze_stale,
+            per_race_timeout_sec=args.analyze_timeout,
+            use_requests=args.use_requests,
+        )
 
     elif args.evaluate:
         evaluate_prediction_for_day(args.evaluate)

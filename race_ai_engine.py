@@ -3740,10 +3740,12 @@ def fetch_horse_records_requests(
     horse_url: str,
     history_limit: int = HISTORY_LIMIT_DEFAULT,
     cutoff_date: Optional[str] = None,
+    session: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     requests + BeautifulSoup 版の馬ページ戦績取得。
     同一レースの過去ローテ傾向分析用に、Selenium なしで前走だけ拾えるようにする。
+    session: 呼び出し元の NetkeibaSession を渡すとレートリミットを共有できる。
     """
     records: List[Dict[str, Any]] = []
     if not horse_url:
@@ -3758,7 +3760,7 @@ def fetch_horse_records_requests(
 
     try:
         from netkeiba_session import NetkeibaSession
-        _hs = NetkeibaSession()
+        _hs = session if session is not None else NetkeibaSession()
         html = _hs.fetch_html(horse_url, referer="https://db.netkeiba.com/")
         if not html:
             return records
@@ -4827,6 +4829,13 @@ def analyze_race(
         )
 
         if not horses:
+            # expected_starter_count が取れない + 馬行なし = 過去レースの shutuba が
+            # 結果ページ相当の HTML を返した可能性（Shutuba_Table クラス消失）
+            _err = (
+                "HISTORICAL_SHUTUBA_UNAVAILABLE"
+                if expected_starter_count is None
+                else "NO_HORSES_FOUND"
+            )
             return {
                 "race_meta": {
                     **race_meta.__dict__,
@@ -4870,6 +4879,7 @@ def analyze_race(
                         horse_url,
                         history_limit=history_limit,
                         cutoff_date=_cutoff_date,
+                        session=_nsession,
                     )
                     sire_name = sire_name or ""
                     _birthday = None

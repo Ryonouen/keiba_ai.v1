@@ -1,5 +1,6 @@
 """tests/test_daily_pipeline.py — パイプラインCRUD + 評価ロジックのユニットテスト"""
 import sys, os, json, tempfile
+from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pipeline_store
@@ -25,6 +26,34 @@ def test_save_and_load_prediction(tmp_path, monkeypatch):
     assert pred["race_name"] == "テストレース"
     assert pred["horses"][0]["horse_name"] == "馬A"
     assert pred["horses"][0]["ai_win_prob"] == 0.3
+
+
+def test_mark_prediction_stale_writes_marker(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    pipeline_store.save_prediction(
+        race_id="202501050811",
+        race_meta={"race_title": "テストレース", "race_date": "2025-01-05"},
+        features=[{"horse_name": "馬A", "win_prob": 0.3}],
+        analysis_date="20250105",
+    )
+
+    saved = pipeline_store.mark_prediction_stale(
+        "202501050811",
+        ["empty_horse_number_map", "empty_horse_number_map", "result_runner_count_mismatch"],
+        source="daily_pipeline_audit",
+        expected_count=14,
+        saved_count=15,
+    )
+
+    pred = pipeline_store.load_prediction("202501050811")
+    marker = pred["stale_prediction"]
+    assert saved is True
+    assert marker["is_stale"] is True
+    assert marker["reasons"] == ["empty_horse_number_map", "result_runner_count_mismatch"]
+    assert marker["source"] == "daily_pipeline_audit"
+    assert marker["expected_count"] == 14
+    assert marker["saved_count"] == 15
+    assert marker["checked_at"]
 
 
 def test_save_and_load_bet_suggestions(tmp_path, monkeypatch):
@@ -189,6 +218,268 @@ def test_evaluate_bets_wide_hit(tmp_path, monkeypatch):
     assert outcomes[0]["hit"] is True
     assert outcomes[0]["payout"] == 210  # 最小払戻（保守的）
     assert abs(outcomes[0]["roi"] - 2.1) < 0.01
+
+
+def test_evaluate_uses_saved_prediction_ids_when_race_list_is_empty(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030811"
+    past_start = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "皐月賞(G1)",
+            "analysis_date": "20260419",
+            "start_time": past_start[11:16],
+            "start_datetime": past_start,
+            "horses": [{"horse_name": "馬A", "ai_win_prob": 0.2}],
+        }
+    })
+    pipeline_store.save_bet_suggestions(race_id, [
+        {
+            "bet_type": "tansho",
+            "bet_type_label": "単勝",
+            "bet_combination": ["馬A"],
+            "stake_amount": 100,
+        }
+    ])
+
+    monkeypatch.setattr(daily_pipeline, "get_race_ids_by_date", lambda _date: [])
+    import dividend_scraper
+    monkeypatch.setattr(dividend_scraper, "scrape_race_result", lambda _race_id: None)
+
+    summary = daily_pipeline.evaluate_prediction_for_day("20260419")
+
+    assert summary["total"] == 1
+    assert summary["skipped"] == 1
+    marker = pipeline_store.load_pipeline_race_result(race_id)
+    assert marker["result_fetch_status"] == "fetch_failed"
+    assert marker["result_fetch_attempt_count"] == 1
+
+
+def test_audit_stale_predictions_marks_count_mismatches(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030602"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "３歳未勝利",
+            "analysis_date": "20260412",
+            "start_time": "10:20",
+            "horse_number_map": {},
+            "horses": [
+                {"horse_name": "馬A", "ai_win_prob": 0.3},
+                {"horse_name": "馬B", "ai_win_prob": 0.2},
+                {"horse_name": "取消馬", "ai_win_prob": 0.1},
+            ],
+        }
+    })
+    pipeline_store.save_pipeline_race_result(
+        race_id,
+        {
+            "finish_order": ["馬A", "馬B"],
+            "runners": [{"horse_name": "馬A"}, {"horse_name": "馬B"}],
+        },
+    )
+
+    import dashboard_loader
+    monkeypatch.setattr(
+        dashboard_loader,
+        "_fetch_schedule_map_for_date",
+        lambda _date: {race_id: {"head_count": 2}},
+    )
+
+    summary = daily_pipeline.audit_stale_predictions_for_date("20260412")
+
+    pred = pipeline_store.load_prediction(race_id)
+    marker = pred["stale_prediction"]
+    assert summary["checked"] == 1
+    assert summary["stale"] == 1
+    assert marker["is_stale"] is True
+    assert marker["reasons"] == [
+        "empty_horse_number_map",
+        "latest_head_count_mismatch",
+        "result_runner_count_mismatch",
+    ]
+    assert marker["expected_count"] == 2
+    assert marker["saved_count"] == 3
+
+
+def test_audit_stale_predictions_marks_horse_number_map_count_mismatch(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030603"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "３歳未勝利",
+            "analysis_date": "20260412",
+            "start_time": "10:50",
+            "horse_number_map": {"1": "馬A", "2": "馬B"},
+            "horses": [
+                {"horse_name": "馬A", "ai_win_prob": 0.3},
+                {"horse_name": "馬B", "ai_win_prob": 0.2},
+                {"horse_name": "馬C", "ai_win_prob": 0.1},
+            ],
+        }
+    })
+
+    import dashboard_loader
+    monkeypatch.setattr(dashboard_loader, "_fetch_schedule_map_for_date", lambda _date: {})
+
+    summary = daily_pipeline.audit_stale_predictions_for_date("20260412")
+
+    marker = pipeline_store.load_prediction(race_id)["stale_prediction"]
+    assert summary["stale"] == 1
+    assert marker["reasons"] == ["horse_number_map_count_mismatch"]
+    assert marker["expected_count"] == 2
+    assert marker["saved_count"] == 3
+
+
+def test_reanalyze_stale_predictions_only_targets_stale_and_clears_on_success(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    stale_race_id = "202606030602"
+    normal_race_id = "202606030603"
+    other_date_race_id = "202606030604"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        stale_race_id: {
+            "race_id": stale_race_id,
+            "race_name": "stale",
+            "analysis_date": "20260412",
+            "stale_prediction": {"is_stale": True, "reasons": ["result_runner_count_mismatch"]},
+            "horses": [{"horse_name": "古い馬"}],
+        },
+        normal_race_id: {
+            "race_id": normal_race_id,
+            "race_name": "normal",
+            "analysis_date": "20260412",
+            "horses": [{"horse_name": "正常馬"}],
+        },
+        other_date_race_id: {
+            "race_id": other_date_race_id,
+            "race_name": "other",
+            "analysis_date": "20260413",
+            "stale_prediction": {"is_stale": True, "reasons": ["empty_horse_number_map"]},
+            "horses": [{"horse_name": "別日馬"}],
+        },
+    })
+    calls = []
+
+    def fake_reanalyze(date_str, race_id, per_race_timeout_sec=300, force_refresh_cache=False, use_requests=False):
+        calls.append((date_str, race_id, per_race_timeout_sec, force_refresh_cache))
+        pipeline_store.save_prediction(
+            race_id=race_id,
+            race_meta={"race_title": "reanalyzed", "race_date": "2026-04-12"},
+            features=[{"horse_name": "新しい馬", "win_prob": 0.4}],
+            analysis_date=date_str,
+        )
+        return {"date": date_str, "total": 1, "success": 1, "skipped": 0, "errors": []}
+
+    monkeypatch.setattr(daily_pipeline, "run_daily_race_analysis_one_safe", fake_reanalyze)
+
+    summary = daily_pipeline.reanalyze_stale_predictions_for_date("20260412", per_race_timeout_sec=123)
+
+    assert summary["total"] == 1
+    assert summary["success"] == 1
+    assert calls == [("20260412", stale_race_id, 123, True)]
+    assert "stale_prediction" not in pipeline_store.load_prediction(stale_race_id)
+    assert pipeline_store.load_prediction(normal_race_id)["race_name"] == "normal"
+    assert pipeline_store.load_prediction(other_date_race_id)["stale_prediction"]["is_stale"] is True
+
+
+def test_reanalyze_stale_predictions_clears_dashboard_needs_reanalysis(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030602"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "stale",
+            "analysis_date": "20260412",
+            "stale_prediction": {"is_stale": True, "reasons": ["result_runner_count_mismatch"]},
+            "horses": [{"horse_name": "古い馬", "ai_win_prob": 0.2}],
+        },
+    })
+
+    def fake_reanalyze(date_str, race_id, per_race_timeout_sec=300, force_refresh_cache=False, use_requests=False):
+        pipeline_store.save_prediction(
+            race_id=race_id,
+            race_meta={"race_title": "reanalyzed", "race_date": "2026-04-12"},
+            features=[{"horse_name": "新しい馬", "win_prob": 0.4}],
+            analysis_date=date_str,
+        )
+        return {"date": date_str, "total": 1, "success": 1, "skipped": 0, "errors": []}
+
+    monkeypatch.setattr(daily_pipeline, "run_daily_race_analysis_one_safe", fake_reanalyze)
+
+    daily_pipeline.reanalyze_stale_predictions_for_date("20260412")
+
+    import dashboard_loader as dl
+    monkeypatch.setattr(dl, "_PREDICTIONS_FILE", pipeline_store.PREDICTIONS_FILE)
+    monkeypatch.setattr(dl, "_BET_SUGGESTIONS_FILE", pipeline_store.BET_SUGGESTIONS_FILE)
+    monkeypatch.setattr(dl, "_BET_OUTCOMES_FILE", pipeline_store.BET_OUTCOMES_FILE)
+    monkeypatch.setattr(dl, "_RACE_RESULTS_FILE", pipeline_store.RACE_RESULTS_FILE)
+    monkeypatch.setattr(dl, "_fetch_schedule_map_for_date", lambda _date: {})
+    races = dl.load_races_for_date("20260412")
+    assert races[0]["needs_reanalysis"] is False
+    assert races[0]["stale_prediction"] == {}
+
+
+def test_reanalyze_stale_predictions_keeps_marker_on_failure(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030602"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "stale",
+            "analysis_date": "20260412",
+            "stale_prediction": {"is_stale": True, "reasons": ["result_runner_count_mismatch"]},
+            "horses": [{"horse_name": "古い馬"}],
+        },
+    })
+
+    def fake_reanalyze(date_str, race_id, per_race_timeout_sec=300, force_refresh_cache=False, use_requests=False):
+        return {
+            "date": date_str,
+            "total": 1,
+            "success": 0,
+            "skipped": 1,
+            "errors": [{"race_id": race_id, "error": "timeout"}],
+        }
+
+    monkeypatch.setattr(daily_pipeline, "run_daily_race_analysis_one_safe", fake_reanalyze)
+
+    summary = daily_pipeline.reanalyze_stale_predictions_for_date("20260412")
+
+    assert summary["total"] == 1
+    assert summary["success"] == 0
+    assert summary["skipped"] == 1
+    assert summary["errors"] == [{"race_id": race_id, "error": "timeout"}]
+    assert pipeline_store.load_prediction(race_id)["stale_prediction"]["is_stale"] is True
+
+
+def test_reanalyze_stale_predictions_treats_success_return_with_marker_left_as_failure(tmp_path, monkeypatch):
+    _tmp_store(monkeypatch)
+    race_id = "202606030602"
+    pipeline_store._save(pipeline_store.PREDICTIONS_FILE, {
+        race_id: {
+            "race_id": race_id,
+            "race_name": "stale",
+            "analysis_date": "20260412",
+            "stale_prediction": {"is_stale": True, "reasons": ["result_runner_count_mismatch"]},
+            "horses": [{"horse_name": "古い馬"}],
+        },
+    })
+
+    def fake_reanalyze(date_str, race_id, per_race_timeout_sec=300, force_refresh_cache=False, use_requests=False):
+        return {"date": date_str, "total": 1, "success": 1, "skipped": 0, "errors": []}
+
+    monkeypatch.setattr(daily_pipeline, "run_daily_race_analysis_one_safe", fake_reanalyze)
+
+    summary = daily_pipeline.reanalyze_stale_predictions_for_date("20260412")
+
+    assert summary["total"] == 1
+    assert summary["success"] == 0
+    assert summary["skipped"] == 1
+    assert summary["errors"] == [{"race_id": race_id, "error": "stale_marker_still_present"}]
+    assert pipeline_store.load_prediction(race_id)["stale_prediction"]["is_stale"] is True
 
 
 # ── Task 4 tests ──────────────────────────────────────────────
