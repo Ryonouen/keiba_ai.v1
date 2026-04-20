@@ -35,7 +35,7 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
-from dividend_scraper import scrape_race_result
+from dividend_scraper import _RACE_LIST_URL, _fetch_html, scrape_race_result
 
 from race_history_ai import (
     fetch_race_history as history_fetch_race_history,
@@ -49,6 +49,7 @@ from race_history_ai import (
     match_current_runners_with_10y_trend,
     fetch_race_history_enriched,
     race_names_match,
+    _extract_core_race_name,
 )
 from trend_stats import build_condition_stats, build_combo_condition_stats
 from route_profile_engine import (
@@ -107,10 +108,13 @@ CACHE_DIR: str = ".keiba_cache"
 CACHE_TTL_SECONDS: int = 60 * 60 * 6
 ROUTE_PROFILE_YEARS: int = 8
 ROUTE_PROFILE_PROB_WEIGHT: float = 0.35
-ROUTE_PROFILE_CACHE_VERSION: str = "v3"
+ROUTE_PROFILE_CACHE_VERSION: str = "v5_id_fallback"
 HISTORICAL_PATTERN_YEARS: int = 8
 HISTORICAL_PATTERN_PROB_WEIGHT: float = 0.30
-HISTORICAL_PATTERN_CACHE_VERSION: str = "v2_body_weight"
+HISTORICAL_PATTERN_CACHE_VERSION: str = "v3_id_fallback"
+HISTORICAL_RACE_ID_RESOLVER_CACHE_VERSION: str = "race_id_resolver_v2_nearby_race_no"
+HISTORICAL_RACE_ID_FETCH_STATUS_OK: str = "ok"
+HISTORICAL_RACE_ID_FETCH_STATUS_FAILED: str = "fetch_failed"
 TREND_ANALYZER_PROB_WEIGHT: float = 0.50
 RANKER_WEIGHT_DEFAULT: float = 0.35   # feat_last3f が十分に揃っているレース向けの標準値
 HORSE_RECORDS_CACHE_VERSION: str = "body_weight_v2"
@@ -3856,10 +3860,362 @@ def _normalize_cutoff_date(date_text: str) -> str:
     return str(date_text or "").replace("-", "/")
 
 
+def _extract_route_profile_search_date(expected_race_name: str) -> Tuple[Optional[int], Optional[int]]:
+    text = str(expected_race_name or "")
+    patterns = (
+        r"\d{4}年(\d{1,2})月(\d{1,2})日",
+        r"\d{4}[-/](\d{1,2})[-/](\d{1,2})",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if not m:
+            continue
+        try:
+            month = int(m.group(1))
+            day = int(m.group(2))
+        except Exception:
+            continue
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return month, day
+    return None, None
+
+
+def _route_profile_search_dates(year: int, month: Optional[int], day: Optional[int]) -> List[str]:
+    if month is None:
+        return []
+
+    dates: List[str] = []
+    if day is not None:
+        try:
+            center = datetime.date(year, month, day)
+        except Exception:
+            center = None
+        if center is not None:
+            for offset in range(-14, 15):
+                d = center + datetime.timedelta(days=offset)
+                if d.year == year:
+                    dates.append(d.strftime("%Y%m%d"))
+            return dates
+
+    try:
+        current = datetime.date(year, month, 1)
+    except Exception:
+        return []
+    while current.month == month:
+        dates.append(current.strftime("%Y%m%d"))
+        current += datetime.timedelta(days=1)
+    return dates
+
+
+def _extract_route_profile_search_name(expected_race_name: str) -> str:
+    search_name = _extract_core_race_name(expected_race_name)
+    search_name = re.sub(r"\s*(出馬表|結果).*", "", search_name).strip()
+    return search_name
+
+
+def _fetch_route_profile_race_ids_by_name(
+    race_name: str,
+    year: int,
+    search_month: Optional[int],
+    search_day: Optional[int],
+    race_no: str = "",
+) -> List[str]:
+    if not race_name:
+        return []
+
+    cache_name = cache_key(
+        "route_profile_race_id_search",
+        ROUTE_PROFILE_CACHE_VERSION,
+        race_name,
+        year,
+        search_month if search_month is not None else "",
+        search_day if search_day is not None else "",
+        race_no,
+    )
+    cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
+    if cached and isinstance(cached.get("race_ids"), list):
+        return [str(rid) for rid in cached["race_ids"]]
+
+    race_ids: List[str] = []
+    for date_str in _route_profile_search_dates(year, search_month, search_day):
+        html = _fetch_html(_RACE_LIST_URL.format(date=date_str))
+        if not html:
+            continue
+        # race list titles may be mojibake, so collect same-R candidates by id
+        # and verify race_name/surface/distance via scrape_race_result below.
+        for race_id in re.findall(r"race_id=(\d{12})", html):
+            if race_no and race_id[-2:] != race_no:
+                continue
+            if race_id not in race_ids:
+                race_ids.append(race_id)
+
+    save_json_cache(cache_name, {"race_ids": race_ids})
+    return race_ids
+
+
+def _nearby_race_numbers(race_no: str, width: int = 2) -> List[str]:
+    try:
+        base = int(str(race_no or ""))
+    except Exception:
+        return []
+    if base < 1:
+        return []
+
+    race_numbers: List[str] = []
+    for offset in range(1, width + 1):
+        for candidate in (base - offset, base + offset):
+            if 1 <= candidate <= 12:
+                race_numbers.append(f"{candidate:02d}")
+    return race_numbers
+
+
+def _route_profile_race_data_matches(
+    race_data: Optional[Dict[str, Any]],
+    expected_race_name: str,
+    target_surface: str = "",
+    target_distance: Optional[int] = None,
+) -> bool:
+    if not race_data:
+        return False
+
+    if expected_race_name and not race_names_match(str(race_data.get("race_name") or ""), expected_race_name):
+        return False
+
+    surface = str(race_data.get("surface") or "")
+    if target_surface and surface and surface != target_surface:
+        return False
+
+    if target_distance is not None and race_data.get("distance") not in (None, ""):
+        try:
+            if int(race_data.get("distance")) != int(target_distance):
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
+def _historical_profile_cache_has_current_resolver(profile: Optional[Dict[str, Any]]) -> bool:
+    return (
+        isinstance(profile, dict)
+        and profile.get("historical_race_id_resolver_version") == HISTORICAL_RACE_ID_RESOLVER_CACHE_VERSION
+    )
+
+
+def _historical_profile_cache_has_fetch_failure(profile: Optional[Dict[str, Any]]) -> bool:
+    return (
+        isinstance(profile, dict)
+        and profile.get("historical_race_id_fetch_status") == HISTORICAL_RACE_ID_FETCH_STATUS_FAILED
+    )
+
+
+def _historical_profile_cache_is_legacy_zero(profile: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(profile, dict) or "sample_size" not in profile:
+        return False
+    try:
+        sample_size = int(profile.get("sample_size") or 0)
+    except Exception:
+        sample_size = 0
+    if sample_size != 0:
+        return False
+    if (
+        _historical_profile_cache_has_current_resolver(profile)
+        and profile.get("historical_race_id_fetch_status") == HISTORICAL_RACE_ID_FETCH_STATUS_OK
+    ):
+        return False
+
+    source_race_ids = profile.get("source_race_ids")
+    source_years = profile.get("source_years")
+    return source_race_ids in (None, []) and source_years in (None, 0)
+
+
+def _historical_profile_cache_is_unusable(profile: Optional[Dict[str, Any]]) -> bool:
+    return _historical_profile_cache_is_legacy_zero(profile) or _historical_profile_cache_has_fetch_failure(profile)
+
+
+def _mark_historical_profile_cache(
+    profile: Dict[str, Any],
+    fetch_status: str = HISTORICAL_RACE_ID_FETCH_STATUS_OK,
+) -> Dict[str, Any]:
+    profile["historical_race_id_resolver_version"] = HISTORICAL_RACE_ID_RESOLVER_CACHE_VERSION
+    profile["historical_race_id_fetch_status"] = fetch_status
+    return profile
+
+
+def _race_analysis_cache_has_legacy_zero_profiles(cached_result: Dict[str, Any]) -> bool:
+    if not isinstance(cached_result, dict):
+        return False
+    return (
+        _historical_profile_cache_is_legacy_zero(cached_result.get("route_profile"))
+        or _historical_profile_cache_is_legacy_zero(cached_result.get("historical_pattern_profile"))
+    )
+
+
+def _race_analysis_cache_has_unusable_profiles(cached_result: Dict[str, Any]) -> bool:
+    if not isinstance(cached_result, dict):
+        return False
+    return (
+        _historical_profile_cache_is_unusable(cached_result.get("route_profile"))
+        or _historical_profile_cache_is_unusable(cached_result.get("historical_pattern_profile"))
+    )
+
+
+def _should_save_race_analysis_cache(result: Dict[str, Any]) -> bool:
+    if _race_analysis_cache_has_unusable_profiles(result):
+        return False
+    cached_starter_count = (result.get("race_meta") or {}).get("starter_count")
+    return not cached_starter_count or len(result.get("features", [])) >= cached_starter_count
+
+
+def _new_historical_resolution_diagnostics() -> Dict[str, Any]:
+    return {
+        "candidate_ids_seen": [],
+        "scrape_attempted_ids": [],
+        "scrape_success_count": 0,
+        "search_failed": False,
+    }
+
+
+def _append_unique(items: List[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def _record_historical_candidate_scrape(
+    diagnostics: Dict[str, Any],
+    candidate_id: str,
+    race_data: Optional[Dict[str, Any]],
+) -> None:
+    candidate_id = str(candidate_id or "")
+    if not candidate_id:
+        return
+    candidate_ids_seen = diagnostics.setdefault("candidate_ids_seen", [])
+    scrape_attempted_ids = diagnostics.setdefault("scrape_attempted_ids", [])
+    first_attempt = candidate_id not in scrape_attempted_ids
+    _append_unique(candidate_ids_seen, candidate_id)
+    _append_unique(scrape_attempted_ids, candidate_id)
+    if first_attempt and race_data:
+        diagnostics["scrape_success_count"] = int(diagnostics.get("scrape_success_count") or 0) + 1
+
+
+def _historical_resolution_diagnostics_has_fetch_failure(diagnostics: Dict[str, Any]) -> bool:
+    return (
+        bool((diagnostics or {}).get("candidate_ids_seen"))
+        and bool((diagnostics or {}).get("scrape_attempted_ids"))
+        and int((diagnostics or {}).get("scrape_success_count") or 0) == 0
+    )
+
+
+def _historical_resolution_fetch_failed(
+    diagnostics_list: List[Dict[str, Any]],
+    source_years: int,
+    requested_years: int,
+) -> bool:
+    if source_years >= requested_years:
+        return False
+    return any(_historical_resolution_diagnostics_has_fetch_failure(diag) for diag in diagnostics_list)
+
+
+def _resolve_historical_route_race_with_diagnostics(
+    year: int,
+    suffix: str,
+    expected_race_name: str = "",
+    target_surface: str = "",
+    target_distance: Optional[int] = None,
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
+    diagnostics = _new_historical_resolution_diagnostics()
+    race_id = f"{year}{suffix}"
+    race_data = scrape_race_result(race_id)
+    if _route_profile_race_data_matches(race_data, expected_race_name, target_surface, target_distance):
+        return race_id, race_data, diagnostics
+
+    search_name = _extract_route_profile_search_name(expected_race_name)
+    if not search_name:
+        return "", None, diagnostics
+
+    search_month, search_day = _extract_route_profile_search_date(expected_race_name)
+    try:
+        candidate_ids = _fetch_route_profile_race_ids_by_name(
+            search_name,
+            year,
+            search_month,
+            search_day,
+            race_no=suffix[-2:],
+        )
+    except Exception:
+        diagnostics["search_failed"] = True
+        candidate_ids = []
+
+    for candidate_id in candidate_ids:
+        candidate_id = str(candidate_id or "")
+        if len(candidate_id) < 12 or not candidate_id.startswith(str(year)):
+            continue
+        if candidate_id == race_id:
+            candidate_data = race_data
+        else:
+            candidate_data = scrape_race_result(candidate_id)
+        _record_historical_candidate_scrape(diagnostics, candidate_id, candidate_data)
+        if _route_profile_race_data_matches(candidate_data, expected_race_name, target_surface, target_distance):
+            return candidate_id, candidate_data, diagnostics
+
+    nearby_race_numbers = _nearby_race_numbers(suffix[-2:])
+    if nearby_race_numbers:
+        try:
+            nearby_candidate_ids = _fetch_route_profile_race_ids_by_name(
+                search_name,
+                year,
+                search_month,
+                search_day,
+                race_no="",
+            )
+        except Exception:
+            diagnostics["search_failed"] = True
+            nearby_candidate_ids = []
+
+        seen_candidate_ids = set(candidate_ids)
+        for nearby_race_no in nearby_race_numbers:
+            for candidate_id in nearby_candidate_ids:
+                candidate_id = str(candidate_id or "")
+                if (
+                    len(candidate_id) < 12
+                    or candidate_id == race_id
+                    or candidate_id in seen_candidate_ids
+                    or not candidate_id.startswith(str(year))
+                    or candidate_id[-2:] != nearby_race_no
+                ):
+                    continue
+                seen_candidate_ids.add(candidate_id)
+                candidate_data = scrape_race_result(candidate_id)
+                _record_historical_candidate_scrape(diagnostics, candidate_id, candidate_data)
+                if _route_profile_race_data_matches(candidate_data, expected_race_name, target_surface, target_distance):
+                    return candidate_id, candidate_data, diagnostics
+
+    return "", None, diagnostics
+
+
+def _resolve_historical_route_race(
+    year: int,
+    suffix: str,
+    expected_race_name: str = "",
+    target_surface: str = "",
+    target_distance: Optional[int] = None,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    race_id, race_data, _diagnostics = _resolve_historical_route_race_with_diagnostics(
+        year,
+        suffix,
+        expected_race_name=expected_race_name,
+        target_surface=target_surface,
+        target_distance=target_distance,
+    )
+    return race_id, race_data
+
+
 def build_historical_route_profile(
     current_race_id: str,
     expected_race_name: str = "",
     years: int = ROUTE_PROFILE_YEARS,
+    target_surface: str = "",
+    target_distance: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     同一レースの過去N年・全出走馬の前走ローテを集計してプロファイル化する。
@@ -3873,22 +4229,30 @@ def build_historical_route_profile(
         current_race_id,
         expected_race_name,
         years,
+        target_surface,
+        target_distance if target_distance is not None else "",
     )
     cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
     if cached:
-        return cached
+        if not _historical_profile_cache_is_unusable(cached):
+            return cached
 
     current_year = int(str(current_race_id)[:4])
     suffix = str(current_race_id)[4:]
     samples: List[Dict[str, Any]] = []
     used_race_ids: List[str] = []
+    resolution_diagnostics: List[Dict[str, Any]] = []
 
     for year in range(current_year - 1, current_year - years - 1, -1):
-        race_id = f"{year}{suffix}"
-        race_data = scrape_race_result(race_id)
+        race_id, race_data, diagnostics = _resolve_historical_route_race_with_diagnostics(
+            year,
+            suffix,
+            expected_race_name=expected_race_name,
+            target_surface=target_surface,
+            target_distance=target_distance,
+        )
+        resolution_diagnostics.append(diagnostics)
         if not race_data:
-            continue
-        if expected_race_name and not race_names_match(str(race_data.get("race_name") or ""), expected_race_name):
             continue
 
         cutoff_date = _normalize_cutoff_date(str(race_data.get("race_date") or ""))
@@ -3924,6 +4288,14 @@ def build_historical_route_profile(
     profile = build_route_profile(samples)
     profile["source_race_ids"] = used_race_ids
     profile["source_years"] = len(used_race_ids)
+    fetch_status = (
+        HISTORICAL_RACE_ID_FETCH_STATUS_FAILED
+        if _historical_resolution_fetch_failed(resolution_diagnostics, len(used_race_ids), years)
+        else HISTORICAL_RACE_ID_FETCH_STATUS_OK
+    )
+    _mark_historical_profile_cache(profile, fetch_status=fetch_status)
+    if fetch_status == HISTORICAL_RACE_ID_FETCH_STATUS_FAILED:
+        return profile
     save_json_cache(cache_name, profile)
     return profile
 
@@ -3951,6 +4323,8 @@ def collect_historical_pattern_profile(
     current_race_id: str,
     expected_race_name: str = "",
     years: int = HISTORICAL_PATTERN_YEARS,
+    target_surface: str = "",
+    target_distance: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     同一レースの過去N年・全出走馬の近5走をトークン化し、
@@ -3965,22 +4339,30 @@ def collect_historical_pattern_profile(
         current_race_id,
         expected_race_name,
         years,
+        target_surface,
+        target_distance if target_distance is not None else "",
     )
     cached = load_json_cache(cache_name, ttl_seconds=60 * 60 * 24 * 30)
     if cached:
-        return cached
+        if not _historical_profile_cache_is_unusable(cached):
+            return cached
 
     current_year = int(str(current_race_id)[:4])
     suffix = str(current_race_id)[4:]
     samples: List[Dict[str, Any]] = []
     used_race_ids: List[str] = []
+    resolution_diagnostics: List[Dict[str, Any]] = []
 
     for year in range(current_year - 1, current_year - years - 1, -1):
-        race_id = f"{year}{suffix}"
-        race_data = scrape_race_result(race_id)
+        race_id, race_data, diagnostics = _resolve_historical_route_race_with_diagnostics(
+            year,
+            suffix,
+            expected_race_name=expected_race_name,
+            target_surface=target_surface,
+            target_distance=target_distance,
+        )
+        resolution_diagnostics.append(diagnostics)
         if not race_data:
-            continue
-        if expected_race_name and not race_names_match(str(race_data.get("race_name") or ""), expected_race_name):
             continue
 
         cutoff_date = _normalize_cutoff_date(str(race_data.get("race_date") or ""))
@@ -4005,6 +4387,14 @@ def collect_historical_pattern_profile(
     profile = build_historical_pattern_profile_stats(samples)
     profile["source_race_ids"] = used_race_ids
     profile["source_years"] = len(used_race_ids)
+    fetch_status = (
+        HISTORICAL_RACE_ID_FETCH_STATUS_FAILED
+        if _historical_resolution_fetch_failed(resolution_diagnostics, len(used_race_ids), years)
+        else HISTORICAL_RACE_ID_FETCH_STATUS_OK
+    )
+    _mark_historical_profile_cache(profile, fetch_status=fetch_status)
+    if fetch_status == HISTORICAL_RACE_ID_FETCH_STATUS_FAILED:
+        return profile
     save_json_cache(cache_name, profile)
     return profile
 
@@ -4664,9 +5054,9 @@ def analyze_race(
         except Exception:
             _cutoff_date = f"{_rid[:4]}/12/31"
 
-    # "cutoff_v2_hp_v2": historical_pattern 表示理由と body_weight 入力修正後の結果を保証する。
-    # 旧キャッシュ（body_weight 欠損・表示用 reasons なし）を自動無効化するための固定バージョン文字列。
-    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2_hp_v2")
+    # historical_pattern 表示理由、body_weight 入力修正、route/historical過去ID解決後の結果を保証する。
+    # 旧キャッシュ（body_weight 欠損・旧route距離bucket・過去ID未解決）を自動無効化するための固定バージョン文字列。
+    race_cache_name = cache_key("race_analysis", shutuba_url, history_limit, "cutoff_v2_hp_v3_route_dist_v5")
     if force_refresh_cache:
         print(f"[analyze_race] cache bypass race_id={_debug_race_id or 'unknown'}", flush=True)
     else:
@@ -4678,6 +5068,9 @@ def analyze_race(
             _input_rid = _input_rid_m.group(1) if _input_rid_m else ""
             if _cached_rid and _input_rid and _cached_rid != _input_rid:
                 cached_result = None  # race_id 不一致 → このキャッシュは別レースのもの、破棄
+            elif _race_analysis_cache_has_unusable_profiles(cached_result):
+                cached_result = None  # 旧ゼロ/取得失敗profile埋め込み → 再分析してprofile cacheを更新
+                print(f"[analyze_race] cache unusable profile race_id={_input_rid or 'unknown'}", flush=True)
             else:
                 print(f"[analyze_race] cache hit race_id={_input_rid or 'unknown'}", flush=True)
                 return refresh_result_payload(cached_result)
@@ -4843,7 +5236,7 @@ def analyze_race(
                     "race_info_text": race_meta.race_info_text or "出馬表を取得できませんでした",
                 },
                 "features": [],
-                "error": "NO_HORSES_FOUND",
+                "error": _err,
             }
 
         horse_results: List[Dict[str, Any]] = []
@@ -5153,6 +5546,8 @@ def analyze_race(
                         current_race_id,
                         expected_race_name=_expected_name,
                         years=ROUTE_PROFILE_YEARS,
+                        target_surface=race_meta.target_surface if race_meta else "",
+                        target_distance=race_meta.target_distance if race_meta else None,
                     )
                     features = attach_route_profile_scores(features, route_profile)
                 except Exception as _rpe:
@@ -5167,6 +5562,8 @@ def analyze_race(
                         current_race_id,
                         expected_race_name=_expected_name,
                         years=HISTORICAL_PATTERN_YEARS,
+                        target_surface=race_meta.target_surface if race_meta else "",
+                        target_distance=race_meta.target_distance if race_meta else None,
                     )
                     features = attach_historical_pattern_scores(
                         features, historical_pattern_profile, race_id=current_race_id
@@ -5463,10 +5860,11 @@ def analyze_race(
         # 最終AI指標・期待値・危険人気馬などを再計算
         result = refresh_result_payload(result)
         print("[analyze_race] payload refreshed", flush=True)
-        cached_starter_count = result.get("race_meta", {}).get("starter_count")
-        if not cached_starter_count or len(result.get("features", [])) >= cached_starter_count:
+        if _should_save_race_analysis_cache(result):
             save_json_cache(race_cache_name, result)
             print("[analyze_race] cache saved", flush=True)
+        else:
+            print("[analyze_race] cache skip unusable/incomplete result", flush=True)
         return result
     
     finally:

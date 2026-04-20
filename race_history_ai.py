@@ -11,6 +11,7 @@ import os
 import re
 import time
 import random
+import unicodedata
 from pathlib import Path
 from trend_stats import bucket_gate
 
@@ -81,6 +82,91 @@ def _extract_core_race_name(title: str) -> str:
     return title
 
 
+_RACE_NAME_ALIAS_DEFINITIONS = (
+    (
+        "アメリカジョッキークラブカップ",
+        (
+            "アメリカジョッキークラブC",
+            "アメリカジョッキーC",
+            "アメリカJCC",
+            "AJCC",
+        ),
+    ),
+    (
+        "フィリーズレビュー",
+        (
+            "フィリーズR",
+        ),
+    ),
+    (
+        "朝日杯フューチュリティステークス",
+        (
+            "朝日杯フューチュリティS",
+            "朝日杯FS",
+        ),
+    ),
+    (
+        "ジャパンカップ",
+        (
+            "ジャパンC",
+        ),
+    ),
+    (
+        "阪神ジュベナイルフィリーズ",
+        (
+            "阪神ジュベナイルF",
+            "阪神JF",
+        ),
+    ),
+    (
+        "東京スポーツ杯2歳ステークス",
+        (
+            "東京スポーツ杯2歳S",
+            "東スポ杯2歳ステークス",
+            "東スポ杯2歳S",
+        ),
+    ),
+    (
+        "報知杯弥生賞ディープインパクト記念",
+        (
+            "報知弥生ディープ記念",
+            "報知杯弥生賞",
+            "弥生賞ディープインパクト記念",
+            "弥生賞ディープ記念",
+            "弥生賞",
+        ),
+    ),
+)
+
+
+def _compact_race_name_for_match(name: str) -> str:
+    name = unicodedata.normalize("NFKC", str(name or ""))
+    for marker in ("出馬表", "レース結果", "レース情報", "競馬予想"):
+        if marker in name:
+            name = name.split(marker, 1)[0]
+    name = re.sub(r"\s+", "", name)
+    return name.strip()
+
+
+def _build_race_name_alias_lookup() -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for canonical, aliases in _RACE_NAME_ALIAS_DEFINITIONS:
+        normalized_canonical = _compact_race_name_for_match(canonical)
+        for name in (canonical, *aliases):
+            lookup[_compact_race_name_for_match(name)] = normalized_canonical
+    return lookup
+
+
+_RACE_NAME_ALIAS_LOOKUP = _build_race_name_alias_lookup()
+
+
+def _normalize_race_name_alias(title: str) -> str:
+    name = _compact_race_name_for_match(_extract_core_race_name(title))
+    if not name:
+        return ""
+    return _RACE_NAME_ALIAS_LOOKUP.get(name, name)
+
+
 def race_names_match(scraped_title: str, target_name: str) -> bool:
     """
     スクレイプ済みページタイトルが対象レース名と同一レースを指すか判定する。
@@ -99,8 +185,8 @@ def race_names_match(scraped_title: str, target_name: str) -> bool:
     """
     if not scraped_title or not target_name:
         return True  # 判定不能 → 通す
-    n1 = _extract_core_race_name(scraped_title)
-    n2 = _extract_core_race_name(target_name)
+    n1 = _normalize_race_name_alias(scraped_title)
+    n2 = _normalize_race_name_alias(target_name)
     if not n1 or not n2:
         return True  # 正規化後も空 → 通す
     if n1 in n2 or n2 in n1:
