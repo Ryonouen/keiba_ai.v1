@@ -23,6 +23,7 @@ _PREDICTIONS_FILE     = os.path.join(_HERE, "pipeline_predictions.json")
 _BET_SUGGESTIONS_FILE = os.path.join(_HERE, "pipeline_bet_suggestions.json")
 _BET_OUTCOMES_FILE    = os.path.join(_HERE, "pipeline_bet_outcomes.json")
 _RACE_RESULTS_FILE    = os.path.join(_HERE, "pipeline_race_results.json")
+_RACE_REVIEWS_FILE    = os.path.join(_HERE, "pipeline_race_reviews.json")
 _RACE_LIST_URL        = "https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={date}"
 _SHUTUBA_URL          = "https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
 
@@ -730,10 +731,11 @@ def load_races_for_date(date_str: str) -> List[Dict]:
         horses, bets, outcomes,
         upset_score, upset_label, upset_color, hot_bets
     """
-    preds    = _load_json(_PREDICTIONS_FILE)
-    bets_all = _load_json(_BET_SUGGESTIONS_FILE)
-    outs_all = _load_json(_BET_OUTCOMES_FILE)
-    rr_all   = _load_json(_RACE_RESULTS_FILE)   # 1回だけ読む
+    preds       = _load_json(_PREDICTIONS_FILE)
+    bets_all    = _load_json(_BET_SUGGESTIONS_FILE)
+    outs_all    = _load_json(_BET_OUTCOMES_FILE)
+    rr_all      = _load_json(_RACE_RESULTS_FILE)
+    reviews_all = _load_json(_RACE_REVIEWS_FILE)
     needs_schedule_fallback = any(
         pred.get("analysis_date") == date_str
         and (not pred.get("start_time") or not pred.get("start_datetime"))
@@ -817,6 +819,7 @@ def load_races_for_date(date_str: str) -> List[Dict]:
                 "distance":       race_result.get("distance"),
                 "surface":        race_result.get("surface"),
                 "n_runners":      len(race_result.get("runners") or []) or fallback_schedule.get("head_count") or entry_fallback.get("head_count") or None,
+                "review":         reviews_all.get(race_id),
             }
         )
 
@@ -831,12 +834,19 @@ def calc_kpi(races: List[Dict]) -> Dict:
 
     Returns
     -------
-    {total_stake, total_payout, roi, hit_count, total_bets}
+    {total_stake, total_payout, roi, hit_count, total_bets,
+     hit_race_count, total_race_count}
     """
     total_stake = total_payout = hit_count = total_bets = 0
+    hit_race_count = total_race_count = 0
 
     for race in races:
-        for o in race.get("outcomes", []):
+        race_outcomes = race.get("outcomes", [])
+        if race_outcomes:
+            total_race_count += 1
+            if any(o.get("hit") for o in race_outcomes):
+                hit_race_count += 1
+        for o in race_outcomes:
             stake         = o.get("stake", 100)
             total_stake  += stake
             total_payout += o.get("payout", 0)
@@ -846,11 +856,13 @@ def calc_kpi(races: List[Dict]) -> Dict:
 
     roi = round(total_payout / total_stake * 100, 1) if total_stake > 0 else 0.0
     return {
-        "total_stake":  total_stake,
-        "total_payout": total_payout,
-        "roi":          roi,
-        "hit_count":    hit_count,
-        "total_bets":   total_bets,
+        "total_stake":      total_stake,
+        "total_payout":     total_payout,
+        "roi":              roi,
+        "hit_count":        hit_count,
+        "total_bets":       total_bets,
+        "hit_race_count":   hit_race_count,
+        "total_race_count": total_race_count,
     }
 
 
@@ -893,6 +905,136 @@ def calc_kpi_by_bet_type(races: List[Dict]) -> List[Dict]:
         )
     rows.sort(key=lambda r: r["bet_type"])
     return rows
+
+
+_REVIEW_REASON_LABELS: Dict[str, str] = {
+    "honmei_won":                  "本命1着",
+    "honmei_placed":               "本命2〜3着",
+    "winner_in_selection":         "勝ち馬を買い目に含む",
+    "top3_covered_well":           "1〜3着を2頭以上カバー",
+    "high_confidence_hit":         "高信頼度で的中",
+    "honmei_fell":                 "本命が飛んだ",
+    "himo_miss":                   "ヒモ抜け",
+    "favourite_missed":            "人気馬を買い目に含めず",
+    "longshot_chosen_but_failed":  "人気薄選択・全外れ",
+}
+
+
+def _label(key: str) -> str:
+    return _REVIEW_REASON_LABELS.get(key, key)
+
+
+def calc_daily_status(races: List[Dict]) -> Dict:
+    """
+    評価状態を集計して返す。
+
+    Returns
+    -------
+    {
+      "status":        "unevaluated" | "partial" | "full",
+      "total_races":   int,
+      "outcome_races": int,   # outcomes あり
+      "review_races":  int,   # review あり
+    }
+    """
+    total_races   = len(races)
+    outcome_races = sum(1 for r in races if r.get("outcomes"))
+    review_races  = sum(1 for r in races if r.get("review"))
+
+    if outcome_races == 0:
+        status = "unevaluated"
+    elif outcome_races < total_races:
+        status = "partial"
+    else:
+        status = "full"
+
+    return {
+        "status":        status,
+        "total_races":   total_races,
+        "outcome_races": outcome_races,
+        "review_races":  review_races,
+    }
+
+
+def calc_review_summary(races: List[Dict]) -> Dict:
+    """
+    レース一覧から race_review の集計を返す。
+    理由キーは日本語ラベルに変換済み。
+
+    Returns
+    -------
+    {
+      "hit_count":        int,
+      "miss_count":       int,
+      "no_review":        int,
+      "hit_reasons":      Dict[str, int],        # ラベル → 件数
+      "miss_reasons":     Dict[str, int],
+      "hit_reason_races": Dict[str, List[str]],  # ラベル → 該当レース名リスト
+      "miss_reason_races": Dict[str, List[str]],
+      "race_reviews":     List[Dict],
+    }
+    """
+    hit_count = miss_count = no_review = 0
+    hit_reasons:             Dict[str, int]        = {}
+    miss_reasons:            Dict[str, int]        = {}
+    hit_reason_races:        Dict[str, List[str]]  = {}
+    miss_reason_races:       Dict[str, List[str]]  = {}
+    hit_reason_first_review: Dict[str, Dict]       = {}
+    miss_reason_first_review: Dict[str, Dict]      = {}
+    race_reviews = []
+
+    for race in races:
+        review = race.get("review")
+        if not review:
+            no_review += 1
+            continue
+        rt       = review.get("review_type")
+        short_id = f'{race.get("venue", "?")} {race.get("race_number", "?")}'
+        detail = {
+            "venue_race":               short_id,
+            "race_name":                race.get("race_name", ""),
+            "honmei_name":              review.get("honmei_name", ""),
+            "honmei_actual_rank":       review.get("honmei_actual_rank"),
+            "actual_winner_name":       review.get("actual_winner_name", ""),
+            "actual_winner_popularity": review.get("actual_winner_popularity"),
+            "selected_horses":          review.get("selected_horses") or [],
+            "placed_horses":            review.get("placed_horses") or [],
+        }
+        if rt == "hit":
+            hit_count += 1
+            reasons = [_label(r) for r in (review.get("hit_reasons") or [])]
+            detail["reasons"] = reasons
+            for r in reasons:
+                hit_reasons[r] = hit_reasons.get(r, 0) + 1
+                hit_reason_races.setdefault(r, []).append(short_id)
+                hit_reason_first_review.setdefault(r, detail)
+        else:
+            miss_count += 1
+            reasons = [_label(r) for r in (review.get("miss_reasons") or [])]
+            detail["reasons"] = reasons
+            for r in reasons:
+                miss_reasons[r] = miss_reasons.get(r, 0) + 1
+                miss_reason_races.setdefault(r, []).append(short_id)
+                miss_reason_first_review.setdefault(r, detail)
+        race_reviews.append({
+            "race_id":    race.get("race_id"),
+            "race_name":  race.get("race_name", ""),
+            "review_type": rt,
+            "reasons":    reasons,
+        })
+
+    return {
+        "hit_count":                  hit_count,
+        "miss_count":                 miss_count,
+        "no_review":                  no_review,
+        "hit_reasons":                hit_reasons,
+        "miss_reasons":               miss_reasons,
+        "hit_reason_races":           hit_reason_races,
+        "miss_reason_races":          miss_reason_races,
+        "hit_reason_first_review":    hit_reason_first_review,
+        "miss_reason_first_review":   miss_reason_first_review,
+        "race_reviews":               race_reviews,
+    }
 
 
 def get_races_by_venue(date_str: str) -> Dict[str, List[Dict]]:

@@ -301,7 +301,12 @@ def _render_kpi(kpi: Dict) -> None:
     col1.metric("投資額",   f"¥{kpi['total_stake']:,}")
     col2.metric("回収額",   f"¥{kpi['total_payout']:,}")
     col3.metric("ROI",      f"{kpi['roi']}%")
-    col4.metric("的中",     f"{kpi['hit_count']} / {kpi['total_bets']}")
+    hit_r  = kpi.get("hit_race_count")
+    tot_r  = kpi.get("total_race_count")
+    if hit_r is not None and tot_r is not None:
+        col4.metric("的中レース", f"{hit_r} / {tot_r}")
+    else:
+        col4.metric("的中",   f"{kpi['hit_count']} / {kpi['total_bets']}")
 
 
 def _render_bet_type_table(races: List[Dict]) -> None:
@@ -890,10 +895,166 @@ def _tab_daily() -> None:
         st.info("この日のデータがありません。")
         return
 
+    # ── 評価状態 ─────────────────────────────────────────────
+    ds = dl.calc_daily_status(races)
+    if ds["status"] == "unevaluated":
+        st.warning(f"未評価（{ds['total_races']} レース / evaluate 未実行）")
+    elif ds["status"] == "partial":
+        st.info(f"一部評価済み（{ds['outcome_races']} / {ds['total_races']} レース）")
+    else:
+        st.success(f"全評価済み（{ds['outcome_races']} / {ds['total_races']} レース）")
+
+    if ds["review_races"] == 0 and ds["outcome_races"] > 0:
+        st.caption("race review 未生成（次回 evaluate 実行後に反映）")
+    elif 0 < ds["review_races"] < ds["outcome_races"]:
+        st.caption(f"race review 一部あり（{ds['review_races']} / {ds['outcome_races']} レース）")
+
+    # ── KPI ──────────────────────────────────────────────────
     kpi = dl.calc_kpi(races)
     st.subheader(f"{selected[:4]}/{selected[4:6]}/{selected[6:]} の集計")
     _render_kpi(kpi)
 
+    # ── race_review 集計 ──────────────────────────────────────
+    review_summary = dl.calc_review_summary(races)
+    if ds["outcome_races"] > 0 and review_summary["hit_count"] + review_summary["miss_count"] == 0:
+        st.subheader("予測レビュー集計")
+        st.info("レビュー未生成")
+    elif review_summary["hit_count"] + review_summary["miss_count"] > 0:
+        st.subheader("予測レビュー集計")
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("的中レース", review_summary["hit_count"])
+        rc2.metric("外れレース", review_summary["miss_count"])
+        rc3.metric("review なし", review_summary["no_review"])
+
+        view_filter = st.radio(
+            "表示",
+            ["すべて", "hit", "miss"],
+            horizontal=True,
+            key=f"rv_{selected}",
+        )
+
+        def _reason_df(reasons: Dict, reason_races: Dict) -> List[Dict]:
+            return [
+                {
+                    "理由":     k,
+                    "件数":     v,
+                    "該当レース": ", ".join(reason_races.get(k, [])),
+                }
+                for k, v in sorted(reasons.items(), key=lambda x: -x[1])
+            ]
+
+        def _review_sublabel(d: Dict) -> str:
+            honmei_rank   = d.get("honmei_actual_rank")
+            winner        = d.get("actual_winner_name", "")
+            selected_set  = set(d.get("selected_horses") or [])
+            placed        = d.get("placed_horses") or []
+            placed_in_sel = sum(1 for h in placed if h in selected_set)
+            winner_hit    = bool(winner and winner in selected_set)
+            if placed_in_sel >= 2:
+                return "1〜3着は広く拾えた型"
+            if winner_hit:
+                return "勝ち馬拾えた型"
+            if honmei_rank and honmei_rank <= 3:
+                return "本命好走型"
+            if honmei_rank and honmei_rank >= 4:
+                return "本命凡走型"
+            return "勝ち馬抜け型"
+
+        def _render_reason_expanders(reasons: Dict, first_reviews: Dict) -> None:
+            for k, v in sorted(reasons.items(), key=lambda x: -x[1]):
+                d = first_reviews.get(k)
+                if not d:
+                    continue
+                selected = d.get("selected_horses") or []
+                placed   = d.get("placed_horses") or []
+                winner       = d.get("actual_winner_name", "")
+                placed_set   = set(placed)
+                selected_set = set(selected)
+                sel_lines = [
+                    f"{'✅' if h in placed_set else '❌'} {'🏆 ' if h == winner else ''}{h}"
+                    for h in selected
+                ]
+                missed_lines = [
+                    f"⚠️ {'🏆 ' if h == winner else ''}{h}"
+                    for h in placed
+                    if h not in selected_set
+                ]
+                with st.expander(f"{k}（{v}件）｜{_review_sublabel(d)}"):
+                    st.caption(f"{d.get('venue_race', '?')}  {d.get('race_name', '')[:25]}")
+                    st.markdown(
+                        f"**本命** {d.get('honmei_name', '?')} → "
+                        f"**{d.get('honmei_actual_rank', '?')}着**　　"
+                        f"**勝ち馬** {d.get('actual_winner_name', '?')}"
+                        f"（{d.get('actual_winner_popularity', '?')}人気）"
+                    )
+                    st.markdown("**買い目候補**　" + "　".join(sel_lines) if sel_lines else "**買い目候補** —")
+                    if missed_lines:
+                        st.markdown("**買い目外の入着馬**　" + "　".join(missed_lines))
+                    st.markdown(f"**理由** {', '.join(d.get('reasons', [])) or '—'}")
+
+        if view_filter == "すべて":
+            col_h, col_m = st.columns(2)
+            if review_summary["hit_reasons"]:
+                with col_h:
+                    st.caption("hit 理由")
+                    st.dataframe(
+                        _reason_df(review_summary["hit_reasons"], review_summary["hit_reason_races"]),
+                        use_container_width=True, hide_index=True,
+                    )
+            if review_summary["miss_reasons"]:
+                with col_m:
+                    st.caption("miss 理由")
+                    st.dataframe(
+                        _reason_df(review_summary["miss_reasons"], review_summary["miss_reason_races"]),
+                        use_container_width=True, hide_index=True,
+                    )
+            if review_summary["hit_reasons"]:
+                st.caption("hit 代表例")
+                _render_reason_expanders(
+                    review_summary["hit_reasons"], review_summary["hit_reason_first_review"]
+                )
+            if review_summary["miss_reasons"]:
+                st.caption("miss 代表例")
+                _render_reason_expanders(
+                    review_summary["miss_reasons"], review_summary["miss_reason_first_review"]
+                )
+        elif view_filter == "hit" and review_summary["hit_reasons"]:
+            st.caption("hit 理由")
+            st.dataframe(
+                _reason_df(review_summary["hit_reasons"], review_summary["hit_reason_races"]),
+                use_container_width=True, hide_index=True,
+            )
+            _render_reason_expanders(
+                review_summary["hit_reasons"], review_summary["hit_reason_first_review"]
+            )
+        elif view_filter == "miss" and review_summary["miss_reasons"]:
+            st.caption("miss 理由")
+            st.dataframe(
+                _reason_df(review_summary["miss_reasons"], review_summary["miss_reason_races"]),
+                use_container_width=True, hide_index=True,
+            )
+            _render_reason_expanders(
+                review_summary["miss_reasons"], review_summary["miss_reason_first_review"]
+            )
+
+        filtered = [
+            rr for rr in review_summary["race_reviews"]
+            if view_filter == "すべて" or rr["review_type"] == view_filter
+        ]
+        if filtered:
+            st.dataframe(
+                [
+                    {
+                        "レース": rr["race_name"][:30],
+                        "結果": rr["review_type"],
+                        "理由": ", ".join(rr["reasons"]) or "—",
+                    }
+                    for rr in filtered
+                ],
+                use_container_width=True, hide_index=True,
+            )
+
+    # ─────────────────────────────────────────────────────────
     st.subheader("券種別集計")
     _render_bet_type_table(races)
 
