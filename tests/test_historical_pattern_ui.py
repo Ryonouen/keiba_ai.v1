@@ -41,8 +41,38 @@ def test_historical_pattern_ui_falls_back_to_display_then_legacy_reasons():
     assert display_groups["negative"] == [
         "近走で直行・非トライアル組に該当する点は近年傾向ではやや割引"
     ]
-    assert legacy_groups["positive"] == ["distance_top3:1800(+0.300)"]
-    assert legacy_groups["negative"] == ["trial_group:other(-0.300)"]
+    assert legacy_groups["positive"] == ["1800mでの好走実績は距離面の好材料"]
+    assert legacy_groups["negative"] == [
+        "近走で直行・非トライアル組に該当する点は近年傾向ではやや割引"
+    ]
+
+
+def test_historical_pattern_ui_polishes_raw_tokens_in_fallback_reasons():
+    from historical_pattern_ui import get_historical_pattern_ui_reason_groups
+
+    feature = {
+        "historical_pattern_reasons": [
+            "race_top3:共同通信杯(+0.450)",
+            "distance_top3:1600(+0.450)",
+            "trial_group:gi_prep(-0.300)",
+            "prev_race_name=共同通信杯(+0.450)",
+            "race_any:新潟2歳S(-0.450)",
+            "unknown_token:raw(-0.100)",
+        ],
+    }
+
+    groups = get_historical_pattern_ui_reason_groups(feature)
+
+    assert groups["positive"] == [
+        "共同通信杯で3着以内の実績は好材料",
+        "1600mでの好走実績は距離面の好材料",
+        "前走共同通信杯組はローテ傾向で好材料",
+    ]
+    assert groups["negative"] == [
+        "近走でトライアル組に該当する点は近年傾向ではやや割引",
+    ]
+    assert all(":" not in reason and "prev_" not in reason for reason in groups["positive"])
+    assert all(":" not in reason and "race_any:" not in reason for reason in groups["negative"])
 
 
 def test_route_profile_display_reasons_are_human_readable():
@@ -62,6 +92,52 @@ def test_route_profile_display_reasons_are_human_readable():
         "前走1600m組はローテ傾向ではやや割引",
     ]
     assert all("prev_" not in reason for reason in reasons)
+
+
+def test_route_profile_display_reasons_show_exact_distance_buckets():
+    from historical_pattern_ui import get_route_profile_display_reasons
+
+    feature = {
+        "route_profile_reasons": [
+            "prev_distance_bucket=1400(+0.120)",
+            "prev_distance_bucket=1600(-0.120)",
+            "prev_distance_bucket=1800(+0.120)",
+            "prev_distance_bucket=2000(-0.141)",
+            "prev_distance_bucket=3200(+0.180)",
+        ],
+    }
+
+    reasons = get_route_profile_display_reasons(feature, limit=5)
+
+    assert reasons == [
+        "前走1400m組はローテ傾向で好材料",
+        "前走1600m組はローテ傾向ではやや割引",
+        "前走1800m組はローテ傾向で好材料",
+        "前走2000m組はローテ傾向ではやや割引",
+        "前走3200m組はローテ傾向で好材料",
+    ]
+
+
+def test_route_profile_display_reasons_show_neutral_for_tiny_distance_scores():
+    from historical_pattern_ui import get_route_profile_display_reasons
+
+    feature = {
+        "route_profile_reasons": [
+            "prev_distance_bucket=2000(-0.007)",
+            "prev_distance_bucket=2200(+0.012)",
+            "prev_race_name=報知弥生ディープ記念(-0.057)",
+            "prev_month=3(-0.450)",
+        ],
+    }
+
+    reasons = get_route_profile_display_reasons(feature, limit=4)
+
+    assert reasons == [
+        "前走2000m組はローテ傾向ではほぼ中立",
+        "前走2200m組はローテ傾向ではほぼ中立",
+        "前走報知弥生ディープ記念組はローテ傾向ではやや割引",
+        "3月からの臨戦はローテ傾向ではやや割引",
+    ]
 
 
 def test_historical_pattern_ui_softens_two_year_old_maiden_labels():
@@ -154,10 +230,10 @@ def test_audit_historical_pattern_ui_reasons_detects_display_noise():
     audit = audit_historical_pattern_ui_reasons(features)
 
     assert audit["checked_horses"] == 2
-    assert audit["issue_counts"]["raw_token"] == 1
+    assert audit["issue_counts"]["raw_token"] == 0
     assert audit["issue_counts"]["strong_young_reason"] == 0
     assert audit["issue_counts"]["mechanical_phrase"] == 0
-    assert audit["examples"]["raw_token"][0]["horse_name"] == "ノイズ馬"
+    assert audit["examples"]["raw_token"] == []
 
 
 def test_historical_pattern_ui_polishes_age_labels():
@@ -165,13 +241,43 @@ def test_historical_pattern_ui_polishes_age_labels():
 
     feature = {
         "historical_pattern_display_reasons": [
+            "プラス要因: age:5 は好材料",
+            "マイナス要因: age:4 は近年傾向ではやや割引",
             "マイナス要因: age:6以上 は近年傾向ではやや割引",
         ],
     }
 
     groups = get_historical_pattern_ui_reason_groups(feature)
 
-    assert groups["negative"] == ["6歳以上は近年傾向ではやや割引"]
+    assert groups["positive"] == ["5歳は好材料"]
+    assert groups["negative"] == [
+        "4歳は近年傾向ではやや割引",
+        "6歳以上は近年傾向ではやや割引",
+    ]
+
+
+def test_historical_pattern_ui_polishes_other_race_labels():
+    from historical_pattern_ui import get_historical_pattern_ui_reason_groups
+
+    feature = {
+        "historical_pattern_display_reasons": [
+            "プラス要因: OTHERで3着以内の実績は好材料",
+            "プラス要因: OTHER出走経験は好材料",
+            "マイナス要因: OTHERで3着以内の履歴は近年傾向ではやや割引",
+            "マイナス要因: OTHER出走経験は近年傾向では補助的に割引",
+        ],
+    }
+
+    groups = get_historical_pattern_ui_reason_groups(feature)
+
+    assert groups["positive"] == [
+        "その他のレースでの好走実績は好材料",
+        "その他のレースでの出走経験は好材料",
+    ]
+    assert groups["negative"] == [
+        "その他のレースでの好走履歴は近年傾向ではやや割引",
+        "その他のレースでの出走経験は近年傾向では補助的に割引",
+    ]
 
 
 def test_historical_pattern_ui_softens_low_support_body_weight_reasons():
