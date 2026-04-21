@@ -92,6 +92,7 @@ def _race_status(
     start_datetime: Optional[str],
     outcomes: List[Dict],
     finish_order: Optional[List] = None,
+    result_fetch_status: Optional[str] = None,
 ) -> str:
     """
     レースの表示ステータスを返す。
@@ -101,6 +102,8 @@ def _race_status(
     """
     if outcomes or finish_order:
         return "result"
+    if result_fetch_status == "fetch_failed":
+        return "awaiting"
     if start_datetime:
         try:
             t = datetime.fromisoformat(start_datetime)
@@ -369,6 +372,32 @@ def _enrich_horses_from_result_dict(race_result: Dict, horses: List[Dict]) -> No
         h["gate"]        = runner.get("gate")
         h["jockey"]      = runner.get("jockey")
         h["actual_rank"] = finish_rank_map.get(name)
+
+
+def _exclude_horses_not_in_result(race_result: Dict, horses: List[Dict]) -> int:
+    """
+    結果確定後、結果側に存在しない保存済み予測馬をUI表示から除外する。
+    取消・除外馬が古い prediction に残るケース向けの表示層ガード。
+    """
+    if not race_result or not horses:
+        return 0
+    result_names = {
+        str(r.get("horse_name") or "")
+        for r in (race_result.get("runners") or [])
+        if r.get("horse_name")
+    }
+    if not result_names:
+        result_names = {
+            str(name or "")
+            for name in (race_result.get("finish_order") or [])
+            if name
+        }
+    if not result_names:
+        return 0
+
+    before = len(horses)
+    horses[:] = [h for h in horses if str(h.get("horse_name") or "") in result_names]
+    return before - len(horses)
 
 
 def _enrich_horses_from_result(race_id: str, horses: List[Dict]) -> None:
@@ -729,6 +758,9 @@ def load_races_for_date(date_str: str) -> List[Dict]:
 
         race_result = rr_all.get(str(race_id), {})
         _enrich_horses_from_result_dict(race_result, horses)
+        excluded_horse_count = _exclude_horses_not_in_result(race_result, horses)
+        stale_prediction = pred.get("stale_prediction") if isinstance(pred.get("stale_prediction"), dict) else {}
+        needs_reanalysis = bool(stale_prediction.get("is_stale"))
         entry_fallback: Dict[str, Any] = {}
         if _needs_entry_fallback(pred, horses):
             entry_fallback = _fetch_entry_fallback_for_race(str(race_id), date_str)
@@ -755,10 +787,22 @@ def load_races_for_date(date_str: str) -> List[Dict]:
                 "race_number":    r_num,
                 "start_time":     start_time,
                 "start_datetime": start_dt,
-                "status":         _race_status(start_dt, outcomes, race_result.get("finish_order")),
+                "status":         _race_status(
+                    start_dt,
+                    outcomes,
+                    race_result.get("finish_order"),
+                    race_result.get("result_fetch_status"),
+                ),
                 "horses":         horses,
                 "bets":           bets,
                 "outcomes":       outcomes,
+                "result_fetch_status": race_result.get("result_fetch_status"),
+                "result_fetch_attempted_at": race_result.get("result_fetch_attempted_at"),
+                "result_fetch_attempt_count": race_result.get("result_fetch_attempt_count"),
+                "result_fetch_reason": race_result.get("result_fetch_reason"),
+                "excluded_horse_count": excluded_horse_count,
+                "stale_prediction": stale_prediction,
+                "needs_reanalysis": needs_reanalysis,
                 "upset_score":    upset["score"],
                 "upset_label":    upset["label"],
                 "upset_color":    upset["color"],

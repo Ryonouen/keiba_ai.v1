@@ -258,6 +258,106 @@ def test_entry_fallback_enriches_missing_horse_fields():
     assert horses["ウマA"]["popularity"] == 1
 
 
+def test_load_races_excludes_non_result_runners_after_result_saved():
+    pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "horses": [
+                {
+                    "horse_name": "ウマA",
+                    "ai_win_prob": 0.15,
+                    "feature_dict": {"win_odds": 5.6, "feat_popularity": 1},
+                },
+                {
+                    "horse_name": "取消馬",
+                    "ai_win_prob": 0.10,
+                    "feature_dict": {"win_odds": 12.0, "feat_popularity": 2},
+                },
+            ],
+        }
+    }
+    race_results = {
+        "202606030401": {
+            "finish_order": ["ウマA"],
+            "runners": [{"horse_name": "ウマA", "horse_no": 1, "gate": 1}],
+        }
+    }
+
+    def side_effect(path):
+        if "predictions" in path:
+            return pred
+        if "suggestions" in path:
+            return {}
+        if "outcomes" in path:
+            return {}
+        if "race_results" in path:
+            return race_results
+        return {}
+
+    with patch.object(dl, "_load_json", side_effect=side_effect):
+        races = dl.load_races_for_date("20260405")
+
+    assert [h["horse_name"] for h in races[0]["horses"]] == ["ウマA"]
+    assert races[0]["excluded_horse_count"] == 1
+    assert races[0]["status"] == "result"
+
+
+def test_load_races_exposes_result_fetch_status_marker():
+    past_pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "start_datetime": "",
+        }
+    }
+    race_results = {
+        "202606030401": {
+            "result_fetch_status": "fetch_failed",
+            "result_fetch_attempt_count": 2,
+            "result_fetch_reason": "scrape_race_result_none",
+        }
+    }
+
+    def side_effect(path):
+        if "predictions" in path:
+            return past_pred
+        if "suggestions" in path:
+            return {}
+        if "outcomes" in path:
+            return {}
+        if "race_results" in path:
+            return race_results
+        return {}
+
+    with patch.object(dl, "_load_json", side_effect=side_effect):
+        races = dl.load_races_for_date("20260405")
+
+    assert races[0]["status"] == "awaiting"
+    assert races[0]["result_fetch_status"] == "fetch_failed"
+    assert races[0]["result_fetch_attempt_count"] == 2
+
+
+def test_load_races_exposes_stale_prediction_marker_without_writing():
+    pred = {
+        "202606030401": {
+            **PRED_V2["202606030401"],
+            "stale_prediction": {
+                "is_stale": True,
+                "reasons": ["empty_horse_number_map"],
+                "checked_at": "2026-04-20 14:30:00",
+                "source": "daily_pipeline_audit",
+                "expected_count": 14,
+                "saved_count": 15,
+            },
+        }
+    }
+
+    with patch.object(dl, "_load_json", side_effect=_mock_load(pred, {}, {})):
+        races = dl.load_races_for_date("20260405")
+
+    assert races[0]["needs_reanalysis"] is True
+    assert races[0]["stale_prediction"]["reasons"] == ["empty_horse_number_map"]
+
+
 def test_load_races_includes_score_debug_rows():
     pred = {
         "202606030401": {
